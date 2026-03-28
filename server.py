@@ -986,6 +986,125 @@ async def archidekt_export(params: ArchidektDeckInput) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# FORMATTING — Generate Archidekt-importable decklists
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class DeckCardEntry(BaseModel):
+    """A single card entry for deck formatting."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: str = Field(..., description="Card name.")
+    quantity: int = Field(default=1, ge=1, le=99)
+    category: Optional[str] = Field(default=None, description="Category name (e.g., 'Ramp', 'Draw', 'Removal', 'Lands').")
+    commander: bool = Field(default=False, description="True if this is the commander (or partner).")
+    maybeboard: bool = Field(default=False, description="True if this should go in the maybeboard.")
+    label: Optional[str] = Field(default=None, description="Optional label text (e.g., 'To Buy').")
+    label_color: Optional[str] = Field(default=None, description="Optional label hex color (e.g., '#2ccce4').")
+
+
+class FormatDeckInput(BaseModel):
+    """Input for format_archidekt."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    cards: list[DeckCardEntry] = Field(
+        ...,
+        description="List of cards with optional category, commander/maybeboard flags, and labels.",
+        min_length=1,
+    )
+    include_set_codes: bool = Field(
+        default=False,
+        description="If true, look up and include set codes from Scryfall. Slower but useful for specific printings.",
+    )
+
+
+@mcp.tool(name="format_archidekt")
+async def format_archidekt(params: FormatDeckInput) -> str:
+    """Format a card list into Archidekt-compatible import text.
+
+    Takes card names with optional categories, commander/maybeboard flags,
+    and labels, then outputs text that can be pasted directly into
+    Archidekt's import dialog. Validates all card names against Scryfall.
+
+    Archidekt import format:
+      1x Card Name (set) [Category] ^Label,#hex^
+      1x Commander Name [Commander{top}]
+      1x Maybe Card [Maybeboard{noDeck}{noPrice}]
+
+    Args:
+        params: FormatDeckInput with cards list and optional set code inclusion.
+
+    Returns:
+        Archidekt-importable text. Cards that fail Scryfall lookup are
+        listed at the bottom with warnings.
+    """
+    # Batch validate on Scryfall
+    unique_names = list({c.name for c in params.cards})
+    found: dict[str, dict] = {}
+    not_found_names: list[str] = []
+
+    for i in range(0, len(unique_names), 75):
+        batch = unique_names[i:i + 75]
+        identifiers = [{"name": name} for name in batch]
+        try:
+            data = await _scryfall_post("/cards/collection", {"identifiers": identifiers})
+            for card in data.get("data", []):
+                found[card["name"].lower()] = card
+            for item in data.get("not_found", []):
+                not_found_names.append(item.get("name", str(item)))
+        except Exception as e:
+            return f"Scryfall lookup failed: {_scryfall_error(e)}"
+
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    for entry in params.cards:
+        scryfall_card = found.get(entry.name.lower())
+
+        # Use Scryfall's canonical name if found
+        if scryfall_card:
+            card_name = scryfall_card["name"]
+        else:
+            card_name = entry.name
+            warnings.append(f"# WARNING: '{entry.name}' not found on Scryfall")
+
+        line = f"{entry.quantity}x {card_name}"
+
+        # Set code (only if requested and card was found)
+        if params.include_set_codes and scryfall_card:
+            set_code = scryfall_card.get("set", "")
+            collector = scryfall_card.get("collector_number", "")
+            if set_code:
+                line += f" ({set_code})"
+            if collector:
+                line += f" {collector}"
+
+        # Category annotation
+        if entry.commander:
+            line += " [Commander{top}]"
+        elif entry.maybeboard:
+            line += " [Maybeboard{noDeck}{noPrice}]"
+        elif entry.category:
+            line += f" [{entry.category}]"
+
+        # Labels
+        if entry.label:
+            if entry.label_color:
+                line += f" ^{entry.label},{entry.label_color}^"
+            else:
+                line += f" ^{entry.label}^"
+
+        lines.append(line)
+
+    lines.sort()
+
+    # Append warnings at end
+    if warnings:
+        lines.append("")
+        lines.extend(warnings)
+
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # VALIDATION — Decklist and deck verification
 # ═══════════════════════════════════════════════════════════════════════════════
 
