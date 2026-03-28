@@ -909,10 +909,13 @@ async def archidekt_user_decks(params: ArchidektUserInput) -> str:
 
 @mcp.tool(name="archidekt_export")
 async def archidekt_export(params: ArchidektDeckInput) -> str:
-    """Export an Archidekt deck as a clean importable card list.
+    """Export an Archidekt deck in Archidekt-compatible import format.
 
-    Returns cards in standard '1 Card Name' format grouped by category,
-    ready to paste into any deck builder. Excludes maybeboard cards.
+    Uses the full Archidekt import syntax with set codes, categories, and labels:
+      1x Card Name (set) [Category{flags}] ^Label,#hex^
+
+    Category flags: {top} for commander, {noDeck}{noPrice} for maybeboard.
+    Output can be pasted directly into Archidekt's import dialog.
     """
     deck_id = _parse_deck_id(params.deck)
     try:
@@ -921,43 +924,63 @@ async def archidekt_export(params: ArchidektDeckInput) -> str:
         return _archidekt_error(e)
 
     categories = {c["name"]: c for c in data.get("categories", [])}
-    cards_by_cat: dict[str, list[str]] = {}
+
+    parts: list[str] = []
+    total_in_deck = 0
 
     for entry in data.get("cards", []):
         qty = entry.get("quantity", 1)
-        oracle = entry.get("card", {}).get("oracleCard", {})
+        card_data = entry.get("card", {})
+        oracle = card_data.get("oracleCard", {})
         card_name = oracle.get("name", "?")
+        edition = card_data.get("edition", {})
+        set_code = edition.get("editioncode", "")
+        collector = card_data.get("collectorNumber", "")
         entry_cats = entry.get("categories", [])
+        labels = entry.get("labels") or []
 
+        # Build the line: 1x Card Name (set) collector [Category{flags}] ^label^
+        line = f"{qty}x {card_name}"
+
+        if set_code:
+            line += f" ({set_code})"
+
+        if collector:
+            line += f" {collector}"
+
+        # Determine category annotation and deck inclusion
+        cat_annotation = ""
+        is_in_deck = True
         for cat_name in entry_cats:
             cat_def = categories.get(cat_name, {})
-            if cat_def.get("includedInDeck", True):
-                cards_by_cat.setdefault(cat_name, [])
-                cards_by_cat[cat_name].append(f"{qty} {card_name}")
+            if cat_def.get("isPremier"):
+                cat_annotation = f" [{cat_name}{{top}}]"
+            elif not cat_def.get("includedInDeck", True):
+                cat_annotation = f" [{cat_name}{{noDeck}}{{noPrice}}]"
+                is_in_deck = False
+            else:
+                cat_annotation = f" [{cat_name}]"
 
-    parts: list[str] = []
-    total = 0
+        if is_in_deck:
+            total_in_deck += qty
 
-    # Commander first
-    for cat_name in sorted(cards_by_cat):
-        cat_def = categories.get(cat_name, {})
-        if cat_def.get("isPremier"):
-            parts.append(f"// {cat_name}")
-            for line in cards_by_cat[cat_name]:
-                parts.append(line)
-                total += int(line.split()[0])
-            parts.append("")
+        line += cat_annotation
 
-    for cat_name in sorted(cards_by_cat):
-        cat_def = categories.get(cat_name, {})
-        if not cat_def.get("isPremier"):
-            parts.append(f"// {cat_name}")
-            for line in cards_by_cat[cat_name]:
-                parts.append(line)
-                total += int(line.split()[0])
-            parts.append("")
+        # Labels
+        for label in labels:
+            label_name = label.get("name", "")
+            label_color = label.get("color", "")
+            if label_name:
+                if label_color:
+                    line += f" ^{label_name},{label_color}^"
+                else:
+                    line += f" ^{label_name}^"
 
-    parts.append(f"// Total: {total} cards")
+        parts.append(line)
+
+    parts.sort()
+    parts.append("")
+    parts.append(f"# Total in deck: {total_in_deck}")
 
     return "\n".join(parts)
 
@@ -990,17 +1013,38 @@ class ValidateArchidektInput(BaseModel):
 
 
 def _parse_decklist(text: str) -> list[tuple[int, str]]:
-    """Parse a decklist into (quantity, card_name) tuples."""
+    """Parse a decklist into (quantity, card_name) tuples.
+
+    Handles multiple formats:
+      1 Card Name
+      1x Card Name
+      1x Card Name (set) 123 [Category{flags}] ^Label,#hex^
+      # comments are ignored
+    """
     cards: list[tuple[int, str]] = []
     for line in text.strip().splitlines():
         line = line.strip()
         if not line or line.startswith("//") or line.startswith("#"):
             continue
-        match = re.match(r"^(\d+)\s+(.+)$", line)
+        # Match: optional quantity (with optional 'x'), then card name,
+        # then strip trailing (set), collector#, [category], ^label^
+        match = re.match(r"^(\d+)x?\s+(.+)$", line)
         if match:
-            cards.append((int(match.group(1)), match.group(2).strip()))
-        elif line:
-            cards.append((1, line))
+            qty = int(match.group(1))
+            name = match.group(2).strip()
+        else:
+            qty = 1
+            name = line
+
+        # Strip Archidekt suffixes: (set) collector [Cat{flags}] ^label^
+        name = re.sub(r"\s*\^[^^]*\^", "", name)       # ^Label,#hex^
+        name = re.sub(r"\s*\[[^\]]*\]", "", name)       # [Category{flags}]
+        name = re.sub(r"\s+\d+$", "", name)              # trailing collector number
+        name = re.sub(r"\s*\([a-z0-9]+\)$", "", name)   # (set)
+        name = name.strip()
+
+        if name:
+            cards.append((qty, name))
     return cards
 
 
