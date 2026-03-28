@@ -67,24 +67,42 @@ async def _scryfall_post(endpoint: str, body: dict) -> dict:
         return resp.json()
 
 
-def _format_card(card: dict, verbose: bool = False) -> str:
+def _format_face(face: dict) -> list[str]:
+    """Format a single card face (front or back of a DFC)."""
     lines: list[str] = []
-    name = card.get("name", "Unknown")
-    mana = card.get("mana_cost", "")
+    name = face.get("name", "Unknown")
+    mana = face.get("mana_cost", "")
     lines.append(f"**{name}** {mana}")
 
-    type_line = card.get("type_line", "")
+    type_line = face.get("type_line", "")
     if type_line:
         lines.append(f"Type: {type_line}")
 
-    oracle = card.get("oracle_text", "")
+    oracle = face.get("oracle_text", "")
     if oracle:
         lines.append(f"Text: {oracle}")
 
-    if "power" in card and "toughness" in card:
-        lines.append(f"P/T: {card['power']}/{card['toughness']}")
-    if "loyalty" in card:
-        lines.append(f"Loyalty: {card['loyalty']}")
+    if face.get("power") is not None and face.get("toughness") is not None:
+        lines.append(f"P/T: {face['power']}/{face['toughness']}")
+    if face.get("loyalty") is not None:
+        lines.append(f"Loyalty: {face['loyalty']}")
+
+    return lines
+
+
+def _format_card(card: dict, verbose: bool = False) -> str:
+    lines: list[str] = []
+    faces = card.get("card_faces", [])
+
+    if faces:
+        # Double-faced card: format each face
+        lines.extend(_format_face(faces[0]))
+        for face in faces[1:]:
+            lines.append("---")
+            lines.extend(_format_face(face))
+    else:
+        # Single-faced card
+        lines.extend(_format_face(card))
 
     ci = card.get("color_identity", [])
     lines.append(f"Color Identity: {', '.join(ci) if ci else 'Colorless'}")
