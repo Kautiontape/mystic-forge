@@ -10,6 +10,7 @@ configure Archidekt credentials for private deck access.
 """
 
 import re
+import time
 from typing import Optional, Dict, Any
 from enum import Enum
 from collections import Counter
@@ -24,6 +25,8 @@ SCRYFALL_API = "https://api.scryfall.com"
 EDHREC_JSON = "https://json.edhrec.com"
 EDHREC_API = "https://edhrec.com/api"
 ARCHIDEKT_API = "https://archidekt.com/api"
+SPELLBOOK_API = "https://backend.commanderspellbook.com"
+MTGJSON_API = "https://mtgjson.com/api/v5"
 USER_AGENT = "MysticForge/1.0"
 REQUEST_TIMEOUT = 15.0
 
@@ -38,7 +41,10 @@ mcp = FastMCP(
         "Never manually format decklists with // comments or *CMDR* markers — "
         "the format_archidekt tool produces correct Archidekt import syntax including "
         "[Commander{top}], [Maybeboard{noDeck}{noPrice}], [Category], set codes, and labels. "
-        "Pass each card with its category, commander/maybeboard flags, and any labels."
+        "Pass each card with its category, commander/maybeboard flags, and any labels. "
+        "Use spellbook_combos and spellbook_card_combos for combo lookups — do not guess combos from memory. "
+        "Use scryfall_rulings for official card rulings instead of reciting rules from memory. "
+        "Use precon_search and precon_decklist for preconstructed deck lookups."
     ),
     host="0.0.0.0",
     port=8000,
@@ -1413,6 +1419,400 @@ async def validate_archidekt_deck(params: ValidateArchidektInput) -> str:
         parts.append(f"All {len(unique_names)} cards verified. Deck size: {total_in_deck}. Categories valid.")
 
     return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMMANDER SPELLBOOK — Combo search
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def _spellbook_get(path: str, params: Optional[Dict[str, Any]] = None) -> dict:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{SPELLBOOK_API}{path}",
+            params=params,
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _spellbook_error(e: Exception) -> str:
+    if isinstance(e, httpx.HTTPStatusError):
+        return f"Commander Spellbook API error ({e.response.status_code}): {e.response.text[:300]}"
+    if isinstance(e, httpx.TimeoutException):
+        return "Request to Commander Spellbook timed out. Try again."
+    return f"Unexpected error: {type(e).__name__}: {e}"
+
+
+def _format_combo(variant: dict) -> str:
+    lines: list[str] = []
+
+    # Cards used
+    uses = variant.get("uses", [])
+    card_names = [u.get("card", {}).get("name", "?") for u in uses]
+    lines.append(f"**Cards:** {' + '.join(card_names)}")
+
+    # Color identity
+    identity = variant.get("identity", "")
+    if identity:
+        lines.append(f"Colors: {identity}")
+
+    # Mana needed
+    mana = variant.get("manaNeeded", "")
+    if mana:
+        lines.append(f"Mana needed: {mana}")
+
+    # Prerequisites
+    prereqs = variant.get("easyPrerequisites", "")
+    if prereqs:
+        lines.append(f"Prerequisites: {prereqs}")
+
+    # Steps
+    desc = variant.get("description", "")
+    if desc:
+        lines.append(f"Steps: {desc}")
+
+    # Results
+    produces = variant.get("produces", [])
+    results = [p.get("feature", {}).get("name", "?") for p in produces if p.get("feature")]
+    if results:
+        lines.append(f"Produces: {', '.join(results)}")
+
+    # Popularity
+    pop = variant.get("popularity")
+    if pop:
+        lines.append(f"Popularity: {pop} decks")
+
+    return "\n".join(lines)
+
+
+# ── Spellbook Input Models ───────────────────────────────────────────────────
+
+
+class SpellbookCombosInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    cards: list[str] = Field(
+        ...,
+        description="Card names to find combos for (e.g., ['Dualcaster Mage', 'Twinflame']).",
+        min_length=1, max_length=10,
+    )
+    color_identity: Optional[str] = Field(
+        default=None,
+        description="Optional color identity filter (e.g., 'wubrg', 'bg', 'r').",
+    )
+    limit: int = Field(default=10, ge=1, le=25)
+
+
+class SpellbookCardInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    card: str = Field(..., description="Card name to find combos for.", min_length=1, max_length=200)
+    color_identity: Optional[str] = Field(default=None, description="Optional color identity filter.")
+    limit: int = Field(default=10, ge=1, le=25)
+
+
+# ── Spellbook Tools ──────────────────────────────────────────────────────────
+
+
+@mcp.tool(name="spellbook_combos")
+async def spellbook_combos(params: SpellbookCombosInput) -> str:
+    """Search Commander Spellbook for combos involving specific cards together.
+
+    Finds combos that use ALL the specified cards. Returns step-by-step
+    instructions, prerequisites, and what the combo produces.
+    """
+    q_parts = [f'card:"{name}"' for name in params.cards]
+    if params.color_identity:
+        q_parts.append(f"ci:{params.color_identity}")
+    query = " ".join(q_parts)
+
+    try:
+        data = await _spellbook_get("/variants/", params={"q": query, "limit": params.limit})
+    except Exception as e:
+        return _spellbook_error(e)
+
+    results = data.get("results", [])
+    if not results:
+        return f"No combos found involving {' + '.join(params.cards)}."
+
+    parts: list[str] = []
+    parts.append(f"# Combos with {' + '.join(params.cards)}")
+    parts.append("")
+
+    for i, variant in enumerate(results, 1):
+        parts.append(f"## Combo {i}")
+        parts.append(_format_combo(variant))
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+@mcp.tool(name="spellbook_card_combos")
+async def spellbook_card_combos(params: SpellbookCardInput) -> str:
+    """Find all combos that use a specific card from Commander Spellbook.
+
+    Useful for discovering what combo potential a card has.
+    """
+    q_parts = [f'card:"{params.card}"']
+    if params.color_identity:
+        q_parts.append(f"ci:{params.color_identity}")
+    query = " ".join(q_parts)
+
+    try:
+        data = await _spellbook_get("/variants/", params={"q": query, "limit": params.limit})
+    except Exception as e:
+        return _spellbook_error(e)
+
+    results = data.get("results", [])
+    if not results:
+        return f"No combos found for {params.card}."
+
+    parts: list[str] = []
+    count = data.get("count", len(results))
+    parts.append(f"# Combos with {params.card} ({count} total, showing {len(results)})")
+    parts.append("")
+
+    for i, variant in enumerate(results, 1):
+        parts.append(f"## Combo {i}")
+        parts.append(_format_combo(variant))
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RULINGS — Official card rulings from Scryfall
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class RulingsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: str = Field(..., description="Card name to get rulings for.", min_length=1, max_length=200)
+
+
+@mcp.tool(name="scryfall_rulings")
+async def scryfall_rulings(params: RulingsInput) -> str:
+    """Get official Wizards of the Coast rulings for a card.
+
+    Returns dated rulings that clarify how a card works, including
+    interactions, edge cases, and errata.
+    """
+    # Look up the card to get its rulings URI
+    try:
+        card = await _scryfall_get("/cards/named", params={"exact": params.name})
+    except httpx.HTTPStatusError:
+        try:
+            card = await _scryfall_get("/cards/named", params={"fuzzy": params.name})
+        except Exception as e:
+            return _scryfall_error(e)
+    except Exception as e:
+        return _scryfall_error(e)
+
+    rulings_uri = card.get("rulings_uri", "")
+    if not rulings_uri:
+        return f"No rulings URI found for {card.get('name', params.name)}."
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                rulings_uri,
+                headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        return _scryfall_error(e)
+
+    rulings = data.get("data", [])
+    if not rulings:
+        return f"No rulings found for {card.get('name', params.name)}."
+
+    parts: list[str] = []
+    parts.append(f"# Rulings for {card.get('name', params.name)}")
+    parts.append("")
+
+    for r in rulings:
+        date = r.get("published_at", "?")
+        source = r.get("source", "?")
+        comment = r.get("comment", "")
+        parts.append(f"**{date}** ({source}): {comment}")
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRECON DECKS — Preconstructed deck lookup via MTGJSON
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_deck_list_cache: dict[str, Any] = {"data": None, "expires_at": 0.0}
+
+
+async def _mtgjson_get(path: str) -> dict:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{MTGJSON_API}{path}",
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            timeout=30.0,  # MTGJSON DeckList.json is large
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _mtgjson_error(e: Exception) -> str:
+    if isinstance(e, httpx.HTTPStatusError):
+        return f"MTGJSON API error ({e.response.status_code}): {e.response.text[:300]}"
+    if isinstance(e, httpx.TimeoutException):
+        return "Request to MTGJSON timed out. Try again."
+    return f"Unexpected error: {type(e).__name__}: {e}"
+
+
+async def _get_deck_list() -> list[dict]:
+    if _deck_list_cache["data"] and time.time() < _deck_list_cache["expires_at"]:
+        return _deck_list_cache["data"]
+    data = await _mtgjson_get("/DeckList.json")
+    _deck_list_cache["data"] = data.get("data", [])
+    _deck_list_cache["expires_at"] = time.time() + 86400
+    return _deck_list_cache["data"]
+
+
+# ── Precon Input Models ──────────────────────────────────────────────────────
+
+
+class PreconSearchInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    query: str = Field(..., description="Search term for deck name or set code (e.g., 'Forces of the Imperium' or 'MKC').", min_length=1)
+    commander_only: bool = Field(default=True, description="If true, only show Commander precons.")
+    limit: int = Field(default=15, ge=1, le=50)
+
+
+class PreconDeckInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    file_name: str = Field(..., description="Deck fileName from precon_search results (e.g., 'ForcesOfTheImperium_40K').", min_length=1)
+
+
+# ── Precon Tools ─────────────────────────────────────────────────────────────
+
+
+@mcp.tool(name="precon_search")
+async def precon_search(params: PreconSearchInput) -> str:
+    """Search for preconstructed decks by name or set code.
+
+    Searches MTGJSON's database of 2700+ precon decks. Returns deck names,
+    set codes, and fileNames needed to fetch full decklists.
+    """
+    try:
+        decks = await _get_deck_list()
+    except Exception as e:
+        return _mtgjson_error(e)
+
+    query_lower = params.query.lower()
+    matches: list[dict] = []
+
+    for deck in decks:
+        name = deck.get("name", "")
+        code = deck.get("code", "")
+        deck_type = deck.get("type", "")
+
+        if params.commander_only and "Commander" not in deck_type:
+            continue
+
+        if query_lower in name.lower() or query_lower in code.lower():
+            matches.append(deck)
+
+    if not matches:
+        return f"No precon decks found matching '{params.query}'."
+
+    parts: list[str] = []
+    parts.append(f"# Precon Search: '{params.query}' ({len(matches)} results)")
+    parts.append("")
+
+    for deck in matches[:params.limit]:
+        name = deck.get("name", "?")
+        code = deck.get("code", "?")
+        deck_type = deck.get("type", "?")
+        file_name = deck.get("fileName", "?")
+        parts.append(f"- **{name}** ({code}) — {deck_type}")
+        parts.append(f"  fileName: `{file_name}`")
+
+    return "\n".join(parts)
+
+
+@mcp.tool(name="precon_decklist")
+async def precon_decklist(params: PreconDeckInput) -> str:
+    """Get the full decklist for a preconstructed deck.
+
+    Returns commander, main deck, and sideboard organized by card name.
+    Use precon_search first to find the fileName.
+    """
+    try:
+        data = await _mtgjson_get(f"/decks/{params.file_name}.json")
+    except Exception as e:
+        return _mtgjson_error(e)
+
+    deck = data.get("data", {})
+    parts: list[str] = []
+    parts.append(f"# {deck.get('name', 'Unknown Deck')}")
+    parts.append(f"Set: {deck.get('code', '?')} | Type: {deck.get('type', '?')}")
+    parts.append("")
+
+    commander = deck.get("commander", [])
+    if commander:
+        parts.append("## Commander")
+        for card in commander:
+            parts.append(f"{card.get('count', 1)} {card.get('name', '?')}")
+        parts.append("")
+
+    main = deck.get("mainBoard", [])
+    if main:
+        parts.append(f"## Main Deck ({sum(c.get('count', 1) for c in main)} cards)")
+        for card in sorted(main, key=lambda c: c.get("name", "")):
+            parts.append(f"{card.get('count', 1)} {card.get('name', '?')}")
+        parts.append("")
+
+    side = deck.get("sideBoard", [])
+    if side:
+        parts.append(f"## Sideboard ({sum(c.get('count', 1) for c in side)} cards)")
+        for card in sorted(side, key=lambda c: c.get("name", "")):
+            parts.append(f"{card.get('count', 1)} {card.get('name', '?')}")
+        parts.append("")
+
+    total = sum(c.get("count", 1) for c in commander) + sum(c.get("count", 1) for c in main)
+    parts.append(f"**Total: {total} cards**")
+
+    return "\n".join(parts)
+
+
+@mcp.tool(name="precon_export")
+async def precon_export(params: PreconDeckInput) -> str:
+    """Export a preconstructed deck in Archidekt import format.
+
+    Returns the deck in Archidekt-compatible syntax with [Commander{top}]
+    annotations. Paste directly into Archidekt's import dialog.
+    """
+    try:
+        data = await _mtgjson_get(f"/decks/{params.file_name}.json")
+    except Exception as e:
+        return _mtgjson_error(e)
+
+    deck = data.get("data", {})
+    lines: list[str] = []
+
+    commander = deck.get("commander", [])
+    for card in commander:
+        lines.append(f"{card.get('count', 1)}x {card.get('name', '?')} [Commander{{top}}]")
+
+    main = deck.get("mainBoard", [])
+    for card in sorted(main, key=lambda c: c.get("name", "")):
+        lines.append(f"{card.get('count', 1)}x {card.get('name', '?')}")
+
+    side = deck.get("sideBoard", [])
+    for card in side:
+        lines.append(f"{card.get('count', 1)}x {card.get('name', '?')} [Sideboard]")
+
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
