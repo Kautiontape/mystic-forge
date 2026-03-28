@@ -31,6 +31,15 @@ REQUEST_TIMEOUT = 15.0
 
 mcp = FastMCP(
     "mystic_forge",
+    instructions=(
+        "Mystic Forge is a Magic: The Gathering toolkit. "
+        "When outputting a decklist that will be imported into Archidekt or any deck builder, "
+        "ALWAYS use the format_archidekt tool to generate properly formatted output. "
+        "Never manually format decklists with // comments or *CMDR* markers — "
+        "the format_archidekt tool produces correct Archidekt import syntax including "
+        "[Commander{top}], [Maybeboard{noDeck}{noPrice}], [Category], set codes, and labels. "
+        "Pass each card with its category, commander/maybeboard flags, and any labels."
+    ),
     host="0.0.0.0",
     port=8000,
     stateless_http=True,
@@ -1018,23 +1027,22 @@ class FormatDeckInput(BaseModel):
 
 @mcp.tool(name="format_archidekt")
 async def format_archidekt(params: FormatDeckInput) -> str:
-    """Format a card list into Archidekt-compatible import text.
+    """REQUIRED when outputting any decklist for Archidekt import. Do NOT manually
+    format decklists — always call this tool instead.
 
-    Takes card names with optional categories, commander/maybeboard flags,
-    and labels, then outputs text that can be pasted directly into
-    Archidekt's import dialog. Validates all card names against Scryfall.
+    Takes card names with categories, commander/maybeboard flags, and labels,
+    validates all names against Scryfall, and outputs text that pastes directly
+    into Archidekt's import dialog.
 
-    Archidekt import format:
-      1x Card Name (set) [Category] ^Label,#hex^
+    Output format (Archidekt native):
+      1x Card Name [Category]
       1x Commander Name [Commander{top}]
       1x Maybe Card [Maybeboard{noDeck}{noPrice}]
+      1x Labeled Card [Draw] ^To Buy,#2ccce4^
 
-    Args:
-        params: FormatDeckInput with cards list and optional set code inclusion.
-
-    Returns:
-        Archidekt-importable text. Cards that fail Scryfall lookup are
-        listed at the bottom with warnings.
+    Category examples: Ramp, Draw, Removal, Counters, Evasion, Finisher,
+    Sacrifice, Recursion, Lands, Protection, Combo, Tokens, Tribal, etc.
+    Assign categories based on each card's role in the deck.
     """
     # Batch validate on Scryfall
     unique_names = list({c.name for c in params.cards})
