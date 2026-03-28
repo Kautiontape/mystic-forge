@@ -1,0 +1,16 @@
+name: Deploy to ktn
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, ktn]
+    steps:
+      - name: Deploy
+        run: |
+          cd /opt/services/mcp-servers
+          git submodule update --remote mystic-forge
+          docker compose build mystic-forge
+          docker compose up -d mystic-forge
