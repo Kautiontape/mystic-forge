@@ -383,7 +383,7 @@ async def scryfall_price_list(params: PriceListInput) -> str:
     found = data.get("data", [])
     not_found = data.get("not_found", [])
 
-    priced: list[tuple[str, float, str]] = []
+    priced: list[tuple[str, float]] = []
     no_price: list[str] = []
 
     for card in found:
@@ -391,7 +391,7 @@ async def scryfall_price_list(params: PriceListInput) -> str:
         prices = card.get("prices", {})
         usd = prices.get("usd") or prices.get("usd_foil") or prices.get("usd_etched")
         if usd:
-            priced.append((name, float(usd), usd))
+            priced.append((name, float(usd)))
         else:
             no_price.append(name)
 
@@ -402,9 +402,9 @@ async def scryfall_price_list(params: PriceListInput) -> str:
     parts.append("")
 
     total = 0.0
-    for name, val, display in priced:
-        parts.append(f"- **{name}** — ${display}")
-        total += val
+    for name, val in priced:
+        parts.append(f"- **{name}** — ${val:.2f}")
+        total = round(total + val, 2)
 
     if no_price:
         parts.append("")
