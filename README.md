@@ -18,6 +18,7 @@ A unified MCP (Model Context Protocol) server for Magic: The Gathering. Combines
 |---|---|
 | `edhrec_commander` | Top card recommendations for a commander |
 | `edhrec_average_deck` | Average decklist for a commander |
+| `edhrec_precon_upgrade` | Community cut/added cards for a precon (real add %, ranked cuts) |
 | `edhrec_combos` | Popular combo lines |
 | `edhrec_top_cards` | Trending cards by period and color |
 | `edhrec_recommendations` | Personalized suggestions given your current cards |
@@ -35,6 +36,14 @@ A unified MCP (Model Context Protocol) server for Magic: The Gathering. Combines
 |---|---|
 | `validate_decklist` | Verify card names, deck size, and color identity |
 | `validate_archidekt_deck` | Full validation of an Archidekt deck including categories |
+
+### Precon Decks (MTGJSON + EDHRec)
+| Tool | Description |
+|---|---|
+| `precon_search` | Search official precons by name or set code (MTGJSON) |
+| `precon_decklist` | Full official contents of a precon (MTGJSON) |
+| `precon_export` | Export a precon in Archidekt import format |
+| `precon_diff` | Exact cut/added cards between a precon and a specific deck |
 
 ## Quick Start
 
