@@ -2110,6 +2110,156 @@ async def precon_export(params: PreconDeckInput) -> str:
     return "\n".join(lines)
 
 
+class PreconDiffInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    file_name: str = Field(
+        ...,
+        description="MTGJSON precon fileName from precon_search (e.g. 'WorldShaper_TDC').",
+        min_length=1,
+    )
+    deck: Optional[str] = Field(
+        default=None,
+        description="Upgraded deck as an Archidekt deck ID or URL.",
+    )
+    decklist: Optional[str] = Field(
+        default=None,
+        description="OR the upgraded deck as a pasted list ('1 Card Name' per line).",
+    )
+    canonicalize: bool = Field(
+        default=True,
+        description="Normalize display names via Scryfall and flag unrecognized "
+                    "cards. Matching is always case-insensitive.",
+    )
+
+
+@mcp.tool(name="precon_diff")
+async def precon_diff(params: PreconDiffInput) -> str:
+    """Compute the exact cards cut and added between a preconstructed deck and a
+    specific upgraded deck. Use this INSTEAD of estimating from memory when a user
+    wants a real cut/added percentage for one deck.
+
+    The precon baseline comes from MTGJSON (use precon_search for the fileName).
+    Provide the upgraded deck as either an Archidekt deck (`deck`) or a pasted
+    `decklist`. Basic lands are reported separately so routine mana-base churn
+    doesn't distort the numbers.
+    """
+    if bool(params.deck) == bool(params.decklist):
+        return ("Provide exactly one of `deck` (Archidekt ID/URL) or `decklist` "
+                "(pasted list).")
+
+    # Precon baseline (MTGJSON).
+    try:
+        pdata = await _mtgjson_get(f"/decks/{params.file_name}.json")
+    except Exception as e:
+        return _mtgjson_error(e)
+    deck_obj = pdata.get("data", {})
+    precon: dict[str, int] = {}
+    for card in deck_obj.get("commander", []) + deck_obj.get("mainBoard", []):
+        name = card.get("name", "?")
+        precon[name] = precon.get(name, 0) + card.get("count", 1)
+
+    # Upgraded side.
+    if params.deck:
+        deck_id = _parse_deck_id(params.deck)
+        try:
+            adata = await _archidekt_get(f"/decks/{deck_id}/")
+        except Exception as e:
+            return _archidekt_error(e)
+        upgraded = _archidekt_in_deck_cards(adata)
+        upgraded_src = f"Archidekt deck {deck_id}"
+    else:
+        upgraded = {}
+        for qty, name in _parse_decklist(params.decklist):
+            upgraded[name] = upgraded.get(name, 0) + qty
+        upgraded_src = "pasted decklist"
+
+    # Optional Scryfall canonicalization (display + unknown-card flagging).
+    canon: Optional[dict[str, str]] = None
+    unknown: list[str] = []
+    canon_note = ""
+    if params.canonicalize:
+        canon = await _canonical_names(list({*precon, *upgraded}))
+        if canon is None:
+            canon_note = ("_Name canonicalization unavailable — matched on raw "
+                          "names._")
+        else:
+            for n in {*precon, *upgraded}:
+                if _diff_key(n) not in canon:
+                    unknown.append(n)
+
+    def display(name: str) -> str:
+        if canon:
+            return canon.get(_diff_key(name), name)
+        return name
+
+    # Split basics out, then diff non-basics by normalized key.
+    def split(counts: dict[str, int]):
+        main, basics = {}, {}
+        for n, c in counts.items():
+            (basics if n in BASIC_LANDS else main)[n] = c
+        return main, basics
+
+    precon_main, precon_basics = split(precon)
+    upgraded_main, upgraded_basics = split(upgraded)
+
+    precon_keys = {_diff_key(n): n for n in precon_main}
+    upgraded_keys = {_diff_key(n): n for n in upgraded_main}
+    added = sorted(display(upgraded_keys[k])
+                   for k in set(upgraded_keys) - set(precon_keys))
+    cut = sorted(display(precon_keys[k])
+                 for k in set(precon_keys) - set(upgraded_keys))
+    kept = set(precon_keys) & set(upgraded_keys)
+
+    precon_size = sum(precon.values())
+    pct = lambda n: (round(n / precon_size * 100) if precon_size else 0)
+
+    parts: list[str] = []
+    parts.append(f"# Precon Diff: {deck_obj.get('name', params.file_name)}")
+    parts.append(f"Baseline: {deck_obj.get('name', '?')} "
+                 f"({deck_obj.get('code', '?')})  vs  {upgraded_src}")
+    parts.append("")
+
+    parts.append(f"## Added ({len(added)})")
+    parts.extend(f"- {n}" for n in added) if added else parts.append("- (none)")
+    parts.append("")
+
+    parts.append(f"## Cut ({len(cut)})")
+    parts.extend(f"- {n}" for n in cut) if cut else parts.append("- (none)")
+    parts.append("")
+
+    parts.append("## Summary")
+    parts.append(f"- Precon size: {precon_size} cards")
+    parts.append(f"- Cut: {len(cut)} ({pct(len(cut))}% of precon)")
+    parts.append(f"- Added: {len(added)} ({pct(len(added))}% of precon)")
+    parts.append(f"- Kept: {len(kept)}")
+    parts.append("- (Basic lands excluded above and listed separately.)")
+
+    basic_names = sorted(set(precon_basics) | set(upgraded_basics))
+    basic_changes = [(n, precon_basics.get(n, 0), upgraded_basics.get(n, 0))
+                     for n in basic_names
+                     if precon_basics.get(n, 0) != upgraded_basics.get(n, 0)]
+    if basic_changes:
+        parts.append("")
+        parts.append("## Basic land changes")
+        for n, b, a in basic_changes:
+            parts.append(f"- {n}: {b} → {a}")
+
+    if unknown:
+        parts.append("")
+        parts.append("## Not recognized by Scryfall")
+        parts.append("These names were diffed as-is and may be typos:")
+        parts.extend(f"- {n}" for n in sorted(unknown))
+
+    parts.append("")
+    parts.append("---")
+    parts.append(f"Precon source: MTGJSON /decks/{params.file_name}.json | "
+                 f"Upgraded: {upgraded_src}")
+    if canon_note:
+        parts.append(canon_note)
+
+    return "\n".join(parts)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENTRYPOINT
 # ═══════════════════════════════════════════════════════════════════════════════
