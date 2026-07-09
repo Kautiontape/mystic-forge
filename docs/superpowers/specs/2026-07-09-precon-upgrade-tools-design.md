@@ -116,13 +116,23 @@ class PreconUpgradeInput(BaseModel):
 
 ### Behavior
 
-1. **Slug resolution.** If `precon` already looks like a slug (matches
-   `^[a-z0-9-]+$`), try `/pages/precon/<precon>.json` directly; if that 403s/404s,
-   fall back to index resolution. For any input with spaces or capitals, go straight
-   to index resolution: fetch the precon index (`/pages/precon.json`, cached like the
-   MTGJSON deck list — 24h) and fuzzy-match `precon` against cardview `name`. On no
-   match, return a helpful message listing the closest names. Cache the index in a
-   module-level dict mirroring `_deck_list_cache`.
+1. **Slug resolution (confidence-gated).** If `precon` already looks like a slug
+   (matches `^[a-z0-9-]+$`), try `/pages/precon/<precon>.json` directly; if that
+   403s/404s, fall back to index resolution. For any input with spaces or capitals,
+   go straight to index resolution: fetch the precon index (`/pages/precon.json`,
+   cached like the MTGJSON deck list — 24h) and score `precon` against every cardview
+   `name` using `difflib.SequenceMatcher` on normalized (lowercased, punctuation-
+   stripped via `_sanitize`) strings. Exact match or unique substring containment is
+   treated as confident. Otherwise:
+   - **Confident** (best score ≥ `MATCH_THRESHOLD`, default 0.72, and ahead of the
+     runner-up by ≥ `MATCH_MARGIN`, default 0.08): use it.
+   - **Low confidence** (below threshold, or top two scores within the margin — i.e.
+     ambiguous): **do not guess.** Return a ranked "no confident match" result
+     listing the top 5 candidates as `name — pass precon="<name>"`, so the caller
+     can confirm with the user or retry with the best hit. This is the failure gate
+     from Decision D3.
+   Thresholds are module-level constants, tunable during implementation.
+   Cache the index in a module-level dict mirroring `_deck_list_cache`.
 2. **Fetch base page** `/pages/precon/<slug>.json`.
 3. **Commander selection.**
    - Read `precon_commander_counts`.
@@ -235,16 +245,23 @@ these tools, e.g.:
   (`world-shaper`); MTGJSON uses *fileNames* (`WorldShaper_...`). `edhrec_precon_upgrade`
   resolves EDHREC slugs from the EDHREC index; `precon_diff` takes an MTGJSON
   `file_name` from `precon_search`. We do not attempt to unify them in v1.
-- **D3 — Commander-name lookup is best-effort.** Slug resolution matches on precon
-  name. If a user supplies only a commander name, they may need `precon_search`
-  first. A future enhancement could map commander → precon; out of scope for v1.
+- **D3 — Best-effort matching with a confidence gate.** Slug resolution matches on
+  precon name (see Tool 1, step 1). Rather than silently resolving a weak match, the
+  tool gates on a similarity threshold: a confident match resolves directly, while a
+  low-confidence or ambiguous match returns ranked candidates instead of guessing —
+  the tool effectively auto-searches and hands back the shortlist for confirmation.
+  Commander-name → precon mapping remains a future enhancement (out of scope for v1);
+  a user supplying only a commander name may still need `precon_search` first, but
+  the gate ensures a near-miss precon name degrades to a shortlist, not a wrong answer.
 
 ## Testing strategy
 
 - **`edhrec_precon_upgrade`:** live-endpoint tests against `world-shaper` (multi-
   commander) — assert real add percentages appear, cuts appear without a `%`, the
   commander line lists both faces, and the `commander="Hearthhull, the Worldseed"`
-  path fetches the sub-page. One negative test for an unresolvable name.
+  path fetches the sub-page. Confidence-gate tests: an exact/near name resolves,
+  while a deliberately ambiguous or low-similarity query returns a ranked candidate
+  shortlist rather than resolving to a wrong precon.
 - **`precon_diff`:** a fixture pairing a known MTGJSON precon `fileName` with a
   pasted decklist (deterministic, no Archidekt dependency) — assert Added/Cut/Kept
   membership, the percentage math, and that basic lands land in their own section.
