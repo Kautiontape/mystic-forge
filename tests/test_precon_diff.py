@@ -112,3 +112,32 @@ async def test_canonicalize_flags_unknown(monkeypatch):
         file_name="TestPrecon", decklist=listing, canonicalize=True))
     assert "Notarealcard Xyz" in out
     assert "not recognized" in out.lower()
+
+
+async def test_canonicalize_does_not_flag_resolved_partial(monkeypatch):
+    """A card Scryfall resolves under a fuller canonical name must NOT be reported
+    as 'not recognized' — only cards in Scryfall's not_found should be flagged."""
+    _fake_mtgjson(monkeypatch)
+
+    async def fake_scryfall_post(endpoint, body):
+        wanted = {i["name"] for i in body["identifiers"]}
+        data, not_found = [], []
+        for n in wanted:
+            if n == "Niv-Mizzet":            # partial → Scryfall resolves it
+                data.append({"name": "Niv-Mizzet, Parun"})
+            elif n == "Notarealcard Xyz":    # genuinely unknown
+                not_found.append({"name": n})
+            else:
+                data.append({"name": n})
+        return {"data": data, "not_found": not_found}
+
+    monkeypatch.setattr(server, "_scryfall_post", fake_scryfall_post)
+    listing = UPGRADED_LIST + "\n1 Niv-Mizzet\n1 Notarealcard Xyz"
+    out = await server.precon_diff(server.PreconDiffInput(
+        file_name="TestPrecon", decklist=listing, canonicalize=True))
+    # Genuinely-unknown card is still flagged.
+    assert "not recognized" in out.lower()
+    unknown_section = out.split("Not recognized by Scryfall")[1]
+    assert "Notarealcard Xyz" in unknown_section
+    # Resolved partial must NOT appear in the unrecognized list.
+    assert "Niv-Mizzet" not in unknown_section

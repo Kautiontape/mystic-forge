@@ -960,7 +960,7 @@ async def edhrec_precon_upgrade(params: PreconUpgradeInput) -> str:
             parts.append(f"## {title} (ranked by how often they're cut)")
             for cv in cl["cardviews"][:params.limit]:
                 score = cv.get("unpopularity")
-                suffix = (f" — cut-frequency score {score:.2f}"
+                suffix = (f" — cut-rank score {score:.2f}"
                           if isinstance(score, (int, float)) else "")
                 parts.append(f"- **{cv.get('name', '?')}**{suffix}")
             parts.append("")
@@ -1951,13 +1951,17 @@ def _diff_key(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip().lower()
 
 
-async def _canonical_names(names: list[str]) -> Optional[dict[str, str]]:
-    """Map _diff_key(name) → Scryfall canonical name for recognized cards.
+async def _canonical_names(names: list[str]) -> Optional[tuple[dict[str, str], set[str]]]:
+    """Look card names up on Scryfall.
 
-    Returns None if the Scryfall lookup fails entirely (caller falls back to raw
-    names). Names absent from the returned map are unrecognized by Scryfall.
+    Returns (mapping, not_found) where mapping is _diff_key(name) → canonical name
+    for recognized cards, and not_found is the set of _diff_key(name) values that
+    Scryfall did not recognize. Returns None if the lookup fails entirely (caller
+    falls back to raw names). Recognition is judged by Scryfall's own not_found list
+    — a name it resolves under a fuller canonical spelling is NOT unrecognized.
     """
     mapping: dict[str, str] = {}
+    not_found: set[str] = set()
     try:
         for i in range(0, len(names), 75):
             batch = names[i:i + 75]
@@ -1969,9 +1973,13 @@ async def _canonical_names(names: list[str]) -> Optional[dict[str, str]]:
                 cname = card.get("name", "")
                 if cname:
                     mapping[_diff_key(cname)] = cname
+            for item in data.get("not_found", []):
+                nm = item.get("name", "") if isinstance(item, dict) else str(item)
+                if nm:
+                    not_found.add(_diff_key(nm))
     except Exception:
         return None
-    return mapping
+    return mapping, not_found
 
 
 # ── Precon Input Models ──────────────────────────────────────────────────────
@@ -2181,13 +2189,14 @@ async def precon_diff(params: PreconDiffInput) -> str:
     unknown: list[str] = []
     canon_note = ""
     if params.canonicalize:
-        canon = await _canonical_names(list({*precon, *upgraded}))
-        if canon is None:
+        result = await _canonical_names(list({*precon, *upgraded}))
+        if result is None:
             canon_note = ("_Name canonicalization unavailable — matched on raw "
                           "names._")
         else:
+            canon, not_found_keys = result
             for n in {*precon, *upgraded}:
-                if _diff_key(n) not in canon:
+                if _diff_key(n) in not_found_keys:
                     unknown.append(n)
 
     def display(name: str) -> str:
