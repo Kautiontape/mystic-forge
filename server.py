@@ -14,6 +14,7 @@ import time
 from typing import Optional, Dict, Any
 from enum import Enum
 from collections import Counter
+from difflib import SequenceMatcher
 
 import httpx
 from pydantic import BaseModel, Field, ConfigDict
@@ -29,6 +30,10 @@ SPELLBOOK_API = "https://backend.commanderspellbook.com"
 MTGJSON_API = "https://mtgjson.com/api/v5"
 USER_AGENT = "MysticForge/1.0"
 REQUEST_TIMEOUT = 15.0
+
+# Precon name → slug fuzzy-match gate (Decision D3). Tunable.
+MATCH_THRESHOLD = 0.72   # min difflib ratio to accept a match
+MATCH_MARGIN = 0.08      # min lead over the runner-up to accept without ambiguity
 
 # ── Server ───────────────────────────────────────────────────────────────────
 
