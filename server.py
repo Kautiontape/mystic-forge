@@ -1007,6 +1007,28 @@ def _archidekt_error(e: Exception) -> str:
     return f"Unexpected error: {type(e).__name__}: {e}"
 
 
+def _archidekt_in_deck_cards(data: dict) -> dict[str, int]:
+    """Return {card_name: quantity} for cards in the deck (commander included,
+    maybeboard excluded). Mirrors the inclusion logic used by archidekt_deck."""
+    categories = {c["name"]: c for c in data.get("categories", [])}
+    counts: dict[str, int] = {}
+    for entry in data.get("cards", []):
+        qty = entry.get("quantity", 1)
+        name = entry.get("card", {}).get("oracleCard", {}).get("name", "?")
+        entry_cats = entry.get("categories", [])
+        if entry_cats:
+            in_deck = any(
+                categories.get(cn, {}).get("isPremier", False)
+                or categories.get(cn, {}).get("includedInDeck", True)
+                for cn in entry_cats
+            )
+        else:
+            in_deck = True  # uncategorized cards default into the deck
+        if in_deck:
+            counts[name] = counts.get(name, 0) + qty
+    return counts
+
+
 def _parse_deck_id(deck_ref: str) -> str:
     """Extract deck ID from an Archidekt URL or raw ID."""
     match = re.search(r"archidekt\.com/decks/(\d+)", deck_ref)
@@ -1912,6 +1934,41 @@ async def _get_deck_list() -> list[dict]:
     _deck_list_cache["data"] = data.get("data", [])
     _deck_list_cache["expires_at"] = time.time() + 86400
     return _deck_list_cache["data"]
+
+
+BASIC_LANDS = {
+    "Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes",
+    "Snow-Covered Plains", "Snow-Covered Island", "Snow-Covered Swamp",
+    "Snow-Covered Mountain", "Snow-Covered Forest", "Snow-Covered Wastes",
+}
+
+
+def _diff_key(name: str) -> str:
+    """Normalized comparison key for card names (case/whitespace-insensitive)."""
+    return re.sub(r"\s+", " ", name).strip().lower()
+
+
+async def _canonical_names(names: list[str]) -> Optional[dict[str, str]]:
+    """Map _diff_key(name) → Scryfall canonical name for recognized cards.
+
+    Returns None if the Scryfall lookup fails entirely (caller falls back to raw
+    names). Names absent from the returned map are unrecognized by Scryfall.
+    """
+    mapping: dict[str, str] = {}
+    try:
+        for i in range(0, len(names), 75):
+            batch = names[i:i + 75]
+            data = await _scryfall_post(
+                "/cards/collection",
+                {"identifiers": [{"name": n} for n in batch]},
+            )
+            for card in data.get("data", []):
+                cname = card.get("name", "")
+                if cname:
+                    mapping[_diff_key(cname)] = cname
+    except Exception:
+        return None
+    return mapping
 
 
 # ── Precon Input Models ──────────────────────────────────────────────────────
