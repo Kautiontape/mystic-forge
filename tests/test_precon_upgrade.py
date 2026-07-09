@@ -89,3 +89,67 @@ async def test_resolve_low_confidence_returns_candidates(monkeypatch):
     kind, val = await server._resolve_precon_slug("Zzqx Nonsense Foo")
     assert kind == "candidates"
     assert isinstance(val, list) and len(val) >= 1
+
+
+# ── Tool tests ────────────────────────────────────────────────────────────────
+
+async def test_adds_show_real_percentage(monkeypatch):
+    _fake_edhrec_get(monkeypatch)
+    out = await server.edhrec_precon_upgrade(
+        server.PreconUpgradeInput(precon="World Shaper"))
+    assert "Cards to Add" in out
+    assert "Icetill Explorer" in out
+    assert "42%" in out                 # 1143 / 2737
+    assert "1143 of 2737 decks" in out
+
+
+async def test_cuts_have_no_percentage(monkeypatch):
+    _fake_edhrec_get(monkeypatch)
+    out = await server.edhrec_precon_upgrade(
+        server.PreconUpgradeInput(precon="World Shaper"))
+    assert "Cards to Cut" in out
+    # The cut card appears, but its line carries no "%".
+    cut_line = next(ln for ln in out.splitlines() if "World Breaker" in ln)
+    assert "%" not in cut_line
+    assert "unpopularity" in out.lower()          # the honest-labeling note
+
+
+async def test_lists_both_commanders(monkeypatch):
+    _fake_edhrec_get(monkeypatch)
+    out = await server.edhrec_precon_upgrade(
+        server.PreconUpgradeInput(precon="World Shaper"))
+    assert "Hearthhull, the Worldseed" in out
+    assert "Szarel, Genesis Shepherd" in out
+    assert "12322 decks" in out
+
+
+async def test_commander_param_fetches_subpage(monkeypatch):
+    _fake_edhrec_get(monkeypatch)
+    out = await server.edhrec_precon_upgrade(
+        server.PreconUpgradeInput(precon="World Shaper",
+                                  commander="Hearthhull, the Worldseed"))
+    assert "Hearthhull" in out
+    assert "Cultivate" in out           # SUB-page's add card
+    assert "Icetill Explorer" not in out
+
+
+async def test_slug_fast_path(monkeypatch):
+    _fake_edhrec_get(monkeypatch)
+    out = await server.edhrec_precon_upgrade(
+        server.PreconUpgradeInput(precon="world-shaper"))
+    assert "Icetill Explorer" in out
+
+
+async def test_low_confidence_query_returns_candidates(monkeypatch):
+    _fake_edhrec_get(monkeypatch)
+    out = await server.edhrec_precon_upgrade(
+        server.PreconUpgradeInput(precon="Zzqx Nonsense Foo"))
+    assert "No confident precon match" in out
+
+
+async def test_provenance_footer(monkeypatch):
+    _fake_edhrec_get(monkeypatch)
+    out = await server.edhrec_precon_upgrade(
+        server.PreconUpgradeInput(precon="World Shaper"))
+    assert "edhrec.com/precon/world-shaper" in out
+    assert "Based on 2764 decks" in out            # default commander = Szarel

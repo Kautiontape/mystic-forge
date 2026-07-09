@@ -823,6 +823,160 @@ def _precon_candidates_message(query: str, names: list[str]) -> str:
     return "\n".join(lines)
 
 
+class PreconUpgradeInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    precon: str = Field(
+        ...,
+        description="Precon name or slug (e.g. 'World Shaper' or 'world-shaper').",
+        min_length=1, max_length=200,
+    )
+    commander: Optional[str] = Field(
+        default=None,
+        description="Face commander to view when the precon builds as several "
+                    "(e.g. 'Hearthhull, the Worldseed').",
+    )
+    limit: int = Field(default=20, ge=1, le=50, description="Max cards per section.")
+
+
+@mcp.tool(name="edhrec_precon_upgrade")
+async def edhrec_precon_upgrade(params: PreconUpgradeInput) -> str:
+    """Get how a preconstructed deck is commonly upgraded, from EDHRec's Precon
+    Upgrade Guide. Use this INSTEAD of web search or memory for "what cards are
+    cut/added" questions.
+
+    Returns the most-added cards/lands with real inclusion percentages, and the
+    most-cut cards/lands as a ranked list (EDHRec's unpopularity score, not a
+    percentage). Precons that build as multiple commanders are handled explicitly;
+    pass `commander` to switch faces. For an exact cut percentage against a
+    specific deck, use precon_diff.
+    """
+    query = params.precon.strip()
+
+    # 1. Resolve to a base slug (fast path for literal slugs, else gated resolve).
+    slug: Optional[str] = None
+    if re.fullmatch(r"[a-z0-9-]+", query):
+        slug = query  # optimistic; validated by the fetch below
+    else:
+        try:
+            kind, val = await _resolve_precon_slug(query)
+        except Exception as e:
+            return _edhrec_error(e)
+        if kind == "candidates":
+            return _precon_candidates_message(params.precon, val)
+        slug = val
+
+    # 2. Fetch the base page; if an optimistic slug 403/404s, fall back to resolve.
+    try:
+        page = await _edhrec_get(f"/pages/precon/{slug}.json")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (403, 404):
+            try:
+                kind, val = await _resolve_precon_slug(query)
+            except Exception as e2:
+                return _edhrec_error(e2)
+            if kind == "candidates":
+                return _precon_candidates_message(params.precon, val)
+            slug = val
+            try:
+                page = await _edhrec_get(f"/pages/precon/{slug}.json")
+            except Exception as e2:
+                return _edhrec_error(e2)
+        else:
+            return _edhrec_error(e)
+    except Exception as e:
+        return _edhrec_error(e)
+
+    commander_counts = page.get("precon_commander_counts", []) or []
+    base_href = f"/precon/{slug}"
+    active_href = base_href
+    selected = page
+
+    # 3. Optional face-commander switch → fetch the sub-page.
+    if params.commander and commander_counts:
+        cq = _sanitize(params.commander)
+        best_c, best_s = None, 0.0
+        for c in commander_counts:
+            s = _match_score(cq, _sanitize(c.get("value", "")))
+            if s > best_s:
+                best_s, best_c = s, c
+        if best_c and best_s >= MATCH_THRESHOLD:
+            href = best_c.get("href", "")
+            if href and href != base_href and href.startswith("/precon/"):
+                sub = href[len("/precon/"):]
+                try:
+                    selected = await _edhrec_get(f"/pages/precon/{sub}.json")
+                    active_href = href
+                except Exception as e:
+                    return _edhrec_error(e)
+
+    # Which commander do the shown tables describe?
+    active_commander = next(
+        (c for c in commander_counts if c.get("href") == active_href), None)
+
+    # 4. Render.
+    parts: list[str] = []
+    parts.append(f"# {selected.get('header', 'Precon Upgrade')}")
+    if commander_counts:
+        parts.append("")
+        if len(commander_counts) > 1:
+            parts.append("**Commanders in this precon:**")
+            for c in commander_counts:
+                mark = "  ← shown below" if c.get("href") == active_href else ""
+                parts.append(f"- {c.get('value', '?')} "
+                             f"({c.get('count', '?')} decks){mark}")
+            if not params.commander:
+                parts.append("")
+                parts.append('_Pass `commander="<name>"` to see another '
+                             'commander\'s upgrades._')
+    parts.append("")
+
+    cardlists = {cl.get("tag"): cl for cl in
+                 selected.get("container", {}).get("json_dict", {}).get("cardlists", [])}
+
+    for tag, title in (("cardstoadd", "Cards to Add"), ("landstoadd", "Lands to Add")):
+        cl = cardlists.get(tag)
+        if cl and cl.get("cardviews"):
+            parts.append(f"## {title}")
+            for cv in cl["cardviews"][:params.limit]:
+                inc, pot = cv.get("inclusion"), cv.get("potential_decks")
+                pct = _pct(inc, pot) if inc is not None and pot else "?%"
+                line = f"- **{cv.get('name', '?')}** — {pct}"
+                if inc is not None and pot:
+                    line += f" ({inc} of {pot} decks)"
+                syn = cv.get("synergy")
+                if syn is not None:
+                    line += f" | synergy {syn:+.0%}"
+                parts.append(line)
+            parts.append("")
+
+    any_cuts = False
+    for tag, title in (("cardstocut", "Cards to Cut"), ("landstocut", "Lands to Cut")):
+        cl = cardlists.get(tag)
+        if cl and cl.get("cardviews"):
+            any_cuts = True
+            parts.append(f"## {title} (ranked by how often they're cut)")
+            for cv in cl["cardviews"][:params.limit]:
+                score = cv.get("unpopularity")
+                suffix = (f" — cut-frequency score {score:.2f}"
+                          if isinstance(score, (int, float)) else "")
+                parts.append(f"- **{cv.get('name', '?')}**{suffix}")
+            parts.append("")
+
+    if any_cuts:
+        parts.append("_Cut ranking is EDHRec's unpopularity score (higher = cut "
+                     "more often), not a percentage. For an exact cut percentage "
+                     "against a specific deck, use precon_diff._")
+        parts.append("")
+
+    parts.append("---")
+    footer = f"Source: https://edhrec.com{active_href}"
+    if active_commander and active_commander.get("count") is not None:
+        footer += f" | Based on {active_commander['count']} decks"
+    parts.append(footer)
+
+    return "\n".join(parts)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ARCHIDEKT — Deck reading and export
 # ═══════════════════════════════════════════════════════════════════════════════
