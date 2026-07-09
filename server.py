@@ -752,6 +752,77 @@ async def edhrec_salt(params: SaltInput) -> str:
     return "\n".join(parts)
 
 
+# ── Precon index (EDHREC) ─────────────────────────────────────────────────────
+
+_precon_index_cache: dict[str, Any] = {"data": None, "expires_at": 0.0}
+
+
+async def _get_precon_index() -> list[dict]:
+    """Fetch and cache EDHREC's precon index as a list of {name, slug} (24h TTL)."""
+    if _precon_index_cache["data"] and time.time() < _precon_index_cache["expires_at"]:
+        return _precon_index_cache["data"]
+    data = await _edhrec_get("/pages/precon.json")
+    entries: list[dict] = []
+    for cl in data.get("container", {}).get("json_dict", {}).get("cardlists", []):
+        for cv in cl.get("cardviews", []):
+            name = cv.get("name", "")
+            url = cv.get("url", "")
+            slug = url.rsplit("/", 1)[-1] if url else _sanitize(name)
+            if name and slug:
+                entries.append({"name": name, "slug": slug})
+    _precon_index_cache["data"] = entries
+    _precon_index_cache["expires_at"] = time.time() + 86400
+    return entries
+
+
+def _match_score(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+async def _resolve_precon_slug(query: str) -> tuple[str, Any]:
+    """Resolve a precon name/slug to an EDHREC slug (Decision D3).
+
+    Returns ("slug", slug) on a confident match, or ("candidates", [names])
+    when the match is low-confidence or ambiguous.
+    """
+    index = await _get_precon_index()
+    q = _sanitize(query)
+
+    # Exact slug or exact name match → confident
+    for e in index:
+        if _sanitize(e["slug"]) == q or _sanitize(e["name"]) == q:
+            return ("slug", e["slug"])
+
+    # Unique substring containment → confident
+    if q:
+        contains = [e for e in index if q in _sanitize(e["name"])]
+        if len(contains) == 1:
+            return ("slug", contains[0]["slug"])
+
+    # Fuzzy score with a threshold + margin gate
+    scored = sorted(
+        ((_match_score(q, _sanitize(e["name"])), e) for e in index),
+        key=lambda t: t[0], reverse=True,
+    )
+    if not scored:
+        return ("candidates", [])
+    best_score, best = scored[0]
+    runner = scored[1][0] if len(scored) > 1 else 0.0
+    if best_score >= MATCH_THRESHOLD and (best_score - runner) >= MATCH_MARGIN:
+        return ("slug", best["slug"])
+    return ("candidates", [e["name"] for _, e in scored[:5]])
+
+
+def _precon_candidates_message(query: str, names: list[str]) -> str:
+    if not names:
+        return (f"No precon matched '{query}'. Try precon_search for the MTGJSON "
+                f"name, or check the precon's name on EDHREC.")
+    lines = [f"No confident precon match for '{query}'. Closest matches — "
+             f"call again with one of these:", ""]
+    lines += [f'- {name}  →  precon="{name}"' for name in names]
+    return "\n".join(lines)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ARCHIDEKT — Deck reading and export
 # ═══════════════════════════════════════════════════════════════════════════════
