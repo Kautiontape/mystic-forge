@@ -2169,7 +2169,7 @@ async def precon_diff(params: PreconDiffInput) -> str:
         upgraded_src = f"Archidekt deck {deck_id}"
     else:
         upgraded = {}
-        for qty, name in _parse_decklist(params.decklist):
+        for qty, name in _parse_decklist(params.decklist or ""):
             upgraded[name] = upgraded.get(name, 0) + qty
         upgraded_src = "pasted decklist"
 
