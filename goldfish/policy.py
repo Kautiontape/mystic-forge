@@ -48,7 +48,9 @@ from .engine import (
 # source can be net-neutral or net-positive ("{1}: create a Treasure" pays for
 # its own next activation), so the multi-pass loop would re-fire it forever.
 # Tap-costed versions self-limit (one activation per untap); non-tap versions
-# are skipped entirely.
+# are skipped entirely. Honesty note: this skip undervalues real net-positive
+# mana engines (they ARE infinite mana) — Task 13's honesty report may
+# surface it.
 _MANA_VERBS = frozenset({"add_mana", "treasure", "ramp_mana"})
 _TOKEN_VERBS = frozenset({"create_token", "token_copy"})
 
@@ -169,6 +171,10 @@ def _main_action(g: Game) -> tuple[dict, str]:
 
     # Rule 6: remaining spells cheapest-first; rituals early only when the
     # hand's spell cost exceeds the mana available this turn, else last.
+    # Pinned reading of the spec's "remaining annotated spells": annotated =
+    # in the simulation pool (legal_actions already excludes inert cards), so
+    # annotation-less vanilla creatures are castable here — a literal reading
+    # would never cast a Bear and zero out goldfish damage.
     if others:
         rituals = [n for n in others if _is_ritual(g.card(n))]
         normal = [n for n in others if n not in rituals]

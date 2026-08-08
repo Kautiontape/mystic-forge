@@ -489,6 +489,78 @@ def test_tutor_by_type_name_any_and_whiff():
     assert g.hand[-1] == "Plains" and g.library == ["Plains"]
 
 
+# -- tutor targeting (spec §Policy: combo-aware, filter defaults) -----------
+
+def _tutor_cards():
+    cards = mini_cards()
+    cards["Kiki"] = SimCard(data=make_data("Kiki", cost=parse_cost("{1}{R}"),
+                            types=frozenset({"creature"}), power=2, toughness=2),
+                            ann=None, scope_class=None)
+    cards["Twin"] = SimCard(data=make_data("Twin", cost=parse_cost("{R}"),
+                            types=frozenset({"sorcery"})),
+                            ann=None, scope_class=None)
+    return cards
+
+
+def test_tutor_fetches_missing_combo_piece_over_first_match():
+    # Reviewer repro: combo [Kiki, Twin], Kiki accessible (hand), Twin in the
+    # library BEHIND a Bear — an any-filter tutor must fetch Twin, not Bear.
+    cards = _tutor_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1,
+                 combos=[["Kiki", "Twin"]])
+    g.hand[:] = ["Kiki"]
+    g.library[:] = ["Bear", "Twin", "Plains"]
+    execute_verb(g, None, "tutor")
+    assert g.hand[-1] == "Twin" and "Twin" not in g.library
+    assert any("tutored Twin" in line for line in g.log)
+
+
+def test_tutor_first_match_when_no_combo_declared():
+    cards = _tutor_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.hand[:] = ["Kiki"]
+    g.library[:] = ["Bear", "Twin", "Plains"]
+    execute_verb(g, None, "tutor")
+    assert g.hand[-1] == "Bear"                   # unchanged default
+
+
+def test_tutor_equipment_filter_fetches_cheapest_not_first():
+    cards = mini_cards()
+    cards["BigSword"] = SimCard(data=make_data(
+        "BigSword", cost=parse_cost("{4}"),
+        types=frozenset({"artifact", "equipment"}),
+        equip_cost=parse_cost("{2}")), ann=None, scope_class=None)
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.library[:] = ["BigSword", "Plains", "Hammer"]   # Hammer {1} < BigSword {4}
+    execute_verb(g, None, "tutor", tutor_filter="equipment")
+    assert g.hand[-1] == "Hammer" and "BigSword" in g.library
+
+
+def test_tutor_combo_piece_not_admitted_by_filter_falls_through():
+    # Missing piece Kiki is a creature; a land-filter tutor must not fetch it
+    # — default applies: first land in library order.
+    cards = _tutor_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1,
+                 combos=[["Kiki", "Twin"]])
+    g.hand[:] = ["Twin"]
+    g.library[:] = ["Kiki", "Mountain", "Plains"]
+    execute_verb(g, None, "tutor", tutor_filter="land")
+    assert g.hand[-1] == "Mountain" and "Kiki" in g.library
+
+
+def test_tutor_targeting_deterministic_across_identical_games():
+    def run():
+        cards = _tutor_cards()
+        g = new_game(cards, ["Plains"] * 40, "Boss", seed=9,
+                     combos=[["Kiki", "Twin"]])
+        g.hand[:] = ["Kiki"]
+        g.library[:] = ["Bear", "Twin", "Hammer", "Plains"]
+        execute_verb(g, None, "tutor", count=2)
+        return g
+    g1, g2 = run(), run()
+    assert g1.hand == g2.hand and g1.library == g2.library and g1.log == g2.log
+
+
 def test_pump_durations_count_and_no_source():
     cards = mini_cards()
     g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)

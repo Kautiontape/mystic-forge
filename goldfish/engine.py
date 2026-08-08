@@ -485,6 +485,40 @@ def _tutor_match(g: Game, f: str, name: str) -> bool:
     return f in g.card(name).data.types
 
 
+def _tutor_pick(g: Game, f: str) -> int | None:
+    """Library index the tutor verb fetches (spec §Policy: tutor targeting),
+    re-evaluated per fetch iteration. Selection order:
+
+    1. Combo-aware: when a declared combo is missing exactly one accessible
+       piece (accessible = hand ∪ command ∪ battlefield — the same set
+       check_combos uses), that piece is in the library, and the filter
+       admits it, fetch that piece. Lowest combo index wins (deterministic).
+    2. Filter defaults: "equipment" fetches the cheapest equipment by
+       (mv, name); every other filter (land, name:, any, ...) takes the
+       first library match — land's first-in-library-order behavior is
+       pinned, not incidental."""
+    accessible = {p.name for p in g.battlefield} | set(g.hand) | set(g.command)
+    for pieces in g.combos:
+        missing = [name for name in pieces if name not in accessible]
+        if len(missing) != 1 or not _tutor_match(g, f, missing[0]):
+            continue
+        idx = next((i for i, name in enumerate(g.library)
+                    if name == missing[0]), None)
+        if idx is not None:
+            return idx
+    if f == "equipment":
+        best: tuple | None = None
+        for i, name in enumerate(g.library):
+            if not _tutor_match(g, f, name):
+                continue
+            key = (g.card(name).mv, name)
+            if best is None or key < best[0]:
+                best = (key, i)
+        return best[1] if best is not None else None
+    return next((i for i, name in enumerate(g.library)
+                 if _tutor_match(g, f, name)), None)
+
+
 def _attach_target(g: Game) -> Permanent | None:
     """Commander's permanent if fielded, else the highest-effective-power
     creature (max keeps the first maximum — deterministic battlefield order)."""
@@ -587,8 +621,7 @@ def execute_verb(g: Game, source, verb: str, ctx: dict | None = None, **params):
     elif verb == "tutor":
         f = params.get("tutor_filter") or "any"
         for _ in range(n):
-            idx = next((i for i, name in enumerate(g.library)
-                        if _tutor_match(g, f, name)), None)
+            idx = _tutor_pick(g, f)
             if idx is None:
                 g.emit("tutor whiffed")
             else:
