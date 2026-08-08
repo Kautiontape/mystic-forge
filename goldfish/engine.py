@@ -5,7 +5,7 @@ import hashlib
 import random
 from dataclasses import dataclass, field
 
-from .cards import COLORS, CardData, Cost, SimCard, parse_cost
+from .cards import COLORS, DAMAGE_TARGETS, CardData, Cost, SimCard, parse_cost
 
 
 def derive_seed(master_seed: int, game_index: int) -> int:
@@ -88,6 +88,10 @@ class Game:
     rng: random.Random = field(default_factory=random.Random)
     log: list = field(default_factory=list)
     _next_id: int = 1
+    # Not serialized: trigger dispatch fully unwinds within one action, so
+    # depth never crosses a step boundary.
+    _fire_depth: int = 0
+    _depth_warned: bool = False       # one suppression line per cascade
 
     # -- identity helpers -------------------------------------------------
     def card(self, name: str) -> SimCard:
@@ -333,6 +337,20 @@ def _is_creature_perm(g: Game, p: Permanent) -> bool:
     return g.card(p.name).is_creature or (p.is_token and p.token_power is not None)
 
 
+def _anthem_totals(g: Game) -> tuple:
+    """Summed battlefield anthem statics: (power, toughness, keywords).
+    Callers gate on _is_creature_perm — anthems buff creatures only."""
+    power = toughness = 0
+    kws: set = set()
+    for src in g.battlefield:
+        for s in g.card(src.name).statics():
+            if s.kind == "anthem":
+                power += s.power
+                toughness += s.toughness
+                kws |= set(s.keywords)
+    return power, toughness, kws
+
+
 def effective_power(g: Game, p: Permanent) -> int:
     card = g.card(p.name)
     base = (p.token_power or 0) if p.is_token else (card.data.power or 0)
@@ -340,10 +358,7 @@ def effective_power(g: Game, p: Permanent) -> int:
     for eq_id in p.attached:
         base += _equipment_grants(g, g.perm(eq_id)).get("power", 0)
     if _is_creature_perm(g, p):
-        for src in g.battlefield:
-            for s in g.card(src.name).statics():
-                if s.kind == "anthem":
-                    base += s.power
+        base += _anthem_totals(g)[0]
     return base
 
 
@@ -352,11 +367,9 @@ def effective_keywords(g: Game, p: Permanent) -> set:
     kws = set(p.token_keywords if p.is_token else card.data.keywords)
     for eq_id in p.attached:
         kws |= set(_equipment_grants(g, g.perm(eq_id)).get("keywords", ()))
-    for src in g.battlefield:
-        for s in g.card(src.name).statics():
-            if s.kind == "anthem":
-                kws |= set(s.keywords)
-    return kws
+    if _is_creature_perm(g, p):       # same gate as effective_power: anthem
+        kws |= _anthem_totals(g)[2]   # keywords must not leak onto Treasures
+    return kws                        # or equipment
 
 
 # -- Counts and conditions --------------------------------------------------
@@ -430,6 +443,9 @@ def _do_attach(g: Game, eq: Permanent, tgt: Permanent):
 def execute_verb(g: Game, source, verb: str, ctx: dict | None = None, **params):
     ctx = ctx or {}
     n = resolve_count(g, params.get("count", 1), ctx)
+    if n == 0:
+        return    # zero-count convention: no mutation AND no log line for the
+                  # verb (fire() still records the trigger_fires entry)
     if verb == "draw":
         for _ in range(n):
             if g.library:
@@ -437,23 +453,29 @@ def execute_verb(g: Game, source, verb: str, ctx: dict | None = None, **params):
                 g.hand.append(card)
                 g.emit(f"drew {card}")
     elif verb == "damage":
-        if params.get("target") == "each_opponent":
+        target = params.get("target")
+        if target not in DAMAGE_TARGETS:
+            raise IllegalAction(
+                f"damage requires target in {sorted(DAMAGE_TARGETS)}, got {target!r}")
+        if target == "each_opponent":
             g.opponents = [life - n for life in g.opponents]
         else:
             i = _focus_target(g)
             g.opponents[i] -= n
-        g.emit(f"{n} damage ({params.get('target')})")
+        g.emit(f"{n} damage ({target})")
     elif verb == "create_token":
+        power, toughness = params.get("power"), params.get("toughness")
+        if power is None or toughness is None:
+            raise IllegalAction("create_token requires power and toughness")
         doublers = sum(1 for p in g.battlefield
                        for s in g.card(p.name).statics() if s.kind == "token_doubling")
         total = n * (2 ** doublers)
+        g.emit(f"created {total} token(s)")      # cause precedes the ETB effects
         for _ in range(total):
             tok = g.new_perm(params.get("token_name", "Token"), is_token=True,
-                             token_power=params["power"],
-                             token_toughness=params["toughness"],
+                             token_power=power, token_toughness=toughness,
                              token_keywords=tuple(params.get("keywords", ())))
             fire(g, "creature_etb", entering=tok)
-        g.emit(f"created {total} token(s)")
     elif verb == "treasure":
         for _ in range(n):
             g.new_perm("Treasure", is_token=True)   # Treasure SimCard added in new_game
@@ -462,14 +484,17 @@ def execute_verb(g: Game, source, verb: str, ctx: dict | None = None, **params):
         g.life_gained += n
         g.emit(f"gained {n} life")
     elif verb == "add_mana":
-        if params.get("pips"):
-            for color, qty in parse_cost(params["pips"]).pips.items():
+        pips_str = params.get("pips")
+        if not pips_str and not params.get("any_mana"):
+            raise IllegalAction("add_mana requires pips or colors:any + count")
+        if pips_str:
+            for color, qty in parse_cost(pips_str).pips.items():
                 if qty:
                     # generic braces in an add_mana string mean colorless mana
                     key = "C" if color == "generic" else color
                     g.mana_pool[key] = g.mana_pool.get(key, 0) + qty * n
-            g.emit(f"added {params['pips']} to pool")
-        elif params.get("any_mana"):
+            g.emit(f"added {pips_str} to pool")
+        else:
             g.mana_pool["any"] += n
             g.emit(f"added {n} mana of any color to pool")
     elif verb == "ramp_land":
@@ -501,15 +526,19 @@ def execute_verb(g: Game, source, verb: str, ctx: dict | None = None, **params):
                 g.hand.append(name)
                 g.emit(f"tutored {name}")
     elif verb == "pump":
+        power, toughness = params.get("power"), params.get("toughness")
+        if power is None or toughness is None:
+            raise IllegalAction("pump requires power and toughness")
         if source is None:
             g.emit("pump with no source permanent — skipped")
         else:
-            dest = (source.pump_eot if params.get("duration", "eot") == "eot"
-                    else source.pump_perm)
-            dest[0] += (params.get("power") or 0) * n
-            dest[1] += (params.get("toughness") or 0) * n
-            g.emit(f"{source.name} pumped +{dest[0]}/+{dest[1]} "
-                   f"({params.get('duration', 'eot')})")
+            duration = params.get("duration", "eot")
+            dest = source.pump_eot if duration == "eot" else source.pump_perm
+            dest[0] += power * n
+            dest[1] += toughness * n
+            # log the applied delta, not the cumulative bucket
+            g.emit(f"{source.name} pumped {power * n:+d}/{toughness * n:+d} "
+                   f"({duration})")
     elif verb == "attach":
         for _ in range(n):
             eq = next((p for p in g.battlefield
@@ -564,12 +593,36 @@ def execute_verb(g: Game, source, verb: str, ctx: dict | None = None, **params):
 
 # -- Event dispatch ---------------------------------------------------------
 
+_MAX_FIRE_DEPTH = 20
+
+
 def fire(g: Game, event: str, source_perm=None, entering=None, spell=None, ctx=None):
     """Run all battlefield listeners for a global event. `entering` is skipped:
     a permanent doesn't hear its own arrival as a global event. Self events
     (cast/etb) are executed at cast time, not via fire(). Listeners are
     snapshotted before execution so verb side effects (new tokens) don't feed
-    the same dispatch."""
+    the same dispatch.
+
+    Dispatch depth is bounded: a validation-legal annotation loop (e.g.
+    creature_etb -> create_token) would otherwise recurse without bound and
+    blow the stack mid-mutation. Past the limit, deeper triggers are
+    suppressed — deterministically, with one log line per cascade — and the
+    game continues."""
+    if g._fire_depth >= _MAX_FIRE_DEPTH:
+        if not g._depth_warned:
+            g._depth_warned = True
+            g.emit("trigger depth limit reached — deeper triggers suppressed")
+        return
+    g._fire_depth += 1
+    try:
+        _dispatch(g, event, entering, spell, ctx)
+    finally:
+        g._fire_depth -= 1
+        if g._fire_depth == 0:
+            g._depth_warned = False   # next cascade warns afresh
+
+
+def _dispatch(g: Game, event: str, entering, spell, ctx):
     listeners = []
     for p in g.battlefield:
         if entering is not None and p.id == entering.id:

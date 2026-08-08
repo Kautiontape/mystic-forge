@@ -471,9 +471,12 @@ def test_pump_durations_count_and_no_source():
     execute_verb(g, bear, "pump", power=2, toughness=1)         # default eot
     assert bear.pump_eot == [2, 1]
     assert effective_power(g, bear) == 4
+    assert any("Bear pumped +2/+1 (eot)" in line for line in g.log)
     execute_verb(g, bear, "pump", power=1, toughness=1, duration="permanent", count=3)
     assert bear.pump_perm == [3, 3]
     assert effective_power(g, bear) == 7
+    # the log carries the applied delta, never the cumulative bucket
+    assert any("Bear pumped +3/+3 (permanent)" in line for line in g.log)
     log_len = len(g.log)
     execute_verb(g, None, "pump", power=1, toughness=1)         # no source: logged no-op
     assert len(g.log) == log_len + 1
@@ -571,8 +574,12 @@ def test_effective_power_and_keywords_anthem_and_grants():
     assert {"haste", "trample"} <= effective_keywords(g, bear)
     assert effective_power(g, hammer) == 0      # grants boost the bearer, not the
                                                 # equipment; no base, no anthem
+    assert "haste" not in effective_keywords(g, hammer)   # anthem keywords are
+                                                          # creature-gated too
     tok = g.new_perm("Token", is_token=True, token_power=2, token_toughness=2)
     assert effective_power(g, tok) == 3         # token stats + anthem
+    treasure = g.new_perm("Treasure", is_token=True)
+    assert effective_keywords(g, treasure) == set()       # no leak onto Treasures
 
 
 def test_resolve_count_symbolics_and_unknown():
@@ -658,3 +665,156 @@ def test_unknown_verb_raises():
     g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
     with pytest.raises(IllegalAction):
         execute_verb(g, None, "scry")
+
+
+# -- Task 6 review fixes: recursion bound, zero counts, snapshot pins ------
+
+def test_trigger_loop_bounded_by_depth_limit():
+    # Reviewer's repro: "whenever a creature enters, create a 1/1" is a
+    # validation-legal annotation that self-feeds. The depth bound must stop
+    # it deterministically, log one suppression line per cascade, and leave
+    # the game consistent.
+    from goldfish.engine import _MAX_FIRE_DEPTH
+    cards = mini_cards()
+    cards["Broodmother"] = SimCard(data=make_data("Broodmother", cost=parse_cost("{3}{G}"),
+                                   types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Broodmother", {"name": "Broodmother", "triggers": [
+        {"on": "creature_etb", "do": "create_token", "power": 1, "toughness": 1}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("Broodmother")
+    execute_verb(g, None, "create_token", count=1, power=1, toughness=1)
+    tokens = [p for p in g.battlefield if p.is_token]
+    assert len(tokens) == _MAX_FIRE_DEPTH + 1   # 1 direct + 1 per dispatched level
+    assert sum("depth limit" in line for line in g.log) == 1
+    assert g._fire_depth == 0                   # fully unwound
+    execute_verb(g, None, "create_token", count=1, power=1, toughness=1)
+    assert sum("depth limit" in line for line in g.log) == 2   # next cascade warns afresh
+
+
+def test_nested_triggers_within_depth_work_normally():
+    # land_etb -> create_token -> creature_etb -> draw: a depth-2/3 chain is
+    # untouched by the bound.
+    cards = mini_cards()
+    cards["Nest"] = SimCard(data=make_data("Nest", cost=parse_cost("{2}"),
+                            types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    cards["Scribe"] = SimCard(data=make_data("Scribe", cost=parse_cost("{1}{U}"),
+                              types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Nest", {"name": "Nest", "triggers": [
+        {"on": "land_etb", "do": "create_token", "power": 1, "toughness": 1}]})
+    annotated(cards, "Scribe", {"name": "Scribe", "triggers": [
+        {"on": "creature_etb", "do": "draw", "count": 1}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("Nest"); g.new_perm("Scribe")
+    before = len(g.hand)
+    fire(g, "land_etb")
+    assert sum(1 for p in g.battlefield if p.is_token) == 1
+    assert len(g.hand) == before + 1
+    assert not any("depth limit" in line for line in g.log)
+    # cause precedes effects: "created" is logged before the ETB draw
+    created = next(i for i, line in enumerate(g.log) if "created 1 token(s)" in line)
+    drew = next(i for i, line in enumerate(g.log) if "drew" in line)
+    assert created < drew
+
+
+def test_zero_count_skips_mutation_and_log_but_records_fire():
+    cards = mini_cards()
+    cards["Tactician"] = SimCard(data=make_data("Tactician", cost=parse_cost("{1}{W}"),
+                                 types=frozenset({"creature"}), power=1, toughness=1),
+                                 ann=None, scope_class=None)
+    annotated(cards, "Tactician", {"name": "Tactician", "triggers": [
+        {"on": "attack", "do": "draw", "count": "per_equipped_attacker"}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("Tactician")
+    bear = g.new_perm("Bear")
+    before = len(g.hand)
+    fire(g, "attack", ctx={"attackers": [bear.id]})     # bear unequipped -> n == 0
+    assert len(g.hand) == before
+    assert g.trigger_fires == {"Tactician|attack|draw": 1}   # fire still recorded
+    assert not any("drew" in line for line in g.log)         # verb logged nothing
+    log_len = len(g.log)
+    execute_verb(g, None, "gain_life", count=0)          # uniform across verbs
+    assert g.life_gained == 0 and len(g.log) == log_len
+
+
+def test_snapshot_new_listener_misses_in_flight_event():
+    # A listener's verb creates a permanent that itself listens for the SAME
+    # event: the newcomer must not hear the dispatch that created it, but
+    # participates in the next one.
+    cards = mini_cards()
+    cards["Summoner"] = SimCard(data=make_data("Summoner", cost=parse_cost("{2}"),
+                                types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Summoner", {"name": "Summoner", "triggers": [
+        {"on": "upkeep", "do": "token_copy"}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("Summoner")
+    fire(g, "upkeep")
+    assert sum(1 for p in g.battlefield if p.is_token) == 1   # copy not in snapshot
+    fire(g, "upkeep")                                         # both copy themselves now
+    assert sum(1 for p in g.battlefield if p.is_token) == 3
+
+
+def test_condition_evaluated_at_execution_time_within_dispatch():
+    # An earlier listener's Treasure flips a later listener's metalcraft
+    # inside one dispatch: conditions are checked at execution time, not
+    # snapshot time.
+    cards = mini_cards()
+    cards["Smith"] = SimCard(data=make_data("Smith", cost=parse_cost("{2}"),
+                             types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    cards["Auditor"] = SimCard(data=make_data("Auditor", cost=parse_cost("{2}"),
+                               types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Smith", {"name": "Smith", "triggers": [
+        {"on": "upkeep", "do": "treasure", "count": 1}]})
+    annotated(cards, "Auditor", {"name": "Auditor", "triggers": [
+        {"on": "upkeep", "if": "metalcraft", "do": "draw", "count": 1}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("Smith")                          # listens first (battlefield order)
+    g.new_perm("Auditor")
+    g.new_perm("Hammer"); g.new_perm("Hammer")   # 2 artifacts: metalcraft off
+    before = len(g.hand)
+    fire(g, "upkeep")
+    assert len(g.hand) == before + 1             # Smith's Treasure was the 3rd artifact
+    assert g.trigger_fires["Auditor|upkeep|draw"] == 1
+
+
+def test_missing_required_params_raise():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bear = g.new_perm("Bear")
+    with pytest.raises(IllegalAction):
+        execute_verb(g, None, "damage", count=1)                 # no target
+    with pytest.raises(IllegalAction):
+        execute_verb(g, None, "damage", count=1, target="everyone")
+    with pytest.raises(IllegalAction):
+        execute_verb(g, None, "create_token", count=1, power=1)  # no toughness
+    with pytest.raises(IllegalAction):
+        execute_verb(g, bear, "pump", count=1, power=1)          # no toughness
+    with pytest.raises(IllegalAction):
+        execute_verb(g, None, "add_mana", count=1)               # no pips / colors:any
+    assert g.opponents == [40] and g.life_gained == 0            # nothing mutated
+
+
+def test_spell_cast_noncreature_filter():
+    cards = mini_cards()
+    cards["Prowess"] = SimCard(data=make_data("Prowess", cost=parse_cost("{1}{R}"),
+                               types=frozenset({"creature"}), power=1, toughness=1),
+                               ann=None, scope_class=None)
+    annotated(cards, "Prowess", {"name": "Prowess", "triggers": [
+        {"on": "spell_cast", "filter": "noncreature",
+         "do": "damage", "target": "each_opponent", "count": 1}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("Prowess")
+    fire(g, "spell_cast", spell=cards["Hammer"])    # artifact: noncreature
+    assert g.opponents == [39]
+    fire(g, "spell_cast", spell=cards["Bear"])      # creature: filtered out
+    assert g.opponents == [39]
+
+
+def test_token_doubling_stacks_multiplicatively():
+    cards = mini_cards()
+    cards["Doubler"] = SimCard(data=make_data("Doubler", cost=parse_cost("{4}"),
+                               types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Doubler", {"name": "Doubler", "statics": [{"kind": "token_doubling"}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("Doubler"); g.new_perm("Doubler")
+    execute_verb(g, None, "create_token", count=1, power=1, toughness=1)
+    assert sum(1 for p in g.battlefield if p.is_token) == 4     # 1 * 2^2
