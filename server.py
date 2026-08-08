@@ -1554,6 +1554,73 @@ def _price_for_finish(card: dict, finish: Optional[str]) -> Optional[Decimal]:
         return None
 
 
+def _card_name_aliases(card: dict) -> list[str]:
+    """Lowercased names a decklist line might use for this card.
+
+    Includes each face of a double-faced card, since a list may write only the
+    front face while Scryfall returns 'Front // Back'.
+    """
+    full = (card.get("name") or "").lower().strip()
+    if not full:
+        return []
+    aliases = [full]
+    if "//" in full:
+        aliases.extend(part.strip() for part in full.split("//") if part.strip())
+    return aliases
+
+
+def _index_collection_results(cards: list[dict]) -> dict:
+    """Index collection results for lookup by printing, name+set, or name.
+
+    Scryfall does not guarantee that response order matches request order, and
+    omits not-found entries, so results must be matched explicitly rather than
+    by position. First card wins on any given key.
+    """
+    index: dict = {}
+    for card in cards:
+        set_code = (card.get("set") or "").lower()
+        collector = card.get("collector_number") or ""
+        if set_code and collector:
+            index.setdefault(("printing", set_code, collector), card)
+        for alias in _card_name_aliases(card):
+            if set_code:
+                index.setdefault(("name_set", alias, set_code), card)
+            index.setdefault(("name", alias), card)
+    return index
+
+
+def _lookup_entry(index: dict, entry: DecklistEntry) -> Optional[dict]:
+    """Find the card matching this entry, most specific key first."""
+    name = entry.name.lower().strip()
+    set_code = (entry.set_code or "").lower()
+
+    if set_code and entry.collector_number:
+        hit = index.get(("printing", set_code, entry.collector_number))
+        if hit is not None:
+            return hit
+    if set_code:
+        hit = index.get(("name_set", name, set_code))
+        if hit is not None:
+            return hit
+    return index.get(("name", name))
+
+
+def _identifier_label(identifier: dict) -> str:
+    """Human-readable rendering of an identifier we sent to Scryfall.
+
+    /cards/collection echoes unmatched identifiers back verbatim, so this is
+    what the 'not found' section prints.
+    """
+    name = identifier.get("name")
+    set_code = identifier.get("set")
+    collector = identifier.get("collector_number")
+    if set_code and collector:
+        return f"{set_code.upper()} #{collector}"
+    if name and set_code:
+        return f"{name} ({set_code.upper()})"
+    return name or str(identifier)
+
+
 @mcp.tool(name="validate_decklist")
 async def validate_decklist(params: ValidateDecklistInput) -> str:
     """Validate a Commander decklist for card name accuracy, deck size, and color identity.

@@ -196,3 +196,75 @@ def test_price_for_finish_handles_missing_and_malformed_data():
 def test_price_for_finish_returns_decimal_not_float():
     # Totals sum over ~100 lines; float would accumulate representation error.
     assert isinstance(server._price_for_finish(ALL_FINISHES, "nonfoil"), Decimal)
+
+
+# ── _index_collection_results / _lookup_entry ─────────────────────────────────
+
+SOL_RING_LTC = {
+    "name": "Sol Ring", "set": "ltc", "collector_number": "284",
+    "finishes": ["nonfoil"], "prices": {"usd": "2.51"},
+}
+COUNTERSPELL_DMR = {
+    "name": "Counterspell", "set": "dmr", "collector_number": "281",
+    "finishes": ["nonfoil", "foil"], "prices": {"usd": "2.15", "usd_foil": "2.17"},
+}
+SEPHIROTH_FIN = {
+    "name": "Sephiroth, Fabled SOLDIER // Sephiroth, One-Winged Angel",
+    "set": "fin", "collector_number": "382",
+    "finishes": ["nonfoil", "foil"], "prices": {"usd": "12.00", "usd_foil": "20.00"},
+}
+
+
+def test_lookup_matches_by_set_and_collector_number():
+    index = server._index_collection_results([SOL_RING_LTC, COUNTERSPELL_DMR])
+    entry = server.DecklistEntry(1, "Sol Ring", "ltc", "284", None)
+    assert server._lookup_entry(index, entry) is SOL_RING_LTC
+
+
+def test_lookup_is_insensitive_to_response_order():
+    reversed_index = server._index_collection_results([COUNTERSPELL_DMR, SOL_RING_LTC])
+    entry = server.DecklistEntry(1, "Sol Ring", "ltc", "284", None)
+    assert server._lookup_entry(reversed_index, entry) is SOL_RING_LTC
+
+
+def test_lookup_matches_by_name_and_set():
+    index = server._index_collection_results([COUNTERSPELL_DMR])
+    entry = server.DecklistEntry(1, "Counterspell", "dmr", None, None)
+    assert server._lookup_entry(index, entry) is COUNTERSPELL_DMR
+
+
+def test_lookup_matches_by_bare_name_case_insensitively():
+    index = server._index_collection_results([COUNTERSPELL_DMR])
+    entry = server.DecklistEntry(1, "cOUNTERSPELL", None, None, None)
+    assert server._lookup_entry(index, entry) is COUNTERSPELL_DMR
+
+
+def test_lookup_matches_a_dfc_by_its_front_face_name():
+    index = server._index_collection_results([SEPHIROTH_FIN])
+    entry = server.DecklistEntry(1, "Sephiroth, Fabled SOLDIER", None, None, None)
+    assert server._lookup_entry(index, entry) is SEPHIROTH_FIN
+
+
+def test_lookup_matches_a_dfc_by_its_full_name():
+    index = server._index_collection_results([SEPHIROTH_FIN])
+    entry = server.DecklistEntry(
+        1, "Sephiroth, Fabled SOLDIER // Sephiroth, One-Winged Angel", None, None, None)
+    assert server._lookup_entry(index, entry) is SEPHIROTH_FIN
+
+
+def test_lookup_returns_none_when_absent():
+    index = server._index_collection_results([SOL_RING_LTC])
+    entry = server.DecklistEntry(1, "Black Lotus", None, None, None)
+    assert server._lookup_entry(index, entry) is None
+
+
+# ── _identifier_label ─────────────────────────────────────────────────────────
+
+def test_identifier_label_renders_each_identifier_shape_readably():
+    # not_found echoes back the identifier object we sent, so the old
+    # `item.get("name", str(item))` printed a raw dict for printing lookups.
+    assert server._identifier_label(
+        {"set": "ltc", "collector_number": "284"}) == "LTC #284"
+    assert server._identifier_label(
+        {"name": "Arcane Signet", "set": "otc"}) == "Arcane Signet (OTC)"
+    assert server._identifier_label({"name": "Rhystic Study"}) == "Rhystic Study"
