@@ -4,6 +4,8 @@
 - **Status:** Approved (design), pending implementation plan
 - **Component:** `server.py` (Mystic Forge MCP server)
 - **Branch:** `price-check-for-printings`
+- **Tools affected:** `scryfall_price`, `scryfall_price_list`, `format_archidekt`,
+  `archidekt_export`
 
 ## Problem
 
@@ -29,9 +31,19 @@ numbers rather than missing features**, and both of which this design fixes:
    usd_etched` (`server.py:400`) silently quotes a foil price for a card whose
    printing has no nonfoil price, and folds it into the total unlabelled.
 
-A third gap: `_parse_decklist` (`server.py:1407`) already receives Archidekt/Moxfield
-`(set) 123` suffixes and deliberately strips them (`server.py:1434-1435`). The
-printing data the user needs is arriving at the server and being discarded.
+The remaining gaps are all the same shape — printing data reaching this server and
+being thrown away:
+
+- `_parse_decklist` (`server.py:1407`) receives Archidekt/Moxfield `(set) 123`
+  suffixes and deliberately strips them (`server.py:1434-1435`).
+- `archidekt_export` (`server.py:1205-1253`) reads a deck payload carrying a
+  `modifier` field of `Normal`/`Foil`/`Etched` per card and never reads it, so a foil
+  deck exported through this server comes back all-nonfoil.
+- `format_archidekt` has no way to express a finish at all.
+
+The last two matter because they compound: a decklist round-tripped through this
+server loses its foils, and would then be priced entirely at nonfoil prices by the
+very tool this design is adding.
 
 ## Goals
 
@@ -39,14 +51,16 @@ printing data the user needs is arriving at the server and being discarded.
 2. Let a user price a pasted decklist at the printings written on its lines.
 3. Never quote a price for a different finish or printing than the one asked for.
 4. Make truncation, fallbacks, and missing prices visible in the output.
+5. Stop discarding finish information in the two tools that emit decklists, so a
+   decklist round-tripped through this server still prices correctly.
 
 ## Non-goals
 
 - Cheapest-legal-printing search ("what would this deck cost to build?"). Decided
   against: it needs one `/cards/search` per unspecified card, and misprices users
   who own a more expensive copy. See Decision D2.
-- Emitting finish markers from `format_archidekt`. That tool does not write `*F*`
-  today; adding it is a separate change.
+- Validating that a requested finish exists on the chosen printing. Deferred to a
+  later pass by explicit decision. See Decision D6 and the Risks section.
 - Non-USD totals. EUR and tix stay display-only, as today.
 - Price history or trends. Scryfall does not expose them.
 
@@ -110,6 +124,46 @@ Every row has `usd=null`, six are digital-only, and because `cheapest_usd` is on
 assigned when `usd` is truthy (`server.py:356`), the `Cheapest:` summary line never
 prints. A user asking the price of Counterspell currently gets ten rows of MTGO
 printings and no dollar figure. The real cheapest paper printing is DMR at $2.15.
+
+### Archidekt finish markers — verified end to end
+
+Verified 2026-08-08 by exporting from and importing into the live site.
+
+**Archidekt's own text export** produces this line for a foil commander:
+
+```
+1x Sephiroth, Fabled SOLDIER // Sephiroth, One-Winged Angel (fin) 382 *F* [Commander{top}]
+```
+
+So the canonical grammar is:
+
+```
+{qty}x {name} ({set}) {collector} *F* [{Category}{flags}] ^{Label},{#hex}^
+```
+
+The finish marker sits **after the collector number and before the category
+annotation**. Matching this exactly makes our output round-trip-safe by construction,
+since it is the site's own format. Note the card name here contains ` // ` — DFC
+names must survive parsing.
+
+**Import behavior**, confirmed by pasting a test block:
+
+- `*F*` and `*E*` lines import, and the cards arrive with the correct Foil/Etched
+  modifier applied.
+- A marker placed before `[Category]` does not disturb category parsing — a line
+  carrying both kept its category.
+- Lines with no marker are unaffected.
+
+**Archidekt does not validate the finish against the printing.** Importing
+`1x Sol Ring (ltc) 284 *F*` — a nonfoil-only printing — succeeds and the card shows
+as foil. It then has no price, and the foil status **cannot be toggled off** in the
+UI; the card has to be deleted and re-added. This is the failure mode behind
+Decision D6.
+
+**The deck API exposes the source data.** Each entry in `/decks/{id}/` carries a
+`modifier` field with values `Normal`, `Foil`, `Etched` (confirmed across three
+public decks; one contained 6 `Foil` and 1 `Etched`). `archidekt_export`
+(`server.py:1205-1253`) reads this payload and drops the field.
 
 ### Pagination
 
@@ -183,9 +237,10 @@ Extraction order, applied left to right on each line:
 2. Leading quantity via the existing `^(\d+)x?\s+(.+)$`; absent means 1.
 3. Strip `^...^` labels and `[...]` category annotations.
 4. Extract and remove the finish marker: `*F*` → foil, `*E*` → etched, also
-   accepting case-insensitive `(foil)` and `(etched)`. `*F*`/`*E*` is the Moxfield
-   export convention and is accepted by Archidekt's importer. Note that this repo's
-   own `format_archidekt` does not currently emit these markers.
+   accepting case-insensitive `(foil)` and `(etched)` for tolerance. `*F*`/`*E*` is
+   Archidekt's own export syntax, verified above, and is also what Moxfield emits.
+   Part 3 makes this repo emit it too, so this step is the exact inverse of
+   `_finish_marker`.
 5. Extract set and collector number with an **anchored** pattern —
    `\((?P<set>[a-zA-Z0-9]{2,6})\)(?:\s+(?P<cn>[^\s\[\]^*]+))?\s*$` — so it only
    matches a trailing set/collector suffix. Anchoring is what keeps real card names
@@ -248,6 +303,43 @@ each line looks itself up. No positional assumptions.
 5. **Total** — `$X.XX across N of M cards`, plus a count of lines in sections 2–4 so
    the total's coverage is explicit.
 
+### Part 3 — stop discarding finish on the way out
+
+Pricing by printing is worthless if the tools that *emit* decklists strip the finish
+before the user can paste it back. Two tools do exactly that today.
+
+**`format_archidekt`.** `DeckCardEntry` gains one optional field:
+
+```python
+finish: Optional[Literal["nonfoil", "foil", "etched"]] = None
+```
+
+When set to `foil` or `etched`, the emitted line carries `*F*` / `*E*` in the
+verified position — after the collector number, before the category annotation.
+`nonfoil` and `None` emit nothing.
+
+**No feature flag is needed.** The original plan gated this behind
+`include_finish: bool = False` to hedge against an unverified marker syntax. That
+hedge is unnecessary now that the grammar is confirmed from Archidekt's own export.
+A caller that does not set `finish` produces byte-identical output to today, so
+`finish` being absent *is* the opt-in. This avoids a flag whose only job would be to
+protect against a risk we have since eliminated.
+
+**`archidekt_export`.** Maps the API's `modifier` field to a marker: `Foil` → `*F*`,
+`Etched` → `*E*`, `Normal` and missing → nothing. Emitted in the same position, which
+reproduces the site's own export byte for byte.
+
+This one **defaults on**, with no flag (Decision D7). Archidekt is the source of the
+data; handing back the marker it gave us is round-trip fidelity, not invention, and
+the syntax is confirmed. Dropping it is silent data loss: a foil deck exported through
+this server currently comes back all-nonfoil, and under Part 2 would then be priced
+entirely at nonfoil prices — the precise bug this design exists to fix.
+
+**Round-trip contract.** Part 2's parser and Part 3's formatters are now two halves of
+one format and must agree on marker syntax and position. The shared grammar is the
+verified line above. A round-trip test locks this down: format a set of entries, parse
+the output back, assert the entries survive unchanged.
+
 ### Structure
 
 New pure helpers, all independently testable without network access:
@@ -259,6 +351,10 @@ New pure helpers, all independently testable without network access:
 | `_price_for_finish` | `(card, finish)` → `Decimal \| None`, no cross-finish fallback |
 | `_index_collection_results` | response → lookup dict |
 | `_format_printing_line` | card + entry → one display line |
+| `_finish_marker` | `"foil"` → `"*F*"`, `"etched"` → `"*E*"`, else `""` |
+
+`_finish_marker` is shared by `format_archidekt` and `archidekt_export` so the two
+emitters cannot drift apart, and is the inverse of the parser's step 4.
 
 The tools themselves keep only HTTP orchestration and section assembly, matching how
 `_diff_key` and `_archidekt_in_deck_cards` are factored in the existing code.
@@ -283,6 +379,27 @@ cleanly into `Decimal`.
 - **D4 — No cross-finish price fallback.** A wrong number presented confidently is
   worse than an absent one. This changes existing behavior deliberately.
 - **D5 — `collector_number` is a string.** Verified non-numeric values exist.
+- **D6 — No finish validation against the printing's `finishes` array.** Explicit
+  decision by the repo owner: a caller has to ask for a foil to get one, so this is
+  not a case the tool should police, and it can be revisited in a later pass. The
+  hook is cheap to add later — `format_archidekt` already holds the Scryfall card
+  from its batch lookup (`server.py:1317-1327`), so the check costs no extra
+  requests and would follow the existing `# WARNING:` pattern (`server.py:1340`).
+  Recorded as a known risk below rather than implemented now.
+- **D7 — `archidekt_export` emits markers by default, with no flag.** Echoing back
+  Archidekt's own `modifier` in Archidekt's own syntax is fidelity, not invention.
+  This does change output for any deck containing foils; that change is the bug fix.
+
+## Deferred
+
+Not in scope, recorded so it is not rediscovered from scratch:
+
+- Finish validation (D6), including the `include_set_codes` interaction in Risks.
+- An "all foil" bulk mode on `format_archidekt`. Raised and deliberately postponed;
+  it is the case that would most benefit from D6's validation, since one flag would
+  stamp `*F*` across every card including printings that have no foil.
+- Teaching `precon_export` and the EDHREC formatters about finishes. They emit
+  suggested cards rather than owned ones, so finish is not meaningful there yet.
 
 ## Testing
 
@@ -298,6 +415,13 @@ mocking (`tests/test_precon_diff.py`).
 - names containing parentheses: `Erase (Not the Urza's Legacy One)`,
   `B.F.M. (Big Furry Monster)` — set/collector must stay `None`
 - `//` and `#` comment lines skipped
+- the verified real-world line, as the canonical case:
+  `1x Sephiroth, Fabled SOLDIER // Sephiroth, One-Winged Angel (fin) 382 *F* [Commander{top}]`
+  → qty 1, name `Sephiroth, Fabled SOLDIER // Sephiroth, One-Winged Angel`,
+  set `fin`, collector `382`, finish `foil`. This covers a DFC name containing ` // `
+  on a line that must **not** be treated as a comment, a marker sitting between the
+  collector number and the category, and a category carrying a `{top}` flag —
+  simultaneously.
 
 **Regression:** `_parse_decklist` output is unchanged across the full corpus above.
 This is the test that protects `validate_decklist` and `precon_diff`.
@@ -322,10 +446,28 @@ the coverage figure.
 `collector_number`-without-`set_code` validation error; client-side null-last
 re-sorting given a fixture list with mixed null and non-null prices.
 
+**Emitters** (`_finish_marker`, `format_archidekt`, `archidekt_export`):
+- `foil` → `*F*`, `etched` → `*E*`, `nonfoil` and `None` → no marker
+- marker position: after the collector number, before `[Category]`
+- `format_archidekt` with no `finish` set on any entry produces output byte-identical
+  to the current implementation, over a fixture covering categories, commander,
+  maybeboard, and labels — this is the backward-compatibility guarantee
+- `archidekt_export` maps `modifier` `Foil`/`Etched`/`Normal`/absent correctly, from a
+  fixture deck payload shaped like the real API response
+
+**Round trip:** entries → `format_archidekt` → `_parse_decklist_entries` → entries,
+asserting quantity, name, set, collector number, and finish all survive. Includes the
+Sephiroth line above, since a DFC name plus a marker plus a flagged category is the
+case most likely to break.
+
 ## Documentation
 
-`README.md:13-14` tool descriptions updated to state that both tools accept specific
-printings.
+- `README.md:13-14` tool descriptions updated to state that both pricing tools accept
+  specific printings.
+- `format_archidekt`'s docstring (`server.py:1295-1311`) gains the finish marker in
+  its documented output format, since that docstring is what steers the model.
+- `archidekt_export`'s docstring (`server.py:1186-1192`) likewise — its stated line
+  format currently omits the marker it will now emit.
 
 ## Risks
 
@@ -335,3 +477,14 @@ printings.
   step 6 reusing the existing strips verbatim, plus the dedicated regression test.
 - **Removing the cross-finish fallback shows "no price" where a number used to
   appear.** Intended. The output explains which finishes exist and what they cost.
+- **`archidekt_export` output changes for decks containing foils.** Accepted under
+  D7 — the change is the fix, and it reproduces the site's own export.
+- **Unvalidated finishes can produce an unrecoverable card (D6).** Archidekt accepts
+  `*F*` on a nonfoil-only printing, shows the card with no price, and offers no way
+  to turn foil off — the card must be deleted and re-added. The sharp edge is that
+  `format_archidekt` chooses the printing itself from Scryfall's default lookup
+  (`server.py:1345-1351`), so a caller asking for "a foil Sol Ring" with
+  `include_set_codes=true` can be handed a printing *we* picked that has no foil.
+  Reaching it needs `include_set_codes` on and an explicit `finish`, which is why it
+  is deferred rather than blocking; an "all foil" mode would widen it considerably
+  and should not ship before the validation does.
