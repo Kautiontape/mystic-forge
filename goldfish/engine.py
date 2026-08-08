@@ -74,6 +74,9 @@ class Game:
     spells_cast_this_turn: int = 0
     combats_done: int = 0
     extra_combats: int = 0
+    attacked_this_combat: bool = False   # one attack per combat instance; reset
+                                         # when a new combat begins (extra combat
+                                         # replay or next turn)
     mulligans_taken: int = 0
     free_mulligan_used: bool = False
     won_turn: int | None = None
@@ -139,6 +142,7 @@ class Game:
             "land_drops_used": self._land_drops_used,           # state; from_dict reads this
             "spells_cast_this_turn": self.spells_cast_this_turn,
             "combats_done": self.combats_done, "extra_combats": self.extra_combats,
+            "attacked_this_combat": self.attacked_this_combat,
             "mulligans_taken": self.mulligans_taken,
             "free_mulligan_used": self.free_mulligan_used,
             "life_gained": self.life_gained,
@@ -175,6 +179,7 @@ class Game:
                 _land_drops_used=d["land_drops_used"],
                 spells_cast_this_turn=d["spells_cast_this_turn"],
                 combats_done=d["combats_done"], extra_combats=d["extra_combats"],
+                attacked_this_combat=d["attacked_this_combat"],
                 mulligans_taken=d["mulligans_taken"],
                 free_mulligan_used=d["free_mulligan_used"],
                 life_gained=d["life_gained"],
@@ -340,6 +345,8 @@ def pay(g: Game, cost: Cost):
     for pid in ids:
         g.perm(pid).tapped = True
     g.mana_pool = {k: pool.get(k, 0) for k in list("WUBRG") + ["C", "any"]}
+    if ids:                           # pinned log format; pool-only payments
+        g.emit(f"paid: tapped {', '.join(ids)}")   # log nothing
 
 
 # -- Effective stats (statics: anthem, equipment grants) --------------------
@@ -841,10 +848,12 @@ def step(g: Game, action: dict) -> None:
         _step_attach(g, action)
     elif kind == "activate":
         _step_activate(g, action)
+    elif kind == "attack":
+        _step_attack(g, action)
     elif kind == "pass":
         _step_pass(g)
     else:
-        # attack arrives in Task 9, mulligan/keep in Task 10.
+        # mulligan/keep arrive in Task 10.
         raise IllegalAction(f"unknown or unsupported action type {kind!r}")
     # A turn-advancing pass already recorded inside _begin_new_turn; this
     # second call is deliberate and idempotent (setdefault) — do not "fix" it.
@@ -961,8 +970,8 @@ def _step_attach(g: Game, action: dict):
 def _step_activate(g: Game, action: dict):
     # v1 pin: activations are main-phase only. Real activated abilities (token
     # producers, {T}: draw a card, ...) are frequently used mid-combat too,
-    # but that interacts with the extra_combat policy Task 9 introduces — so
-    # combat-phase activation is deferred there rather than half-modeled here.
+    # but Task 9 pinned combat to attack/pass only — the policy (Task 12)
+    # sequences activations around combat from the main phases instead.
     if g.phase not in ("main1", "main2"):
         raise IllegalAction(f"cannot activate during {g.phase}")
     perm = _resolve_perm(g, action.get("card"))
@@ -1004,6 +1013,85 @@ def _step_activate(g: Game, action: dict):
                 pips=ability.pips, any_mana=ability.any_mana, duration=ability.duration)
 
 
+def _attacker_eligible(g: Game, p: Permanent) -> bool:
+    """Combat eligibility (D8): a battlefield creature (tokens count),
+    untapped, past summoning sickness or hasty."""
+    if not _is_creature_perm(g, p) or p.tapped:
+        return False
+    return p.arrived_turn < g.turn or "haste" in effective_keywords(g, p)
+
+
+def _step_attack(g: Game, action: dict):
+    """One attack per combat instance. Empty attacker list is legal — it
+    declares no attack but still consumes this combat's attack (and fires
+    combat_begin for the instance; the attack event needs actual attackers).
+
+    Pinned mutation order: consume the per-combat flag, fire combat_begin
+    (once per combat instance — fired here, not on phase entry, so listeners
+    see the real attack ctx), fire attack with ctx={"attackers": ids} (global
+    listeners and the attackers' own {on: attack} triggers all live on the
+    battlefield, so ONE dispatch reaches both — each with source=itself),
+    tap all attackers, then damage per attacker: full effective_power into
+    the focus-fire target (first opponent still above 0 when THAT attacker's
+    damage applies — overkill never spills). The commander's damage also
+    accrues cmdr_damage; 21+ eliminates that opponent (life zeroed). A table
+    kill (every opponent at or below 0) sets won_turn once."""
+    if g.phase != "combat":
+        raise IllegalAction(f"cannot attack during {g.phase}")
+    if g.attacked_this_combat:
+        raise IllegalAction("already attacked this combat")
+    ids = action.get("attackers")
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        raise IllegalAction(f"attack needs a list of permanent ids, got {ids!r}")
+    if len(set(ids)) != len(ids):
+        raise IllegalAction("duplicate attacker ids")
+    attackers = []
+    for pid in ids:
+        p = g.perm(pid)               # unknown id raises here, pre-mutation
+        if not _is_creature_perm(g, p):
+            raise IllegalAction(f"{p.name!r} ({pid}) is not a creature")
+        if p.tapped:
+            raise IllegalAction(f"{p.name!r} ({pid}) is tapped")
+        if p.arrived_turn >= g.turn and "haste" not in effective_keywords(g, p):
+            raise IllegalAction(f"{p.name!r} ({pid}) is summoning sick")
+        attackers.append(p)
+    # --- all checks passed; mutation begins ---
+    g.attacked_this_combat = True
+    ctx = {"attackers": list(ids)}
+    fire(g, "combat_begin", ctx=ctx)
+    if not attackers:
+        g.emit("no attack")
+    else:
+        fire(g, "attack", ctx=ctx)
+        for p in attackers:
+            p.tapped = True
+        total = 0
+        hit: list[int] = []           # opponent indexes in first-hit order
+        eliminated: list[int] = []
+        for p in attackers:
+            i = next((j for j, life in enumerate(g.opponents) if life > 0), None)
+            if i is None:
+                break                 # nobody left alive to assign damage to
+            power = effective_power(g, p)
+            total += power
+            g.opponents[i] -= power
+            if i not in hit:
+                hit.append(i)
+            if p.name == g.commander_name and not p.is_token:
+                g.cmdr_damage[i] += power
+                if g.cmdr_damage[i] >= 21 and g.opponents[i] > 0:
+                    g.opponents[i] = 0          # commander-damage elimination
+                    eliminated.append(i)
+        summary = ", ".join(f"opp{i + 1} to {g.opponents[i]}" for i in hit)
+        g.emit(f"attacked with {len(attackers)} (total {total}) — "
+               f"{summary or 'no living target'}")
+        for i in eliminated:
+            g.emit(f"opp{i + 1} eliminated by commander damage")
+    if g.won_turn is None and all(life <= 0 for life in g.opponents):
+        g.won_turn = g.turn
+        g.emit(f"all opponents defeated — won turn {g.turn}")
+
+
 def _step_pass(g: Game):
     if g.phase not in ("main1", "combat", "main2", "end"):
         raise IllegalAction(f"cannot pass during {g.phase}")
@@ -1014,9 +1102,17 @@ def _step_pass(g: Game):
         g.phase = "combat"
         g.emit("phase: combat")
     elif g.phase == "combat":
-        # Task 9 adds extra-combat replays; for now combat always ends.
-        g.phase = "main2"
-        g.emit("phase: main2")
+        if g.attacked_this_combat and g.extra_combats > 0:
+            # Replay combat as a fresh instance: the attack flag resets so a
+            # new attack (and its combat_begin) is legal; attackers stay
+            # tapped (vigilance/untap effects are out of scope v1) and no
+            # events fire on the transition itself.
+            g.extra_combats -= 1
+            g.attacked_this_combat = False
+            g.emit("extra combat")
+        else:
+            g.phase = "main2"
+            g.emit("phase: main2")
     else:
         # main2 (or a resumed "end") rolls through end straight into the next
         # turn — "end" is a transient phase, never a resting state.
@@ -1037,6 +1133,7 @@ def _begin_new_turn(g: Game):
     g.spells_cast_this_turn = 0
     g.combats_done = 0
     g.extra_combats = 0
+    g.attacked_this_combat = False
     g.emit(f"turn {g.turn} begins")
     fire(g, "upkeep")
     # This solitaire format always draws — turn 1 included: the hypergeometric
@@ -1056,8 +1153,11 @@ def legal_actions(g: Game) -> list:
     by (eq id, target id) numerically; not payability-filtered per spec:
     "list pairs, it's fine"), then payable + untapped-eligible
     activated-ability entries (sorted by (perm id, ability index)), then
-    pass. Attack (Task 9) entries arrive in a later task; mulligan-phase
-    actions in Task 10."""
+    pass. Combat is factored, never combinatorial (spec §Interactive mode):
+    one {"type": "attack", "eligible": [ids]} entry — the ELIGIBLE ATTACKER
+    SET, never 2^C subsets — while this combat's attack is still available
+    and at least one attacker is eligible. Mulligan-phase actions arrive in
+    Task 10."""
     if g.phase == "mulligan":
         return []
     actions = []
@@ -1086,7 +1186,7 @@ def legal_actions(g: Game) -> list:
         # that a naive consumer looping over legal_actions under a free-equip
         # static could re-fire forever without changing game state.
         pairs = sorted(((eq, tgt) for eq in equipment for tgt in creatures
-                        if eq.attached_to != tgt.id),
+                        if eq.attached_to != tgt.id and eq.id != tgt.id),
                        key=lambda pair: (int(pair[0].id[1:]), int(pair[1].id[1:])))
         actions += [{"type": "attach", "card": eq.id, "target": tgt.id}
                     for eq, tgt in pairs]
@@ -1097,5 +1197,10 @@ def legal_actions(g: Game) -> list:
             key=lambda t: (int(t[0].id[1:]), t[1]))
         actions += [{"type": "activate", "card": p.id, "ability": i}
                     for p, i in activations]
+    elif g.phase == "combat" and not g.attacked_this_combat:
+        eligible = sorted((p.id for p in g.battlefield if _attacker_eligible(g, p)),
+                          key=lambda pid: int(pid[1:]))
+        if eligible:
+            actions.append({"type": "attack", "eligible": eligible})
     actions.append({"type": "pass"})
     return actions

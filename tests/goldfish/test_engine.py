@@ -403,7 +403,9 @@ def test_per_spell_cast_count_reads_counter():
 def test_new_game_injects_synthetic_cards():
     cards = mini_cards()
     g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
-    assert set(g.card("Treasure").data.produces) == set("WUBRG")
+    treasure_produces = g.card("Treasure").data.produces
+    assert treasure_produces is not None
+    assert set(treasure_produces) == set("WUBRG")
     assert g.card("Rock").data.produces == {"C": 1}
     assert g.card("Token").data.types == frozenset()
     assert g.card("Token").data.produces is None
@@ -1074,7 +1076,7 @@ def test_illegal_actions_leave_game_unmutated():
         {"type": "play_land", "card": "Mountain"},  # not in hand
         {"type": "cast", "card": "Plains"},         # lands aren't cast
         {"type": "cast", "card": "Missing"},        # not in hand or command
-        {"type": "attack", "attackers": []},        # Task 9 — not implemented yet
+        {"type": "attack", "attackers": []},        # wrong phase: main1, not combat
         {"type": "attach", "card": "x", "target": "y"},   # Task 8
         {"type": "mulligan"},                       # Task 10
         {"type": "frobnicate"},                     # unknown type
@@ -1571,3 +1573,259 @@ def test_activate_non_tap_ability_legal_on_tapped_permanent():
     step(g, {"type": "activate", "card": bear.id, "ability": 0})
     assert g.life_gained == 2
     assert bear.tapped is True                    # unaffected by the ability
+
+
+# -- Task 9: combat — attack subsets, sickness, focus-fire, extra combats ----
+
+def test_attack_deals_damage_and_tracks_commander():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.turn = 3
+    boss = g.new_perm("Boss"); boss.arrived_turn = 2
+    bear = g.new_perm("Bear"); bear.arrived_turn = 2
+    g.phase = "combat"
+    step(g, {"type": "attack", "attackers": [boss.id, bear.id]})
+    assert g.opponents == [35]                    # 3 + 2
+    assert g.cmdr_damage == [3]
+    assert boss.tapped and bear.tapped
+
+
+def test_summoning_sick_attacker_rejected_haste_allowed():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.phase = "combat"
+    bear = g.new_perm("Bear")                     # arrived this turn
+    runner = g.new_perm("Runner")                 # haste
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "attack", "attackers": [bear.id]})
+    step(g, {"type": "attack", "attackers": [runner.id]})
+    assert g.opponents == [39]
+
+
+def test_attack_fires_combat_events_and_extra_combat():
+    cards = mini_cards()
+    annotated(cards, "Boss", {"name": "Boss", "triggers": [
+        {"on": "attack", "do": "draw", "count": 1}]})
+    g = started(cards, ["Bear"] * 40, hand=[])
+    g.turn = 2
+    boss = g.new_perm("Boss"); boss.arrived_turn = 1
+    g.phase = "combat"
+    hand_before = len(g.hand)
+    step(g, {"type": "attack", "attackers": [boss.id]})
+    assert len(g.hand) == hand_before + 1         # attack trigger drew
+    g.extra_combats = 1
+    step(g, {"type": "pass"})                     # leaving combat with extra pending
+    assert g.phase == "combat"                    # replays combat, not main2
+    assert boss.tapped                            # still tapped from first swing
+
+
+def test_focus_fire_full_power_per_attacker_no_spillover():
+    # Each attacker's FULL power hits one opponent (the first still alive when
+    # that attacker's damage applies); excess never carries to the next.
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1, opponents=3)
+    g.phase = "combat"; g.turn = 3
+    bear = g.new_perm("Bear"); bear.arrived_turn = 2
+    boss = g.new_perm("Boss"); boss.arrived_turn = 2
+    g.opponents = [1, 40, 40]
+    step(g, {"type": "attack", "attackers": [bear.id, boss.id]})
+    assert g.opponents == [-1, 37, 40]            # bear overkills opp1, boss
+    assert g.cmdr_damage == [0, 3, 0]             # retargets opp2 in full
+    assert g.won_turn is None
+    # exact log format pinned (golden logs)
+    assert "T3: attacked with 2 (total 5) — opp1 to -1, opp2 to 37" in g.log
+
+
+def test_commander_damage_21_eliminates_opponent():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1, opponents=2)
+    g.phase = "combat"; g.turn = 4
+    boss = g.new_perm("Boss"); boss.arrived_turn = 3
+    g.cmdr_damage[0] = 18
+    step(g, {"type": "attack", "attackers": [boss.id]})
+    assert g.cmdr_damage == [21, 0]
+    assert g.opponents == [0, 40]                 # eliminated: life zeroed
+    assert g.won_turn is None                     # not a table kill
+    assert "T4: opp1 eliminated by commander damage" in g.log
+
+
+def test_table_kill_sets_won_turn_once():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.turn = 5
+    bear = g.new_perm("Bear"); bear.arrived_turn = 4
+    g.phase = "combat"
+    g.opponents = [2]
+    step(g, {"type": "attack", "attackers": [bear.id]})
+    assert g.opponents == [0]
+    assert g.won_turn == 5
+    assert "T5: all opponents defeated — won turn 5" in g.log
+
+    # an earlier win (e.g. a combo) is never overwritten, and no second win line
+    g2 = started(cards, ["Plains"] * 40, hand=[])
+    g2.turn = 6
+    bear2 = g2.new_perm("Bear"); bear2.arrived_turn = 5
+    g2.phase = "combat"
+    g2.opponents = [1]
+    g2.won_turn = 2
+    step(g2, {"type": "attack", "attackers": [bear2.id]})
+    assert g2.won_turn == 2
+    assert not any("won turn" in line for line in g2.log)
+
+
+def test_double_attack_in_one_combat_rejected():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.turn = 2
+    bear = g.new_perm("Bear"); bear.arrived_turn = 1
+    runner = g.new_perm("Runner")
+    g.phase = "combat"
+    step(g, {"type": "attack", "attackers": [bear.id]})
+    snap = g.to_dict()
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "attack", "attackers": [runner.id]})   # one attack per combat
+    assert g.to_dict() == snap                    # unmutated, runner untapped
+
+
+def test_empty_attackers_legal_consumes_attack():
+    cards = mini_cards()
+    cards["Warhorn"] = SimCard(data=make_data("Warhorn", cost=parse_cost("{2}"),
+                               types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Warhorn", {"name": "Warhorn", "triggers": [
+        {"on": "combat_begin", "do": "gain_life", "count": 1},
+        {"on": "attack", "do": "draw", "count": 1}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.new_perm("Warhorn")
+    bear = g.new_perm("Bear")
+    g.turn = 2
+    g.phase = "combat"
+    before = len(g.hand)
+    step(g, {"type": "attack", "attackers": []})
+    assert g.opponents == [40]                    # no damage
+    assert g.life_gained == 1                     # combat_begin fired for the instance
+    assert len(g.hand) == before                  # but no attack happened: no attack event
+    assert "T2: no attack" in g.log
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "attack", "attackers": [bear.id]})   # attack already consumed
+    assert bear.tapped is False
+
+
+def test_attack_rejections_leave_game_unmutated():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.turn = 2
+    ok = g.new_perm("Bear"); ok.arrived_turn = 1
+    tapped = g.new_perm("Bear"); tapped.arrived_turn = 1; tapped.tapped = True
+    sick = g.new_perm("Bear")                     # arrived turn 2: summoning sick
+    land = g.new_perm("Plains")
+    g.phase = "combat"
+    snap = g.to_dict()
+    for bad in (
+        {"type": "attack"},                                   # missing list
+        {"type": "attack", "attackers": "b1"},                # not a list
+        {"type": "attack", "attackers": [tapped.id]},         # tapped
+        {"type": "attack", "attackers": [sick.id]},           # summoning sick
+        {"type": "attack", "attackers": [land.id]},           # not a creature
+        {"type": "attack", "attackers": ["b99"]},             # unknown id
+        {"type": "attack", "attackers": [ok.id, ok.id]},      # duplicate ids
+        {"type": "attack", "attackers": [ok.id, sick.id]},    # one bad spoils all
+    ):
+        with pytest.raises(IllegalAction):
+            step(g, bad)
+    assert g.to_dict() == snap                    # validate-first: byte-identical
+
+
+def test_legal_actions_combat_returns_eligible_set_never_subsets():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.turn = 2
+    bear = g.new_perm("Bear"); bear.arrived_turn = 1          # eligible
+    boss = g.new_perm("Boss")                                 # sick: arrived turn 2
+    runner = g.new_perm("Runner")                             # sick but haste: eligible
+    tapped = g.new_perm("Bear"); tapped.arrived_turn = 1; tapped.tapped = True
+    g.new_perm("Plains")                                      # not a creature
+    g.phase = "combat"
+    assert legal_actions(g) == [
+        {"type": "attack", "eligible": [bear.id, runner.id]},
+        {"type": "pass"},
+    ]
+    assert boss.id not in legal_actions(g)[0]["eligible"]
+    step(g, {"type": "attack", "attackers": [bear.id]})
+    assert legal_actions(g) == [{"type": "pass"}]             # attack consumed
+
+
+def test_per_equipped_attacker_resolves_in_attack_step():
+    cards = mini_cards()
+    cards["Tactician"] = SimCard(data=make_data("Tactician", cost=parse_cost("{1}{W}"),
+                                 types=frozenset({"creature"}), power=1, toughness=1),
+                                 ann=None, scope_class=None)
+    annotated(cards, "Tactician", {"name": "Tactician", "triggers": [
+        {"on": "attack", "do": "draw", "count": "per_equipped_attacker"}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.turn = 2
+    g.new_perm("Tactician")                       # bystander listener, not attacking
+    bear = g.new_perm("Bear"); bear.arrived_turn = 1
+    runner = g.new_perm("Runner")
+    ham = g.new_perm("Hammer")
+    ham.attached_to = bear.id
+    bear.attached.append(ham.id)
+    g.phase = "combat"
+    before = len(g.hand)
+    step(g, {"type": "attack", "attackers": [bear.id, runner.id]})
+    assert len(g.hand) == before + 1              # exactly the 1 equipped attacker
+    assert g.opponents == [37]                    # 2 + 1 combat damage still applied
+
+
+def test_combat_begin_fires_once_per_combat_instance_across_extra_combats():
+    cards = mini_cards()
+    cards["Warhorn"] = SimCard(data=make_data("Warhorn", cost=parse_cost("{2}"),
+                               types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Warhorn", {"name": "Warhorn", "triggers": [
+        {"on": "combat_begin", "do": "gain_life", "count": 1}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.turn = 2
+    g.new_perm("Warhorn")
+    bear = g.new_perm("Bear"); bear.arrived_turn = 1
+    runner = g.new_perm("Runner")
+    g.extra_combats = 1
+    g.phase = "combat"
+    step(g, {"type": "attack", "attackers": [bear.id]})
+    assert g.life_gained == 1                     # first instance's combat_begin
+    step(g, {"type": "pass"})                     # replays combat (extra pending)
+    assert g.phase == "combat" and g.extra_combats == 0
+    assert any("extra combat" in line for line in g.log)
+    assert g.life_gained == 1                     # pass itself fires nothing
+    step(g, {"type": "attack", "attackers": [runner.id]})
+    assert g.life_gained == 2                     # new instance: combat_begin again
+    assert g.trigger_fires["Warhorn|combat_begin|gain_life"] == 2
+    assert bear.tapped and runner.tapped          # attackers stay tapped throughout
+    step(g, {"type": "pass"})                     # no extras left
+    assert g.phase == "main2"
+
+
+def test_pay_logs_tapped_ids_only_when_permanents_tap():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    m1, m2, m3 = (g.new_perm("Mountain") for _ in range(3))
+    step(g, {"type": "cast", "card": "Boss"})     # {2}{R}: taps all three
+    assert f"T1: paid: tapped {m1.id}, {m2.id}, {m3.id}" in g.log
+    # pool-only payments log nothing
+    g2 = started(cards, ["Plains"] * 40, hand=[])
+    g2.mana_pool["any"] = 1
+    pay(g2, parse_cost("{1}"))
+    assert not any("paid:" in line for line in g2.log)
+
+
+def test_legal_actions_excludes_self_attach_pair():
+    # a living weapon (creature + equipment) must not offer (blade, blade)
+    cards = mini_cards()
+    cards["LivingBlade"] = SimCard(data=make_data(
+        "LivingBlade", cost=parse_cost("{2}"),
+        types=frozenset({"artifact", "equipment", "creature"}),
+        power=0, toughness=0, equip_cost=parse_cost("{1}")),
+        ann=None, scope_class=None)
+    g = started(cards, ["Plains"] * 40, hand=[])
+    blade = g.new_perm("LivingBlade")
+    bear = g.new_perm("Bear")
+    attaches = [a for a in legal_actions(g) if a["type"] == "attach"]
+    assert attaches == [{"type": "attach", "card": blade.id, "target": bear.id}]
