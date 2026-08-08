@@ -208,3 +208,96 @@ def test_payment_plan_is_deterministic():
     ids2, pool2 = plan2
     assert ids1 == ids2                          # same perms tapped, same order
     assert pool1 == pool2
+
+
+# -- Regressions: MRV pip ordering + generic surplus banking --------------
+# The plan's reference solver ordered colored pips by raw demand (-need[c]),
+# a one-shot sort that strands duals shared between two needed colors, and
+# discarded producer overshoot in the generic phase instead of banking it.
+# Fixed to dynamic most-constrained-first (recomputed after every pip) and
+# to route all overshoot — colored and generic — through the pool.
+
+def _dual_cards():
+    """mini_cards() plus a WU and a WB dual land, for pip-ordering regressions."""
+    cards = mini_cards()
+    cards["WU"] = SimCard(data=make_data("WU", types=frozenset({"land"}),
+                                         produces={"W": 1, "U": 1}), ann=None, scope_class=None)
+    cards["WB"] = SimCard(data=make_data("WB", types=frozenset({"land"}),
+                                         produces={"W": 1, "B": 1}), ann=None, scope_class=None)
+    return cards
+
+
+def _rock_cards():
+    """mini_cards() plus an all-color-agnostic colorless rock (Sol Ring-alike)."""
+    cards = mini_cards()
+    cards["SolRing"] = SimCard(data=make_data("SolRing", types=frozenset({"artifact"}),
+                                              produces={"C": 2}), ann=None, scope_class=None)
+    return cards
+
+
+def test_mrv_orders_colored_pips_by_scarcity_not_demand():
+    # Each of these is payable by an exact matcher; the demand-ordered solver
+    # greedily grabbed the shared color first and stranded the dual.
+    for names, cost_str in (
+        (["WU", "WB"], "{W}{U}"),
+        (["WB", "WU"], "{W}{U}"),
+        (["WU", "WB", "WB"], "{W}{U}{B}"),
+    ):
+        cards = _dual_cards()
+        g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+        for n in names:
+            bf_land(g, n)
+        cost = parse_cost(cost_str)
+        assert can_pay(g, cost) is True, (names, cost_str)
+        pay(g, cost)
+        assert all(p.tapped for p in g.battlefield)
+
+
+def test_mrv_lets_a_basic_rescue_a_double_pip_that_would_strand_a_dual():
+    cards = _dual_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bf_land(g, "Plains"); bf_land(g, "WU"); bf_land(g, "WB")
+    cost = parse_cost("{W}{W}{U}")
+    assert can_pay(g, cost) is True
+    pay(g, cost)
+    assert all(p.tapped for p in g.battlefield)
+
+
+def test_generic_surplus_is_banked_for_a_second_payment_same_turn():
+    cards = _rock_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bf_land(g, "SolRing")
+    pay(g, parse_cost("{1}"))
+    assert g.mana_pool["C"] == 1                  # overshoot banked, not discarded
+    assert can_pay(g, parse_cost("{1}")) is True
+    pay(g, parse_cost("{1}"))
+    assert g.mana_pool["C"] == 0
+
+
+def test_generic_surplus_banked_even_when_split_with_a_land():
+    cards = _rock_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bf_land(g, "SolRing"); bf_land(g, "Plains")
+    pay(g, parse_cost("{1}{W}"))                  # W from Plains, generic from SolRing
+    assert g.mana_pool["C"] == 1
+    assert can_pay(g, parse_cost("{1}")) is True   # banked C covers the follow-up
+
+
+def test_colorless_pip_not_payable_from_any_wildcard():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.mana_pool["any"] = 1
+    assert can_pay(g, parse_cost("{C}")) is False
+
+
+def test_pool_any_untouched_when_a_producer_covers_the_pip():
+    # wildcards spent last: with a Mountain able to pay {R} directly, the
+    # pool's "any" wildcard must be left alone.
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bf_land(g, "Mountain")
+    g.mana_pool["any"] = 1
+    assert can_pay(g, parse_cost("{R}")) is True
+    pay(g, parse_cost("{R}"))
+    assert g.mana_pool["any"] == 1
+    assert g.battlefield[0].tapped is True

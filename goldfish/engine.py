@@ -190,8 +190,9 @@ def new_game(cards: dict, deck: list, commander: str, seed: int,
 
 def untapped_producers(g: Game):
     """[(perm, colors: frozenset|{'C'}, qty)] for untapped mana permanents,
-    summoning-sickness-aware for creatures with {T} in produces (none in v1 —
-    rocks/lands only), deterministic order by perm id."""
+    deterministic order by (fewest colors, perm id) — strictest first. No
+    sickness check: v1 producers are rocks/lands only (creature producers
+    would need an arrived_turn guard)."""
     out = []
     for p in g.battlefield:
         if p.tapped:
@@ -206,38 +207,61 @@ def untapped_producers(g: Game):
 
 
 def _payment_plan(g: Game, cost: Cost):
-    """Greedy: colored pips from strictest producers, generic from the rest
-    (largest quantity first), pool wildcards last. Returns [perm ids] or None."""
+    """Greedy, most-constrained-first: colored pips are paid one at a time,
+    always choosing the still-needed color with the fewest remaining
+    candidate sources (untapped matching producers + matching pool, plus the
+    pool wildcard for WUBRG but never for {C}) — recomputed after every pip so
+    a dual land isn't claimed by a color that had other options (MRV). Within
+    a color the existing strictest-producer (fewest colors, then id) choice
+    is kept via `avail`'s pre-sort. Generic is paid from the rest (largest
+    quantity first); any producer overshoot — colored or generic — is banked
+    into the pool using the same routing rule (multicolor producer -> "any",
+    monocolor -> its one color) so it can fund a later payment this turn.
+    Returns ([perm ids], pool) or None."""
     producers = untapped_producers(g)
     used, avail = [], list(producers)
     pool = dict(g.mana_pool)
     need = dict(cost.pips)
 
-    for color in sorted([c for c in ("W", "U", "B", "R", "G", "C") if need.get(c)],
-                        key=lambda c: -need[c]):
-        for _ in range(need[color]):
-            if pool.get(color, 0) > 0:
-                pool[color] -= 1
-                continue
-            hit = next((t for t in avail if color in t[1]), None)
-            if hit:
-                avail.remove(hit)
-                used.append(hit)
-                surplus = hit[2] - 1
-                if surplus:
-                    pool["any" if len(hit[1]) > 1 else next(iter(hit[1]))] = \
-                        pool.get("any" if len(hit[1]) > 1 else next(iter(hit[1])), 0) + surplus
-            elif pool.get("any", 0) > 0:
-                pool["any"] -= 1
-            else:
-                return None
+    def candidates(color):
+        n = sum(1 for t in avail if color in t[1]) + pool.get(color, 0)
+        if color != "C":                       # "any" can't pay a {C} pip
+            n += pool.get("any", 0)
+        return n
+
+    remaining = {c: need[c] for c in ("W", "U", "B", "R", "G", "C") if need.get(c)}
+    while any(remaining.values()):
+        color = min((c for c in remaining if remaining[c]),
+                    key=lambda c: (candidates(c), -remaining[c], "WUBRGC".index(c)))
+        remaining[color] -= 1
+        if pool.get(color, 0) > 0:
+            pool[color] -= 1
+            continue
+        hit = next((t for t in avail if color in t[1]), None)
+        if hit:
+            avail.remove(hit)
+            used.append(hit)
+            surplus = hit[2] - 1
+            if surplus:
+                k = "any" if len(hit[1]) > 1 else next(iter(hit[1]))
+                pool[k] = pool.get(k, 0) + surplus
+        elif color != "C" and pool.get("any", 0) > 0:
+            pool["any"] -= 1
+        else:
+            return None
 
     generic = need.get("generic", 0)
     avail.sort(key=lambda t: (-t[2], len(t[1])))    # big colorless rocks first
     for t in list(avail):
         if generic <= 0:
             break
-        avail.remove(t); used.append(t); generic -= t[2]
+        avail.remove(t); used.append(t)
+        take = min(generic, t[2])
+        generic -= take
+        surplus = t[2] - take
+        if surplus:
+            k = "any" if len(t[1]) > 1 else next(iter(t[1]))
+            pool[k] = pool.get(k, 0) + surplus
     while generic > 0:
         for k in ("C", "W", "U", "B", "R", "G", "any"):
             if pool.get(k, 0) > 0:
