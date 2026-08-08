@@ -26,6 +26,10 @@ CARDS_PER_PAGE = 24
 
 SHOPS = {"tcgplayer": "$", "cardkingdom": "$", "cardmarket": "€"}
 
+# Public path prefix stripped by the gateway (set from PUBLIC_BASE by server.py).
+# Every emitted link and fetch must include it; empty when served at the root.
+PREFIX = ""
+
 # Chart geometry shared with the inline JS crosshair (keep in sync there).
 CW, CH, CPAD = 640, 220, 34
 SW, SH = 240, 56
@@ -150,6 +154,10 @@ dialog h3{font-family:var(--font-display)}
 .spark polyline{stroke-dasharray:1;stroke-dashoffset:1;animation:draw 1.1s .15s forwards ease-out}
 @keyframes draw{to{stroke-dashoffset:0}}
 .nodata{color:var(--sub);font-size:.78rem;font-style:italic;margin-top:.6rem}
+.skel{background:linear-gradient(90deg,transparent,var(--surface0),transparent)
+  0 0/200% 100%;animation:shimmer 1.6s linear infinite;border-radius:.3rem;
+  padding:.15rem .4rem;display:inline-block}
+@keyframes shimmer{to{background-position:-200% 0}}
 .rail{background:var(--card);border:1px solid var(--surface0);border-radius:1rem;
   padding:1.1rem 1.2rem;backdrop-filter:blur(6px);max-width:44rem;margin:0 auto}
 .rev{display:flex;gap:.55rem;align-items:baseline;padding:.45rem .3rem;border-radius:.5rem;
@@ -250,6 +258,8 @@ footer a{color:var(--sub)}
 
 _JS = r"""
 const KEY=%(key)s, EDITABLE=%(editable)s, CPAD=%(cpad)d, CW=%(cw)d, CH=%(ch)d, CUR=%(cur)s;
+const P=%(prefix)s;                       // gateway path prefix, e.g. '/mtg'
+const U=path=>P+path;                     // build a browser-correct URL
 const X=s=>String(s??'').replace(/[&<>"']/g,
   c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 // ── flashless navigation: every internal link and mutation morphs in place ──
@@ -336,7 +346,7 @@ function wireDialogs(){
     b.onclick=()=>b.closest('dialog').close());
   const renameSave=document.getElementById('renameSave');
   if(renameSave){renameSave.onclick=async()=>{
-    const r=await fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/json'},
+    const r=await fetch(U('/api/rename'),{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({key:KEY,label:document.getElementById('renameInput').value})});
     if(r.ok){document.getElementById('renameDlg').close();refresh()}
     else document.getElementById('renameErr').textContent='could not rename';
@@ -347,7 +357,7 @@ function wireDialogs(){
       const q=document.getElementById('addInput').value.trim();if(!q)return;
       document.getElementById('addErr').textContent='';
       document.getElementById('addPreview').innerHTML='<p class=sub>consulting Scryfall\u2026</p>';
-      const r=await fetch('/api/resolve',{method:'POST',headers:{'Content-Type':'application/json'},
+      const r=await fetch(U('/api/resolve'),{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({key:KEY,query:q})});
       if(!r.ok){document.getElementById('addPreview').innerHTML='';
         document.getElementById('addErr').textContent=(await r.json()).error||'not found';return}
@@ -365,7 +375,7 @@ function wireDialogs(){
     enterClicks('addInput','addLookup');
     document.getElementById('addGo').onclick=async()=>{
       const t=document.getElementById('addTarget');
-      const r=await fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/json'},
+      const r=await fetch(U('/api/add'),{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({key:KEY,name:pending.name,set_code:pending.set_code,
           collector_number:pending.collector_number,
           target_price:t&&t.value.trim()!==''?+t.value:null})});
@@ -380,7 +390,7 @@ function wireDialogs(){
   }
   const boughtBtn=document.getElementById('boughtBtn');
   if(boughtBtn)boughtBtn.onclick=async()=>{
-    const r=await fetch('/api/bought',{method:'POST',headers:{'Content-Type':'application/json'},
+    const r=await fetch(U('/api/bought'),{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({key:KEY,entry_id:+boughtBtn.dataset.entry,
                            bought:!boughtBtn.dataset.bought})});
     if(r.ok){document.getElementById('cardDlg').close();refresh()}
@@ -393,7 +403,7 @@ function wireDialogs(){
       document.getElementById('rmConfirm').style.display='none';
       removeBtn.style.display='';};
     document.getElementById('rmYes').onclick=async()=>{
-      const r=await fetch('/api/remove',{method:'POST',headers:{'Content-Type':'application/json'},
+      const r=await fetch(U('/api/remove'),{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({key:KEY,entry_id:+removeBtn.dataset.entry})});
       if(r.ok){document.getElementById('cardDlg').close();refresh()}
     };
@@ -401,7 +411,7 @@ function wireDialogs(){
   const tgtSave=document.getElementById('tgtSave');
   if(tgtSave){tgtSave.onclick=async()=>{
     const v=document.getElementById('tgtInput').value.trim();
-    const r=await fetch('/api/target',{method:'POST',headers:{'Content-Type':'application/json'},
+    const r=await fetch(U('/api/target'),{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({key:KEY,entry_id:+document.getElementById('tgtEdit').dataset.entry,
                            target_price:v===''?null:+v})});
     if(r.ok){document.getElementById('cardDlg').close();refresh()}
@@ -418,7 +428,7 @@ async function claimFlow(){
   const dlg=document.getElementById('claimDlg');dlg.showModal();
   const out=document.getElementById('claimOut');
   out.innerHTML='<p class=sub>minting your copy\u2026</p>';
-  const r=await fetch('/api/fork',{method:'POST',headers:{'Content-Type':'application/json'},
+  const r=await fetch(U('/api/fork'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({key:KEY,mode:'fork'})});
   if(!r.ok){out.innerHTML='<p class=err>could not create a copy</p>';return}
   const d=await r.json();
@@ -459,7 +469,7 @@ function wireRev(r){
     document.getElementById('revBody').innerHTML='<p class=sub>consulting the ledger\u2026</p>';
     document.getElementById('forkOut').innerHTML='';
     revDlg.showModal();
-    const res=await fetch('/api/revision/'+encodeURIComponent(KEY)+'/'+seq);
+    const res=await fetch(U('/api/revision/'+encodeURIComponent(KEY)+'/'+seq));
     if(!res.ok){document.getElementById('revBody').textContent='Could not read revision.';return}
     const d=await res.json();
     let h='<table class=snap><tr><th>Card</th><th>Printing</th><th>Target</th><th>Note</th></tr>';
@@ -475,7 +485,7 @@ function wireRev(r){
   };
 }
 async function doFork(mode,seq){
-  const res=await fetch('/api/fork',{method:'POST',headers:{'Content-Type':'application/json'},
+  const res=await fetch(U('/api/fork'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({key:KEY,at_seq:+seq,mode})});
   const out=document.getElementById('forkOut');
   if(!res.ok){out.textContent='Fork failed: '+await res.text();return}
@@ -512,6 +522,17 @@ function armCrosshair(pts){
   svg.onpointermove=show;svg.onpointerdown=show;
   svg.onpointerleave=()=>{tip.style.display='none';
     vline.setAttribute('x1',-9);vline.setAttribute('x2',-9);dot.setAttribute('cx',-9)};
+}
+// While history is being fetched, poll quietly until prices land.
+if(document.querySelector('.skel')){
+  let tries=0;
+  const poll=setInterval(async()=>{
+    if(++tries>60){clearInterval(poll);return}          // give up after ~5 min
+    const r=await fetch(location.href,{cache:'no-store'}).catch(()=>null);
+    if(r&&r.ok&&!(await r.text()).includes('class="nodata skel"')){
+      clearInterval(poll);refresh();
+    }
+  },5000);
 }
 wire();wireDialogs();
 """
@@ -641,7 +662,7 @@ def _hit(entry, s) -> bool:
                 and s["current"] <= entry["target_price"])
 
 
-def _card_html(db, entry, s, hit, idx, shop, cur):
+def _card_html(db, entry, s, hit, idx, shop, cur, filling=False):
     """One board card. `s` is the DISPLAY-shop summary; `hit` was computed on
     the tcgplayer basis (targets are USD) so it never flips with the shop."""
     points = []
@@ -662,7 +683,9 @@ def _card_html(db, entry, s, hit, idx, shop, cur):
         deltas = (f'<div class="deltas">{_delta_pct(s["d7"], s["current"], "7d", cur)}'
                   f'{_delta_pct(s["d30"], s["current"], "30d", cur)}</div>')
     else:
-        price = '<div class="nodata">no prices yet — history is on its way</div>'
+        price = ('<div class="nodata skel">fetching price history…</div>'
+                 if filling else
+                 '<div class="nodata">no prices yet</div>')
         deltas = ""
     target = ""
     if bought_at:
@@ -747,7 +770,8 @@ def _shell(row, editable, body, dialogs, cur="$", subtitle="", rightnav=""):
     title = esc(label)
     long_cls = ' class="long"' if len(label) > 16 else ""
     js = _JS % {"key": json.dumps(key), "editable": json.dumps(editable),
-                "cpad": CPAD, "cw": CW, "ch": CH, "cur": json.dumps(cur)}
+                "cpad": CPAD, "cw": CW, "ch": CH, "cur": json.dumps(cur),
+                "prefix": json.dumps(PREFIX)}
     rename = (f'<button class="iconbtn" id="rename" title="Rename list" '
               f'aria-label="Rename list" data-label="{esc(row["label"] or "")}">✎</button>'
               if editable else "")
@@ -775,19 +799,21 @@ document.querySelector('meta[name=theme-color]').content=
 {f'<p class="subtitle">{subtitle}</p>' if subtitle else ''}
 {body}
 <footer>forged in the Mystic Forge · card price watchlist ·
-<a href="/health" title="server status">status</a></footer>
+<a href="{PREFIX}/health" title="server status">status</a></footer>
 </div>
 {dialogs}
 <script>{js}</script>
 </body></html>"""
 
 
-def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -> str:
+def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
+                filling: bool = False) -> str:
     """The board: verdict + stat tiles + card grid, buy windows first."""
     key = row["_key"]
     shop = shop if shop in SHOPS else "tcgplayer"
     cur = SHOPS[shop]
-    base = f"/w/{esc(key)}" if editable else f"/s/{esc(key)}"
+    base = (f"{PREFIX}/w/{esc(key)}" if editable
+            else f"{PREFIX}/s/{esc(key)}")
     keep = f"&shop={shop}" if shop != "tcgplayer" else ""
     qshop = f"?shop={shop}" if shop != "tcgplayer" else ""
     entries = watchlist_db.current_entries(db, row["id"])
@@ -814,7 +840,7 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
     last_ingest = last_ingest["value"] if last_ingest else "never"
 
     page = pairs[(cp - 1) * CARDS_PER_PAGE: cp * CARDS_PER_PAGE]
-    cards = "".join(_card_html(db, e, disp_s, h, i, shop, cur)
+    cards = "".join(_card_html(db, e, disp_s, h, i, shop, cur, filling)
                     for i, (e, _, disp_s, h, _b) in enumerate(page)) or \
         '<p class="nodata">Nothing watched yet — use “Add card” or ask Claude.</p>'
 
@@ -823,7 +849,7 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
     shop_links = "".join(
         f'<a href="{base}?shop={s}" class="{"on" if s == shop else ""}">{shop_names[s]}</a>'
         for s in SHOPS)
-    share_path = f"/s/{esc(row['share_code'])}"
+    share_path = f"{PREFIX}/s/{esc(row['share_code'])}"
     share = (f'<button class="textlink" data-copy="{share_path}" '
              f'title="Copy the read-only link (code {esc(row["share_code"])})">'
              f'Share ⧉</button>' if editable else "")
@@ -886,8 +912,13 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
                if editable else "")
     hist_title = ("Every change ever made to this list — inspect or restore any point"
                   if editable else "See every change made to this list")
-    freshness = (f"Buy prices through {esc(through)}" if through
-                 else "No price data yet — first ingest tonight")
+    if through:
+        freshness = f"Buy prices through {esc(through)}"
+    elif filling:
+        freshness = ("⏳ Fetching 90 days of price history now — first run on a "
+                     "new server takes a few minutes; this page refreshes itself")
+    else:
+        freshness = "No price data yet"
     usd_note = (" · targets always compare against TCGplayer USD"
                 if shop != "tcgplayer" else "")
     ro_note = "" if editable else "Read-only view · "
@@ -930,7 +961,8 @@ def render_history(db, row, editable: bool, hp: int = 1,
                    shop: str = "tcgplayer") -> str:
     """The stashed-away revision view: full chain, revision modal, fork/restore."""
     key = row["_key"]
-    base = f"/w/{esc(key)}" if editable else f"/s/{esc(key)}"
+    base = (f"{PREFIX}/w/{esc(key)}" if editable
+            else f"{PREFIX}/s/{esc(key)}")
     qshop = f"?shop={shop}" if shop in SHOPS and shop != "tcgplayer" else ""
     total_ev = db.execute("SELECT COUNT(*) FROM events WHERE list_id=?",
                           (row["id"],)).fetchone()[0]

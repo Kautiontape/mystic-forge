@@ -166,6 +166,44 @@ def ingest_prices_file(db, gz_path: str, only_uuids=None) -> int:
     return rows
 
 
+def ensure_history(db_path: str, data_dir: str | None = None) -> int:
+    """Guarantee every watched card has its ~90 days of history, downloading
+    the MTGJSON files if they aren't cached yet.
+
+    This is the on-demand path: history is a static backfill, so it must never
+    wait for the nightly cycle. Idempotent and self-coalescing — it works on
+    "every watched uuid with no prices", so simultaneous adds collapse into one
+    pass. Returns price rows written."""
+    data_dir = data_dir or _data_dir()
+    os.makedirs(data_dir, exist_ok=True)
+    db = watchlist_db.connect(db_path)
+    try:
+        watchlist_db.init_db(db)
+        if not db.execute("SELECT 1 FROM watchlist_current LIMIT 1").fetchone():
+            return 0
+        ap_path = os.path.join(data_dir, "AllPrintings.sqlite")
+        if _needs_unresolved(db) and not os.path.exists(ap_path):
+            log.info("bootstrap: fetching AllPrintings")
+            _download(f"{MTGJSON}/AllPrintings.sqlite", ap_path, db)
+        if os.path.exists(ap_path):
+            resolve_watched(db, ap_path)
+        missing = {r["uuid"] for r in db.execute(
+            """SELECT cu.uuid FROM watchlist_current wc
+               JOIN card_uuids cu ON LOWER(cu.card_name)=LOWER(wc.card_name)
+               WHERE NOT EXISTS (SELECT 1 FROM prices p WHERE p.uuid=cu.uuid)""")}
+        if not missing:
+            return 0
+        allp = os.path.join(data_dir, "AllPrices.json.gz")
+        if not os.path.exists(allp):
+            log.info("bootstrap: fetching AllPrices")
+            _download(f"{MTGJSON}/AllPrices.json.gz", allp, db)
+        n = ingest_prices_file(db, allp, only_uuids=missing)
+        log.info("history fill: %d uuid(s), %d rows", len(missing), n)
+        return n
+    finally:
+        db.close()
+
+
 def backfill_cards(db_path: str, data_dir: str | None = None,
                    card_names=None) -> int:
     """Instant history for just-added cards, entirely from the nightly-cached
@@ -229,7 +267,8 @@ def run_ingest(db_path: str, data_dir: str | None = None) -> None:
     try:
         watchlist_db.init_db(db)
         if not db.execute("SELECT 1 FROM watchlist_current LIMIT 1").fetchone():
-            _set_meta(db, "last_ingest", date.today().isoformat())
+            # Nothing watched: do NOT stamp last_ingest, or the first cards
+            # added today would wait until tomorrow for any prices.
             return
         ap_path = os.path.join(data_dir, "AllPrintings.sqlite")
         week_old = (not os.path.exists(ap_path)

@@ -116,6 +116,46 @@ def test_backfill_entry_uses_cached_files_for_one_card(db, db_path, tmp_path):
     assert db.execute("SELECT COUNT(*) FROM card_uuids").fetchone()[0] == 3
 
 
+def test_ensure_history_downloads_when_cache_is_cold(db, db_path, tmp_path,
+                                                     monkeypatch):
+    """A fresh server must not make users wait for the nightly cycle: history
+    is a static backfill, so ensure_history fetches the files on demand."""
+    src = tmp_path / "src"
+    src.mkdir()
+    ap = make_allprintings(src)
+    gz = make_prices_gz(src, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    fetched = []
+
+    def fake_download(url, dest, _db):
+        import shutil
+        fetched.append(url.rsplit("/", 1)[-1])
+        shutil.copy(ap if url.endswith(".sqlite") else gz, dest)
+        return dest
+    monkeypatch.setattr(watchlist_ingest, "_download", fake_download)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    n = watchlist_ingest.ensure_history(db_path, str(tmp_path))
+    assert fetched == ["AllPrintings.sqlite", "AllPrices.json.gz"]
+    assert n == 3
+    assert db.execute("SELECT COUNT(*) FROM prices").fetchone()[0] == 3
+    # idempotent: nothing missing now, so no second pass and no re-download
+    assert watchlist_ingest.ensure_history(db_path, str(tmp_path)) == 0
+    assert len(fetched) == 2
+
+
+def test_empty_watchlist_does_not_stamp_last_ingest(db, db_path, tmp_path):
+    """Regression: stamping last_ingest on an empty list made the first cards
+    added that day wait until tomorrow for any prices."""
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+    db2 = watchlist_db.connect(db_path)
+    row = db2.execute("SELECT value FROM meta WHERE key='last_ingest'").fetchone()
+    db2.close()
+    assert row is None
+
+
 def test_backfill_entry_defers_when_nothing_cached(db, db_path, tmp_path):
     list_id, _, _ = watchlist_db.create_list(db)
     watchlist_db.add_card(db, list_id, "Sol Ring")

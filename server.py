@@ -91,6 +91,11 @@ _PP_RE = re.compile(r"^/mcp/(?P<pp>[a-z0-9][a-z0-9-]{6,})/?$")
 
 PUBLIC_BASE = os.environ.get("MYSTIC_FORGE_PUBLIC_BASE",
                              "https://mcp.kautiontape.com/mtg")
+# The gateway strips this prefix before proxying, so the server sees "/w/…"
+# while the browser needs "/mtg/w/…". Every link and fetch the pages emit must
+# carry it, or they resolve against the origin root and 404.
+PUBLIC_PREFIX = urllib.parse.urlparse(PUBLIC_BASE).path.rstrip("/")
+watchlist_pages.PREFIX = PUBLIC_PREFIX
 
 
 class PassphraseMiddleware:
@@ -2463,27 +2468,39 @@ def _client_key(request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _schedule_backfill(card_names) -> bool:
-    """Instant-history kick after an add: resolve + backfill the given card(s)
-    from the nightly-cached MTGJSON files, off the request path. One scan for
-    the whole batch. No network — if nothing is cached yet, defer to the
-    nightly ingest (returns False)."""
-    names = [card_names] if isinstance(card_names, str) else list(card_names or [])
-    if not names or os.environ.get("MYSTIC_FORGE_NO_INGEST"):
+_history_task: Optional[asyncio.Task] = None
+
+
+def _history_filling() -> bool:
+    return _history_task is not None and not _history_task.done()
+
+
+def _schedule_backfill(card_names=None) -> bool:
+    """Kick the on-demand history fill after an add, off the request path.
+
+    History is a static backfill, so it never waits for the nightly cycle: if
+    the MTGJSON files aren't cached yet this downloads them first. Single-
+    flight — a run in progress already covers every watched card, so a bulk
+    add of 38 cards triggers one pass, not 38. Returns True if history is
+    being fetched now."""
+    global _history_task
+    if os.environ.get("MYSTIC_FORGE_NO_INGEST"):
         return False
+    if _history_filling():
+        return True
     data_dir = watchlist_ingest._data_dir()
-    if not os.path.exists(os.path.join(data_dir, "AllPrices.json.gz")):
-        return False
 
     async def run():
         try:
-            await asyncio.to_thread(watchlist_ingest.backfill_cards,
-                                    watchlist_db.DB_PATH, data_dir, names)
+            await asyncio.to_thread(watchlist_ingest.ensure_history,
+                                    watchlist_db.DB_PATH, data_dir)
         except Exception:
-            logging.getLogger("mystic_forge").exception(
-                "instant backfill failed for %r", names)
+            logging.getLogger("mystic_forge").exception("history fill failed")
 
-    asyncio.get_running_loop().create_task(run())
+    try:
+        _history_task = asyncio.get_running_loop().create_task(run())
+    except RuntimeError:                     # no loop (stdio/tests)
+        return False
     return True
 
 
@@ -2600,11 +2617,10 @@ async def watchlist_add(params: WatchlistAddInput) -> str:
         summary = watchlist_db.entry_price_summary(db, entry)
         if summary:
             backfill = "history ready"
-        elif _schedule_backfill(entry["card_name"]):
-            backfill = ("history backfilling now from cached data — "
-                        "usually ready within a minute or two")
+        elif _schedule_backfill():
+            backfill = "fetching 90 days of price history now"
         else:
-            backfill = "history pending next nightly ingest"
+            backfill = "history pending next ingest"
         printing = f" [{entry['set_code']} {entry['collector_number']}]" \
             if entry.get("set_code") else ""
         lines = [warning + f"Added **{name}**{printing} "
@@ -2695,7 +2711,7 @@ async def watchlist_bulk_add(params: WatchlistBulkAddInput) -> str:
                 db, row["id"], canonical, target_price=target, note=params.note)
             (updated if existed else added).append(entry["card_name"])
 
-        backfilling = _schedule_backfill(added) if added else False
+        backfilling = _schedule_backfill() if added else False
 
         lines = [warning + f"**Added {len(added)} card(s)** to "
                  f"{row['label'] or 'your watchlist'}."]
@@ -2710,10 +2726,11 @@ async def watchlist_bulk_add(params: WatchlistBulkAddInput) -> str:
             lines.append(f"\n⚠️ {len(skipped)} not recognized by Scryfall — "
                          f"check spelling: " + ", ".join(skipped[:20])
                          + (" …" if len(skipped) > 20 else ""))
-        lines.append("\n" + ("Price history is backfilling now from cached "
-                             "data — ready in a minute or two."
+        lines.append("\n" + ("Fetching 90 days of price history now — it "
+                             "appears on the board shortly (first run on a "
+                             "new server takes a few minutes)."
                              if backfilling else
-                             "Price history arrives with the next nightly ingest."))
+                             "Price history arrives with the next ingest."))
         return "\n".join(lines)
     finally:
         db.close()
@@ -3001,6 +3018,18 @@ def _page_row(db, request, param, by_share: bool):
     return row
 
 
+def _ensure_history_for(db, row) -> bool:
+    """Opening a board is itself a request for history: if anything watched
+    still lacks prices, start the fill now rather than waiting for a cycle."""
+    unpriced = db.execute(
+        """SELECT 1 FROM watchlist_current wc
+           WHERE NOT EXISTS (
+             SELECT 1 FROM card_uuids cu JOIN prices p ON p.uuid=cu.uuid
+             WHERE LOWER(cu.card_name)=LOWER(wc.card_name))
+           AND wc.list_id=? LIMIT 1""", (row["id"],)).fetchone()
+    return _schedule_backfill() if unpriced else False
+
+
 @mcp.custom_route("/w/{passphrase}", methods=["GET"])
 async def watch_page(request: Request):
     db = _wl_db()
@@ -3008,9 +3037,11 @@ async def watch_page(request: Request):
         row = _page_row(db, request, "passphrase", by_share=False)
         if row is None:
             return HTMLResponse("unknown passphrase", status_code=404)
+        filling = _ensure_history_for(db, row)
         return HTMLResponse(watchlist_pages.render_main(
             db, row, editable=True, cp=_page_int(request, "cp"),
-            shop=request.query_params.get("shop", "tcgplayer")))
+            shop=request.query_params.get("shop", "tcgplayer"),
+            filling=filling))
     finally:
         db.close()
 
@@ -3081,9 +3112,11 @@ async def share_page(request: Request):
         row = _page_row(db, request, "share_code", by_share=True)
         if row is None:
             return HTMLResponse("unknown share code", status_code=404)
+        filling = _ensure_history_for(db, row)
         return HTMLResponse(watchlist_pages.render_main(
             db, row, editable=False, cp=_page_int(request, "cp"),
-            shop=request.query_params.get("shop", "tcgplayer")))
+            shop=request.query_params.get("shop", "tcgplayer"),
+            filling=filling))
     finally:
         db.close()
 

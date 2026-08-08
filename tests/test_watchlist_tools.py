@@ -42,12 +42,12 @@ async def test_add_kicks_instant_backfill_when_cache_exists(db_path, a_list,
                                                             monkeypatch):
     kicked = []
     monkeypatch.setattr(server, "_schedule_backfill",
-                        lambda name: kicked.append(name) or True)
+                        lambda *a: kicked.append(a) or True)
     list_id, pp, _ = a_list
     out = await server.watchlist_add(server.WatchlistAddInput(
         name="Sol Ring", passphrase=pp))
-    assert kicked == ["Sol Ring"]
-    assert "backfilling now" in out
+    assert len(kicked) == 1                      # single-flight, no per-card loop
+    assert "fetching 90 days" in out.lower()
 
 
 @pytest.fixture
@@ -142,12 +142,12 @@ async def test_bulk_add_kicks_one_backfill_for_the_batch(db_path, a_list,
                                                          monkeypatch):
     kicked = []
     monkeypatch.setattr(server, "_schedule_backfill",
-                        lambda names: kicked.append(list(names)) or True)
+                        lambda *a: kicked.append(a) or True)
     _, pp, _ = a_list
     out = await server.watchlist_bulk_add(server.WatchlistBulkAddInput(
         decklist="Sol Ring\nCultivate\nRhystic Study", passphrase=pp))
-    assert len(kicked) == 1 and len(kicked[0]) == 3   # one call, all cards
-    assert "backfilling now" in out
+    assert len(kicked) == 1                      # ONE fill for the whole batch
+    assert "fetching 90 days" in out.lower()
 
 
 async def test_bulk_add_requires_identity_and_rejects_empty(db_path,

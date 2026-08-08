@@ -271,8 +271,10 @@ def test_shop_survives_history_roundtrip(db_path):
     with client() as c:
         board = c.get(f"/w/{pp}?shop=cardmarket").text
         hist = c.get(f"/w/{pp}/history?shop=cardmarket").text
-    assert f"/w/{pp}/history?shop=cardmarket" in board
-    assert f'href="/w/{pp}?shop=cardmarket"' in hist
+    import server as srv
+    px = srv.PUBLIC_PREFIX                       # gateway prefix, e.g. "/mtg"
+    assert f"{px}/w/{pp}/history?shop=cardmarket" in board
+    assert f'href="{px}/w/{pp}?shop=cardmarket"' in hist
 
 
 def test_mint_throttle_limits_new_lists(db_path, monkeypatch):
