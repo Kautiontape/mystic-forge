@@ -9,8 +9,14 @@ No authentication required for public features. Self-hosters can optionally
 configure Archidekt credentials for private deck access.
 """
 
+import asyncio
+import json
+import logging
+import os
 import re
 import time
+import urllib.parse
+from contextvars import ContextVar
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Dict, Any
@@ -21,6 +27,10 @@ from difflib import SequenceMatcher
 import httpx
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from mcp.server.fastmcp import FastMCP
+
+import watchlist_db
+import watchlist_ingest
+import watchlist_pages
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -88,13 +98,106 @@ mcp = FastMCP(
         "collector_number to price one exact printing, or finish to price a foil or "
         "etched copy — and scryfall_price_list to price a whole decklist at the "
         "printings and finishes written on its lines. Never estimate prices from memory. "
-        "These tools return authoritative, up-to-date data directly from the source APIs."
+        "These tools return authoritative, up-to-date data directly from the source APIs. "
+        "Watchlist: price watchlists are identified by a passphrase. When the "
+        "user gives one (or uses a personal connector URL) pass it through; "
+        "after watchlist_create, show the passphrase once and offer to "
+        "remember it for future chats. Share codes (SC-…) are read-only. "
+        "To add MORE THAN ONE card, always use watchlist_bulk_add with all of "
+        "them in one call — never loop watchlist_add per card."
     ),
     host="0.0.0.0",
     port=8000,
     stateless_http=True,
     transport_security=None,
 )
+
+
+# ── Watchlist identity ───────────────────────────────────────────────────────
+# The list id for the current request, set by PassphraseMiddleware when the
+# connector URL carries a passphrase (/mcp/<passphrase>). Tools fall back to
+# this when no explicit passphrase parameter is given.
+_current_list: ContextVar[Optional[int]] = ContextVar("_current_list", default=None)
+
+_PP_RE = re.compile(r"^/mcp/(?P<pp>[a-z0-9][a-z0-9-]{6,})/?$")
+
+PUBLIC_BASE = os.environ.get("MYSTIC_FORGE_PUBLIC_BASE",
+                             "https://mcp.kautiontape.com/mtg")
+# The gateway strips this prefix before proxying, so the server sees "/w/…"
+# while the browser needs "/mtg/w/…". Every link and fetch the pages emit must
+# carry it, or they resolve against the origin root and 404.
+PUBLIC_PREFIX = urllib.parse.urlparse(PUBLIC_BASE).path.rstrip("/")
+watchlist_pages.PREFIX = PUBLIC_PREFIX
+
+
+class PassphraseMiddleware:
+    """Maps /mcp/<passphrase> → /mcp with the resolved list in a ContextVar.
+
+    Also owns app lifespan add-ons: starts the nightly ingest loop on startup
+    (disabled via MYSTIC_FORGE_NO_INGEST for tests/dev)."""
+
+    def __init__(self, app):
+        self.app = app
+        self._ingest_task = None
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":
+            async def send_hooked(msg):
+                if (msg["type"] == "lifespan.startup.complete"
+                        and not os.environ.get("MYSTIC_FORGE_NO_INGEST")):
+                    self._ingest_task = asyncio.create_task(
+                        watchlist_ingest_loop())
+                if msg["type"] == "lifespan.shutdown.complete" and self._ingest_task:
+                    self._ingest_task.cancel()
+                await send(msg)
+            await self.app(scope, receive, send_hooked)
+            return
+
+        token = None
+        if scope["type"] == "http":
+            m = _PP_RE.match(scope["path"])
+            if m:
+                db = watchlist_db.connect()
+                try:
+                    watchlist_db.init_db(db)
+                    row = watchlist_db.get_list_by_passphrase(db, m["pp"])
+                finally:
+                    db.close()
+                if row is None:
+                    await send({"type": "http.response.start", "status": 404,
+                                "headers": [(b"content-type", b"text/plain")]})
+                    await send({"type": "http.response.body",
+                                "body": b"unknown passphrase"})
+                    return
+                scope = dict(scope, path="/mcp")
+                token = _current_list.set(row["id"])
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if token is not None:
+                _current_list.reset(token)
+
+
+async def watchlist_ingest_loop():
+    """Hourly check; actual ingest runs once per day (last_ingest guard)."""
+    while True:
+        try:
+            db = watchlist_db.connect()
+            watchlist_db.init_db(db)
+            row = db.execute("SELECT value FROM meta WHERE key='last_ingest'"
+                             ).fetchone()
+            db.close()
+            import datetime as _dt
+            if row is None or row["value"] != _dt.date.today().isoformat():
+                await asyncio.to_thread(watchlist_ingest.run_ingest,
+                                        watchlist_db.DB_PATH)
+        except Exception:
+            logging.getLogger("mystic_forge").exception("ingest loop error")
+        await asyncio.sleep(3600)
+
+
+def build_app():
+    return PassphraseMiddleware(mcp.streamable_http_app())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2833,10 +2936,1077 @@ async def precon_diff(params: PreconDiffInput) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# WATCHLIST — Passphrase-named price watchlists (spec 2026-08-08)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class WatchlistCreateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: Optional[str] = Field(None, description="Optional list label, e.g. 'Cloud deck upgrades'")
+
+
+class WatchlistAddInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(..., description="Card name (fuzzy-matched via Scryfall)")
+    set_code: Optional[str] = Field(None, description="Pin a specific printing: set code")
+    collector_number: Optional[str] = Field(None, description="Pin a specific printing: collector number")
+    target_price: Optional[float] = Field(None, description="Alert threshold in USD")
+    note: Optional[str] = Field(None, description="Free-form note, e.g. deck/batch")
+    passphrase: Optional[str] = Field(None, description="List passphrase (omit when using a personal connector URL)")
+
+
+class WatchlistBulkAddInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    decklist: str = Field(..., description=(
+        "Cards to add, one per line. Accepts plain names, decklist quantities "
+        "('1 Sol Ring', '1x Sol Ring'), and Archidekt-style suffixes "
+        "((set) 123 [Category] ^label^) which are stripped. Quantities are "
+        "ignored — a watchlist tracks cards, not copies. An optional target "
+        "price may follow the name after ' @ ', e.g. 'Rhystic Study @ 60'."))
+    note: Optional[str] = Field(None, description="Note applied to every card added, e.g. the deck name")
+    target_price: Optional[float] = Field(None, description="Default target for cards without a per-line ' @ ' target")
+    passphrase: Optional[str] = Field(None, description="List passphrase (omit when using a personal connector URL)")
+
+
+class WatchlistRemoveInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: Optional[str] = Field(None, description="Card name to remove")
+    entry_id: Optional[int] = Field(None, description="Entry id (from watchlist_list/history)")
+    set_code: Optional[str] = Field(None, description="Disambiguate a specific pinned printing")
+    collector_number: Optional[str] = Field(None, description="Disambiguate a specific pinned printing")
+    passphrase: Optional[str] = Field(None, description="List passphrase (omit when using a personal connector URL)")
+
+
+class WatchlistListInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    passphrase: Optional[str] = Field(None, description="List passphrase (omit when using a personal connector URL)")
+
+
+class _NoIdentity(Exception):
+    pass
+
+
+NO_IDENTITY_MSG = (
+    "No watchlist identity. Pass your `passphrase`, use your personal "
+    "connector URL, or create a list with `watchlist_create`."
+)
+
+
+def _wl_db():
+    db = watchlist_db.connect()
+    watchlist_db.init_db(db)
+    return db
+
+
+# Mint throttle (spec: the mitigation for "anyone who finds the public URL can
+# create lists"). In-memory and per-process — enough for a friend-group server;
+# a restart forgives, which is fine for abuse this mild.
+MINT_LIMIT = int(os.environ.get("MYSTIC_FORGE_MINT_LIMIT", "8"))
+MINT_WINDOW = 3600.0
+_mint_log: dict[str, list[float]] = {}
+
+
+def _mint_allowed(who: str) -> bool:
+    now = time.monotonic()
+    hits = [t for t in _mint_log.get(who, []) if now - t < MINT_WINDOW]
+    if len(hits) >= MINT_LIMIT:
+        _mint_log[who] = hits
+        return False
+    hits.append(now)
+    _mint_log[who] = hits
+    if len(_mint_log) > 4096:                      # bound the dict
+        for k in [k for k, v in _mint_log.items()
+                  if not any(now - t < MINT_WINDOW for t in v)]:
+            _mint_log.pop(k, None)
+    return True
+
+
+def _client_key(request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+_history_task: Optional[asyncio.Task] = None
+
+
+def _history_filling() -> bool:
+    return _history_task is not None and not _history_task.done()
+
+
+def _schedule_backfill(card_names=None) -> bool:
+    """Kick the on-demand history fill after an add, off the request path.
+
+    History is a static backfill, so it never waits for the nightly cycle: if
+    the MTGJSON files aren't cached yet this downloads them first. Single-
+    flight — a run in progress already covers every watched card, so a bulk
+    add of 38 cards triggers one pass, not 38. Returns True if history is
+    being fetched now."""
+    global _history_task
+    if os.environ.get("MYSTIC_FORGE_NO_INGEST"):
+        return False
+    if _history_filling():
+        return True
+    data_dir = watchlist_ingest._data_dir()
+
+    async def run():
+        try:
+            await asyncio.to_thread(watchlist_ingest.ensure_history,
+                                    watchlist_db.DB_PATH, data_dir)
+        except Exception:
+            logging.getLogger("mystic_forge").exception("history fill failed")
+
+    try:
+        _history_task = asyncio.get_running_loop().create_task(run())
+    except RuntimeError:                     # no loop (stdio/tests)
+        return False
+    return True
+
+
+def _resolve_list_row(db, passphrase: Optional[str]):
+    """Explicit passphrase param wins over URL context (spec)."""
+    if passphrase:
+        row = watchlist_db.get_list_by_passphrase(db, passphrase)
+        if row is None:
+            raise _NoIdentity("That passphrase is not recognized. Check for "
+                              "typos, or create a list with `watchlist_create`.")
+        return row
+    list_id = _current_list.get()
+    if list_id is not None:
+        return watchlist_db.get_list(db, list_id)
+    raise _NoIdentity(NO_IDENTITY_MSG)
+
+
+def _supersession_warning(db, row) -> str:
+    if row["superseded_by"] is None:
+        return ""
+    succ = watchlist_db.get_list(db, row["superseded_by"])
+    return (f"⚠️ This list was **superseded** by a recovery clone "
+            f"(share code `{succ['share_code']}`, created {succ['created_at']}). "
+            f"You are editing the old copy — switch to the new passphrase/URL "
+            f"if that was unintended.\n\n")
+
+
+def _fmt_price(v) -> str:
+    return f"${v:.2f}" if v is not None else "—"
+
+
+def _fmt_delta(v) -> str:
+    if v is None:
+        return "—"
+    return f"{'▼' if v < 0 else '▲' if v > 0 else '·'}{abs(v):.2f}"
+
+
+def _fmt_summary_price(s) -> str:
+    """Price cell for an entry_price_summary result; marks foil fallback."""
+    if not s:
+        return "—"
+    p = _fmt_price(s["current"])
+    return f"{p} (foil)" if s.get("finish") == "foil" else p
+
+
+@mcp.tool(name="watchlist_create")
+async def watchlist_create(params: WatchlistCreateInput) -> str:
+    """Create a new price watchlist. Returns its passphrase (SHOWN ONLY ONCE —
+    offer to remember it for the user), personal connector URL, and read-only
+    share code."""
+    if not _mint_allowed("mcp"):
+        return ("Too many new watchlists just now — try again later. "
+                "(If you already have a list, give me its passphrase instead.)")
+    db = _wl_db()
+    try:
+        _, pp, sc = watchlist_db.create_list(db, label=params.label)
+    finally:
+        db.close()
+    return (
+        f"# Watchlist created{': ' + params.label if params.label else ''}\n\n"
+        f"**Passphrase (save this — shown only once):** `{pp}`\n\n"
+        f"- Personal connector URL: `{PUBLIC_BASE}/mcp/{pp}`\n"
+        f"- History page: {PUBLIC_BASE}/w/{pp}\n"
+        f"- Read-only share code: `{sc}` (viewable at {PUBLIC_BASE}/s/{sc})\n\n"
+        f"Add this server with the personal URL for automatic identity, or "
+        f"give the passphrase in chat. Share the share code (not the "
+        f"passphrase) with friends."
+    )
+
+
+@mcp.tool(name="watchlist_add")
+async def watchlist_add(params: WatchlistAddInput) -> str:
+    """Add a card to a watchlist (or update its target/note if already
+    watched). Tracks the cheapest printing unless set_code+collector_number
+    pin one."""
+    db = _wl_db()
+    try:
+        try:
+            row = _resolve_list_row(db, params.passphrase)
+        except _NoIdentity as e:
+            return str(e)
+        warning = _supersession_warning(db, row)
+
+        name = params.name
+        current_usd = None
+        if params.set_code and params.collector_number:
+            # Pinned printing: validate it actually exists before storing,
+            # otherwise a typo would sit at "history pending" forever.
+            try:
+                card = await _scryfall_get(
+                    f"/cards/{params.set_code.lower()}/{params.collector_number}")
+                name = card.get("name", params.name)
+                current_usd = (card.get("prices") or {}).get("usd")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    return (f"No printing {params.set_code.upper()} "
+                            f"#{params.collector_number} found on Scryfall — "
+                            f"check the set code and collector number.")
+            except Exception:
+                pass  # Scryfall unreachable: accept the pin unvalidated
+        else:
+            try:
+                card = await _scryfall_get("/cards/named", {"fuzzy": params.name})
+                name = card.get("name", params.name)
+                current_usd = (card.get("prices") or {}).get("usd")
+            except Exception:
+                pass  # offline/unknown: keep the user's spelling
+
+        _, entry = watchlist_db.add_card(
+            db, row["id"], name, set_code=params.set_code,
+            collector_number=params.collector_number,
+            target_price=params.target_price, note=params.note)
+        uuids = watchlist_db.uuids_for_entry(db, entry)
+        summary = watchlist_db.entry_price_summary(db, entry)
+        if summary:
+            backfill = "history ready"
+        elif _schedule_backfill():
+            backfill = "fetching 90 days of price history now"
+        else:
+            backfill = "history pending next ingest"
+        printing = f" [{entry['set_code']} {entry['collector_number']}]" \
+            if entry.get("set_code") else ""
+        lines = [warning + f"Added **{name}**{printing} "
+                 f"(entry #{entry['entry_id']}) — {backfill}."]
+        if current_usd:
+            lines.append(f"Scryfall market price now: ${current_usd}")
+        if entry.get("target_price") is not None:
+            lines.append(f"Target: {_fmt_price(entry['target_price'])}")
+        if uuids:
+            lines.append(f"Tracking {len(uuids)} printing(s).")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+@mcp.tool(name="watchlist_bulk_add")
+async def watchlist_bulk_add(params: WatchlistBulkAddInput) -> str:
+    """Add many cards to a watchlist at once — USE THIS instead of calling
+    watchlist_add repeatedly. Paste a decklist, a shopping list, or any list
+    of card names (one per line); optional per-line target after ' @ '.
+    Validates every name against Scryfall in batches and backfills all their
+    price history in a single pass."""
+    db = _wl_db()
+    try:
+        try:
+            row = _resolve_list_row(db, params.passphrase)
+        except _NoIdentity as e:
+            return str(e)
+        warning = _supersession_warning(db, row)
+
+        # Peel any ' @ <price>' off each line FIRST — _parse_decklist strips
+        # trailing digits as collector numbers and would eat the target.
+        wanted: list[tuple[str, Optional[float]]] = []
+        seen_keys: set[str] = set()
+        for line in params.decklist.splitlines():
+            target = params.target_price
+            m = re.search(r"\s+@\s*[$€]?\s*(\d+(?:\.\d+)?)\s*$", line)
+            if m:
+                target = float(m.group(1))
+                line = line[:m.start()]
+            parsed = _parse_decklist(line)
+            if not parsed:
+                continue
+            name = parsed[0][1]
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen_keys:      # same card twice in one paste
+                continue
+            seen_keys.add(key)
+            wanted.append((name, target))
+        if not wanted:
+            return "No card names found in that list."
+        if len(wanted) > 300:
+            return (f"That's {len(wanted)} cards — more than this tool adds at "
+                    f"once. Split it into batches of 300 or fewer.")
+
+        # Validate every name against Scryfall, 75 identifiers per request
+        found: dict[str, dict] = {}
+        unresolved: list[str] = []
+        names = [n for n, _ in wanted]
+        for i in range(0, len(names), 75):
+            identifiers = [{"name": n} for n in names[i:i + 75]]
+            try:
+                data = await _scryfall_post("/cards/collection",
+                                            {"identifiers": identifiers})
+            except Exception as e:
+                return warning + f"Scryfall lookup failed: {_scryfall_error(e)}"
+            for card in data.get("data", []):
+                found[card["name"].lower()] = card
+                # Scryfall matches on exact/oracle name; map the query back too
+            for item in data.get("not_found", []):
+                unresolved.append(item.get("name", str(item)))
+
+        added, updated, skipped = [], [], []
+        for name, target in wanted:
+            card = found.get(name.lower())
+            if card is None:
+                # fall back to a fuzzy single lookup for near-misses
+                try:
+                    card = await _scryfall_get("/cards/named", {"fuzzy": name})
+                except Exception:
+                    skipped.append(name)
+                    continue
+            canonical = card.get("name", name)
+            existed = watchlist_db._find_entry(db, row["id"], name=canonical)
+            _, entry = watchlist_db.add_card(
+                db, row["id"], canonical, target_price=target, note=params.note)
+            (updated if existed else added).append(entry["card_name"])
+
+        backfilling = _schedule_backfill() if added else False
+
+        lines = [warning + f"**Added {len(added)} card(s)** to "
+                 f"{row['label'] or 'your watchlist'}."]
+        if added:
+            lines.append(", ".join(sorted(added)[:40])
+                         + (" …" if len(added) > 40 else ""))
+        if updated:
+            lines.append(f"\n{len(updated)} already watched (target/note "
+                         f"updated): " + ", ".join(sorted(updated)[:20])
+                         + (" …" if len(updated) > 20 else ""))
+        if skipped:
+            lines.append(f"\n⚠️ {len(skipped)} not recognized by Scryfall — "
+                         f"check spelling: " + ", ".join(skipped[:20])
+                         + (" …" if len(skipped) > 20 else ""))
+        lines.append("\n" + ("Fetching 90 days of price history now — it "
+                             "appears on the board shortly (first run on a "
+                             "new server takes a few minutes)."
+                             if backfilling else
+                             "Price history arrives with the next ingest."))
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+@mcp.tool(name="watchlist_remove")
+async def watchlist_remove(params: WatchlistRemoveInput) -> str:
+    """Remove a card from a watchlist by name or entry id."""
+    if params.name is None and params.entry_id is None:
+        return "Give a card `name` or an `entry_id` to remove."
+    db = _wl_db()
+    try:
+        try:
+            row = _resolve_list_row(db, params.passphrase)
+        except _NoIdentity as e:
+            return str(e)
+        warning = _supersession_warning(db, row)
+        try:
+            removed = watchlist_db.remove_entry(
+                db, row["id"], entry_id=params.entry_id, name=params.name,
+                set_code=params.set_code,
+                collector_number=params.collector_number)
+        except watchlist_db.NotFound as e:
+            return warning + str(e)
+        return warning + f"Removed **{removed['card_name']}** (entry #{removed['entry_id']})."
+    finally:
+        db.close()
+
+
+def _render_entries(db, list_id: int) -> list[str]:
+    lines = ["| # | Card | Price | Δ7d | Δ30d | Target | Note |",
+             "|---|------|-------|-----|------|--------|------|"]
+    entries = watchlist_db.current_entries(db, list_id)
+    rows = []
+    for e in entries:
+        rows.append((e, watchlist_db.entry_price_summary(db, e)))
+    rows.sort(key=lambda t: (t[1] is None,
+                             t[1]["d30"] if t[1] and t[1]["d30"] is not None else 0))
+    for e, s in rows:
+        printing = f" [{e['set_code']} {e['collector_number']}]" \
+            if e.get("set_code") else ""
+        lines.append(
+            f"| {e['entry_id']} | {e['card_name']}{printing} "
+            f"| {_fmt_summary_price(s)} "
+            f"| {_fmt_delta(s['d7']) if s else '—'} "
+            f"| {_fmt_delta(s['d30']) if s else '—'} "
+            f"| {_fmt_price(e['target_price'])} | {e['note'] or ''} |")
+    if not entries:
+        lines = ["*(empty list)*"]
+    return lines
+
+
+@mcp.tool(name="watchlist_list")
+async def watchlist_list(params: WatchlistListInput) -> str:
+    """Show a watchlist: current price (cheapest normal-finish tcgplayer),
+    7/30-day movement, targets, notes. Sorted by 30-day movement."""
+    db = _wl_db()
+    try:
+        try:
+            row = _resolve_list_row(db, params.passphrase)
+        except _NoIdentity as e:
+            return str(e)
+        header = f"# Watchlist{': ' + row['label'] if row['label'] else ''}\n"
+        return _supersession_warning(db, row) + header + \
+            "\n".join(_render_entries(db, row["id"]))
+    finally:
+        db.close()
+
+
+class WatchlistViewInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    share_code: str = Field(..., description="Read-only share code, e.g. SC-ABC123")
+
+
+class WatchlistHistoryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    passphrase: Optional[str] = Field(None, description="List passphrase")
+    share_code: Optional[str] = Field(None, description="Read-only share code")
+    limit: int = Field(50, description="Most recent events to show")
+
+
+class WatchlistCloneInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    passphrase: Optional[str] = Field(None, description="Clone your own list (recovery: marks it superseded)")
+    share_code: Optional[str] = Field(None, description="Clone someone's shared list (fork)")
+    at_seq: Optional[int] = Field(None, description="Revision to clone at (from watchlist_history); default latest")
+
+
+class PriceHistoryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(..., description="Card name")
+    days: int = Field(90, description="Days of history")
+    provider: str = Field("tcgplayer", description="tcgplayer | cardkingdom | cardmarket")
+    set_code: Optional[str] = Field(None, description="Pin a specific printing: set code")
+    collector_number: Optional[str] = Field(None, description="Pin a specific printing: collector number")
+
+
+@mcp.tool(name="watchlist_report")
+async def watchlist_report(params: WatchlistListInput) -> str:
+    """Movers report: biggest 7-day drops/rises and anything at/below target."""
+    db = _wl_db()
+    try:
+        try:
+            row = _resolve_list_row(db, params.passphrase)
+        except _NoIdentity as e:
+            return str(e)
+        entries = watchlist_db.current_entries(db, row["id"])
+        priced = []
+        for e in entries:
+            s = watchlist_db.entry_price_summary(db, e)
+            if s:
+                priced.append((e, s))
+        if not priced:
+            return "No price data yet — history arrives with the nightly ingest."
+        hits = [(e, s) for e, s in priced
+                if e["target_price"] is not None and s["current"] <= e["target_price"]]
+        movers = sorted((t for t in priced if t[1]["d7"] is not None),
+                        key=lambda t: t[1]["d7"])
+        lines = [f"# Watchlist report{': ' + row['label'] if row['label'] else ''}"]
+        if hits:
+            lines.append("\n## 🎯 At or below target")
+            for e, s in hits:
+                lines.append(f"- **{e['card_name']}** {_fmt_price(s['current'])}"
+                             f" (target {_fmt_price(e['target_price'])})")
+        if movers:
+            lines.append("\n## 📉 Biggest 7-day drops")
+            for e, s in movers[:5]:
+                if s["d7"] < 0:
+                    lines.append(f"- {e['card_name']}: {_fmt_price(s['current'])}"
+                                 f" ({_fmt_delta(s['d7'])})")
+            lines.append("\n## 📈 Biggest 7-day rises")
+            for e, s in movers[::-1][:5]:
+                if s["d7"] > 0:
+                    lines.append(f"- {e['card_name']}: {_fmt_price(s['current'])}"
+                                 f" ({_fmt_delta(s['d7'])})")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+@mcp.tool(name="watchlist_view")
+async def watchlist_view(params: WatchlistViewInput) -> str:
+    """View a friend's watchlist read-only via its share code."""
+    db = _wl_db()
+    try:
+        row = watchlist_db.get_list_by_share(db, params.share_code)
+        if row is None:
+            return "That share code is not recognized."
+        header = (f"# Shared watchlist"
+                  f"{': ' + row['label'] if row['label'] else ''} "
+                  f"(read-only via `{row['share_code']}`)\n")
+        return header + "\n".join(_render_entries(db, row["id"]))
+    finally:
+        db.close()
+
+
+@mcp.tool(name="watchlist_history")
+async def watchlist_history(params: WatchlistHistoryInput) -> str:
+    """Show a list's append-only event chain (what changed, when). Accepts a
+    passphrase (own list) or share code (read-only)."""
+    db = _wl_db()
+    try:
+        if params.share_code:
+            row = watchlist_db.get_list_by_share(db, params.share_code)
+            if row is None:
+                return "That share code is not recognized."
+        else:
+            try:
+                row = _resolve_list_row(db, params.passphrase)
+            except _NoIdentity as e:
+                return str(e)
+        events = db.execute(
+            "SELECT * FROM events WHERE list_id=? ORDER BY seq DESC LIMIT ?",
+            (row["id"], params.limit)).fetchall()
+        lines = [f"# History{': ' + row['label'] if row['label'] else ''} "
+                 f"(newest first)"]
+        for ev in events:
+            payload = json.loads(ev["payload_json"])
+            detail = payload.get("card_name") or payload.get("label") or ""
+            extras = {k: v for k, v in payload.items()
+                      if k not in ("card_name", "label", "added_at") and v is not None}
+            lines.append(f"- **#{ev['seq']}** {ev['ts']} `{ev['action']}` "
+                         f"{detail} {extras if extras else ''}".rstrip())
+        lines.append(f"\nRecover any revision with `watchlist_clone(at_seq=N)`.")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+@mcp.tool(name="watchlist_clone")
+async def watchlist_clone(params: WatchlistCloneInput) -> str:
+    """Clone a list at a revision into a NEW list with a new passphrase.
+    Cloning your own list (passphrase) is recovery and supersedes it; cloning
+    a share code is a fork of a friend's list."""
+    db = _wl_db()
+    try:
+        recovery = False
+        if params.share_code:
+            row = watchlist_db.get_list_by_share(db, params.share_code)
+            if row is None:
+                return "That share code is not recognized."
+        else:
+            try:
+                row = _resolve_list_row(db, params.passphrase)
+            except _NoIdentity as e:
+                return str(e)
+            recovery = True
+        new_id, pp, sc = watchlist_db.clone_list(db, row["id"],
+                                                 at_seq=params.at_seq,
+                                                 recovery=recovery)
+        kind = "Recovery clone — the old list is now marked superseded" \
+            if recovery else "Fork"
+        return (
+            f"# {kind}\n\n"
+            f"**Passphrase (save this — shown only once):** `{pp}`\n\n"
+            f"- Personal connector URL: `{PUBLIC_BASE}/mcp/{pp}`\n"
+            f"- History page: {PUBLIC_BASE}/w/{pp}\n"
+            f"- Share code: `{sc}`\n\n"
+            f"Update your claude.ai connector URL and anywhere the old "
+            f"passphrase is remembered."
+        )
+    finally:
+        db.close()
+
+
+from html import escape as _esc
+
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request):
+    """Health surface for compose healthcheck and /mtg/health monitoring."""
+    import datetime as _dt
+    try:
+        db = _wl_db()
+        lists = db.execute("SELECT COUNT(*) FROM lists").fetchone()[0]
+        cards = db.execute("SELECT COUNT(*) FROM watchlist_current").fetchone()[0]
+        row = db.execute("SELECT value FROM meta WHERE key='last_ingest'").fetchone()
+        db.close()
+    except Exception as e:
+        return JSONResponse({"status": "error", "db": False, "error": str(e)},
+                            status_code=500)
+    last = row["value"] if row else None
+    stale = False
+    if cards and last:
+        age = _dt.date.today() - _dt.date.fromisoformat(last)
+        stale = age.days > 1                  # > 36h in whole-day terms
+    elif cards:
+        stale = True
+    return JSONResponse({
+        "status": "degraded" if stale else "ok",
+        "db": True, "lists": lists, "watched_cards": cards,
+        "last_ingest": last, "ingest_stale": stale,
+    })
+
+
+def _page_int(request, name) -> int:
+    try:
+        return max(1, int(request.query_params.get(name, "1")))
+    except ValueError:
+        return 1
+
+
+def _resolve_page_key(db, key: str):
+    """A page/API key is a passphrase (editable) or a share code (read-only)."""
+    row = watchlist_db.get_list_by_passphrase(db, key)
+    if row is not None:
+        return row, True
+    row = watchlist_db.get_list_by_share(db, key)
+    if row is not None:
+        return row, False
+    return None, False
+
+
+def _page_row(db, request, param, by_share: bool):
+    key = request.path_params[param]
+    row = (watchlist_db.get_list_by_share(db, key) if by_share
+           else watchlist_db.get_list_by_passphrase(db, key))
+    if row is None:
+        return None
+    row = dict(row)
+    row["_key"] = row["share_code"] if by_share else key
+    return row
+
+
+def _ensure_history_for(db, row) -> bool:
+    """Opening a board is itself a request for history: if anything watched
+    still lacks prices, start the fill now rather than waiting for a cycle."""
+    unpriced = db.execute(
+        """SELECT 1 FROM watchlist_current wc
+           WHERE NOT EXISTS (
+             SELECT 1 FROM card_uuids cu JOIN prices p ON p.uuid=cu.uuid
+             WHERE LOWER(cu.card_name)=LOWER(wc.card_name))
+           AND wc.list_id=? LIMIT 1""", (row["id"],)).fetchone()
+    return _schedule_backfill() if unpriced else False
+
+
+@mcp.custom_route("/w/{passphrase}", methods=["GET"])
+async def watch_page(request: Request):
+    db = _wl_db()
+    try:
+        row = _page_row(db, request, "passphrase", by_share=False)
+        if row is None:
+            return HTMLResponse("unknown passphrase", status_code=404)
+        filling = _ensure_history_for(db, row)
+        return HTMLResponse(watchlist_pages.render_main(
+            db, row, editable=True, cp=_page_int(request, "cp"),
+            shop=request.query_params.get("shop", "tcgplayer"),
+            filling=filling,
+            sort=request.query_params.get("sort", "target"),
+            show_bought=request.query_params.get("bought") != "hide",
+            q=request.query_params.get("q", "")))
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/w/{passphrase}/history", methods=["GET"])
+async def watch_history_page(request: Request):
+    db = _wl_db()
+    try:
+        row = _page_row(db, request, "passphrase", by_share=False)
+        if row is None:
+            return HTMLResponse("unknown passphrase", status_code=404)
+        return HTMLResponse(watchlist_pages.render_history(
+            db, row, editable=True, hp=_page_int(request, "hp"),
+            shop=request.query_params.get("shop", "tcgplayer")))
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/w/{passphrase}/export.csv", methods=["GET"])
+async def export_csv(request: Request):
+    """Dense spreadsheet feed: every number the board computes, one row per
+    card, stable columns — built for Sheets IMPORTDATA."""
+    import csv
+    import io
+    db = _wl_db()
+    try:
+        row = _page_row(db, request, "passphrase", by_share=False)
+        if row is None:
+            return PlainTextResponse("unknown passphrase", status_code=404)
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["card", "set_code", "collector_number", "tcgplayer_usd",
+                    "cardkingdom_usd", "cardmarket_eur", "d7", "d7_pct",
+                    "d30", "d30_pct", "target_usd", "pct_to_target",
+                    "price_date"])
+        for e in watchlist_db.current_entries(db, row["id"]):
+            per_shop = {shop: watchlist_db.entry_price_summary(db, e, provider=shop)
+                        for shop in ("tcgplayer", "cardkingdom", "cardmarket")}
+            s = per_shop["tcgplayer"]
+
+            def pct(delta):
+                if not s or delta is None or s["current"] == delta:
+                    return ""
+                then = s["current"] - delta
+                return round(delta / then * 100, 1) if then else ""
+
+            tgt = e["target_price"]
+            w.writerow([
+                e["card_name"], e["set_code"] or "", e["collector_number"] or "",
+                *(per_shop[shop]["current"] if per_shop[shop] else ""
+                  for shop in ("tcgplayer", "cardkingdom", "cardmarket")),
+                s["d7"] if s else "", pct(s["d7"]) if s else "",
+                s["d30"] if s else "", pct(s["d30"]) if s else "",
+                tgt if tgt is not None else "",
+                (round((s["current"] - tgt) / tgt * 100, 1)
+                 if s and tgt else ""),
+                s["date"] if s else "",
+            ])
+        return PlainTextResponse(out.getvalue(), media_type="text/csv")
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/s/{share_code}", methods=["GET"])
+async def share_page(request: Request):
+    db = _wl_db()
+    try:
+        row = _page_row(db, request, "share_code", by_share=True)
+        if row is None:
+            return HTMLResponse("unknown share code", status_code=404)
+        filling = _ensure_history_for(db, row)
+        return HTMLResponse(watchlist_pages.render_main(
+            db, row, editable=False, cp=_page_int(request, "cp"),
+            shop=request.query_params.get("shop", "tcgplayer"),
+            filling=filling,
+            sort=request.query_params.get("sort", "target"),
+            show_bought=request.query_params.get("bought") != "hide",
+            q=request.query_params.get("q", "")))
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/s/{share_code}/history", methods=["GET"])
+async def share_history_page(request: Request):
+    db = _wl_db()
+    try:
+        row = _page_row(db, request, "share_code", by_share=True)
+        if row is None:
+            return HTMLResponse("unknown share code", status_code=404)
+        return HTMLResponse(watchlist_pages.render_history(
+            db, row, editable=False, hp=_page_int(request, "hp")))
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/target", methods=["POST"])
+async def api_target(request: Request):
+    """Set or clear an entry's target from the page. Passphrase key only."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        tp = body.get("target_price")
+        if tp is not None and (not isinstance(tp, (int, float)) or tp < 0):
+            return JSONResponse({"error": "bad target_price"}, status_code=400)
+        try:
+            entry = watchlist_db.set_entry_target(
+                db, row["id"], int(body.get("entry_id", -1)), tp)
+        except watchlist_db.NotFound as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        return JSONResponse({"entry_id": entry["entry_id"],
+                             "target_price": entry["target_price"]})
+    finally:
+        db.close()
+
+
+_SCRYFALL_URL_RE = re.compile(
+    r"scryfall\.com/card/(?P<set>[a-z0-9]+)/(?P<cn>[^/?#]+)", re.I)
+
+
+@mcp.custom_route("/api/resolve", methods=["POST"])
+async def api_resolve(request: Request):
+    """Preview a card for the page's add flow: Scryfall URL → that printing;
+    plain text → fuzzy name. Returns display data + local history if any."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, _ = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        query = str(body.get("query", "")).strip()
+        if not query:
+            return JSONResponse({"error": "empty query"}, status_code=400)
+        m = _SCRYFALL_URL_RE.search(query)
+        try:
+            if m:
+                card = await _scryfall_get(
+                    f"/cards/{m['set'].lower()}/{urllib.parse.quote(m['cn'])}")
+            else:
+                card = await _scryfall_get("/cards/named", {"fuzzy": query})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return JSONResponse({"error": "Scryfall doesn't know that one — "
+                                     "check the link or spelling"},
+                                    status_code=404)
+            return JSONResponse({"error": "Scryfall is unreachable"},
+                                status_code=502)
+        except Exception:
+            return JSONResponse({"error": "Scryfall is unreachable"},
+                                status_code=502)
+        name = card.get("name", query)
+        set_code = card.get("set", "").upper() if m else None
+        cn = card.get("collector_number") if m else None
+        entry = {"card_name": name, "set_code": set_code,
+                 "collector_number": cn, "uuid": None}
+        series = watchlist_db.price_series(
+            db, watchlist_db.uuids_for_entry(db, entry), days=90)
+        points = series["points"] if series else []
+        return JSONResponse({
+            "name": name, "set_code": set_code, "collector_number": cn,
+            "usd": (card.get("prices") or {}).get("usd"),
+            "chart": watchlist_pages._big_svg(points, name, "$") if points else "",
+            "sites": watchlist_pages._site_links(entry),
+        })
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/add", methods=["POST"])
+async def api_add(request: Request):
+    """Add a card from the page. Passphrase key only; the /api/resolve step
+    already validated the printing against Scryfall."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return JSONResponse({"error": "missing name"}, status_code=400)
+        tp = body.get("target_price")
+        if tp is not None and (not isinstance(tp, (int, float)) or tp < 0):
+            return JSONResponse({"error": "bad target_price"}, status_code=400)
+        _, entry = watchlist_db.add_card(
+            db, row["id"], name,
+            set_code=body.get("set_code") or None,
+            collector_number=body.get("collector_number") or None,
+            target_price=tp,
+            note=str(body.get("note") or "").strip()[:200] or None)
+        backfilling = (not watchlist_db.entry_price_summary(db, entry)
+                       and _schedule_backfill(entry["card_name"]))
+        return JSONResponse({"entry_id": entry["entry_id"],
+                             "backfilling": backfilling})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/remove", methods=["POST"])
+async def api_remove(request: Request):
+    """Remove an entry from the page (the UI confirms first). Passphrase only."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        try:
+            removed = watchlist_db.remove_entry(
+                db, row["id"], entry_id=int(body.get("entry_id", -1)))
+        except watchlist_db.NotFound as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        return JSONResponse({"removed": removed["card_name"]})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/bought", methods=["POST"])
+async def api_bought(request: Request):
+    """Mark an entry bought (kept, muted, annotated) or un-mark it."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        try:
+            entry = watchlist_db.set_bought(
+                db, row["id"], int(body.get("entry_id", -1)),
+                bought=bool(body.get("bought", True)))
+        except watchlist_db.NotFound as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        return JSONResponse({"entry_id": entry["entry_id"],
+                             "bought_at": entry["bought_at"]})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/note", methods=["POST"])
+async def api_note(request: Request):
+    """Set or clear an entry's note from the page. Passphrase key only."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        note = str(body.get("note") or "").strip()[:200] or None
+        try:
+            entry = watchlist_db.set_entry_note(
+                db, row["id"], int(body.get("entry_id", -1)), note)
+        except watchlist_db.NotFound as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        return JSONResponse({"entry_id": entry["entry_id"],
+                             "note": entry["note"]})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/rename", methods=["POST"])
+async def api_rename(request: Request):
+    """Rename a list from the page. Passphrase key only."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        label = str(body.get("label", "")).strip()[:80] or None
+        watchlist_db.set_label(db, row["id"], label)
+        return JSONResponse({"label": label})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/revision/{key}/{seq}", methods=["GET"])
+async def api_revision(request: Request):
+    """Snapshot of a list at a revision, for the page's revision modal."""
+    db = _wl_db()
+    try:
+        row, _ = _resolve_page_key(db, request.path_params["key"])
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        try:
+            seq = int(request.path_params["seq"])
+        except ValueError:
+            return JSONResponse({"error": "bad seq"}, status_code=400)
+        state = watchlist_db.state_at(db, row["id"], seq)
+        entries = sorted(state.values(), key=lambda e: e["entry_id"])
+        return JSONResponse({"seq": seq, "label": row["label"],
+                             "entries": entries})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/fork", methods=["POST"])
+async def api_fork(request: Request):
+    """Fork (anyone with a key) or recover (passphrase only) at a revision.
+
+    Non-destructive either way: recovery only marks the source superseded."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        mode = body.get("mode", "fork")
+        if mode == "recover" and not editable:
+            return JSONResponse(
+                {"error": "recovery needs the passphrase, not a share code"},
+                status_code=403)
+        if not _mint_allowed(_client_key(request)):
+            return JSONResponse({"error": "too many new lists from this address;"
+                                 " try again later"}, status_code=429)
+        at_seq = body.get("at_seq")
+        new_id, pp, sc = watchlist_db.clone_list(
+            db, row["id"], at_seq=at_seq, recovery=(mode == "recover"))
+        return JSONResponse({
+            "passphrase": pp, "share_code": sc,
+            "url": f"{PUBLIC_BASE}/mcp/{pp}", "page": f"{PUBLIC_BASE}/w/{pp}"})
+    finally:
+        db.close()
+
+
+@mcp.tool(name="price_history")
+async def price_history(params: PriceHistoryInput) -> str:
+    """Daily price series for a card from the local price DB — cheapest
+    printing by default, or a specific one via set_code+collector_number.
+    Data exists for cards someone watches; global, needs no passphrase."""
+    db = _wl_db()
+    try:
+        uuids = watchlist_db.uuids_for_entry(db, {
+            "card_name": params.name, "set_code": params.set_code,
+            "collector_number": params.collector_number, "uuid": None})
+        series = watchlist_db.price_series(db, uuids, days=params.days,
+                                           provider=params.provider)
+        if not series or not series["points"]:
+            return (f"No local history for '{params.name}'. It appears after a "
+                    f"watchlist add + nightly ingest; for a spot price use "
+                    f"scryfall_price.")
+        pts = "\n".join(f"{d}: {p}" for d, p in series["points"])
+        which = (f"{params.set_code.upper()} #{params.collector_number}"
+                 if params.set_code else "cheapest printing")
+        return (f"# {params.name} — {params.provider}, {which} "
+                f"({series['uuid']})\n```\n{pts}\n```")
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ENTRYPOINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import sys
-    transport = "stdio" if "--stdio" in sys.argv else "streamable-http"
-    mcp.run(transport=transport)
+    if "--stdio" in sys.argv:
+        mcp.run(transport="stdio")
+    else:
+        import uvicorn
+        uvicorn.run(build_app(), host="0.0.0.0",
+                    port=int(os.environ.get("MYSTIC_FORGE_PORT", "8000")))
