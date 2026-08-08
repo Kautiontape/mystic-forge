@@ -5,7 +5,7 @@ import hashlib
 import random
 from dataclasses import dataclass, field
 
-from .cards import COLORS, Cost, SimCard
+from .cards import COLORS, CardData, Cost, SimCard, parse_cost
 
 
 def derive_seed(master_seed: int, game_index: int) -> int:
@@ -76,6 +76,11 @@ class Game:
     mulligans_taken: int = 0
     free_mulligan_used: bool = False
     won_turn: int | None = None
+    life_gained: int = 0              # opponents never attack in goldfish games, so
+                                      # gained life has no total to raise; it
+                                      # accumulates here for metrics
+    trigger_fires: dict = field(default_factory=dict)  # "card|event|verb" -> fire
+                                      # count (string keys so it JSON-serializes)
     combos: list = field(default_factory=list)          # [[names], ...]
     combo_wins: list = field(default_factory=list)      # [bool per combo]
     combo_assembled_turn: list = field(default_factory=list)   # [int|None per combo]
@@ -114,6 +119,8 @@ class Game:
             "combats_done": self.combats_done, "extra_combats": self.extra_combats,
             "mulligans_taken": self.mulligans_taken,
             "free_mulligan_used": self.free_mulligan_used,
+            "life_gained": self.life_gained,
+            "trigger_fires": dict(self.trigger_fires),
             "zones": {"library": list(self.library), "hand": list(self.hand),
                       "battlefield": [p.to_dict() for p in self.battlefield],
                       "graveyard": list(self.graveyard), "command": list(self.command)},
@@ -147,6 +154,8 @@ class Game:
                 combats_done=d["combats_done"], extra_combats=d["extra_combats"],
                 mulligans_taken=d["mulligans_taken"],
                 free_mulligan_used=d["free_mulligan_used"],
+                life_gained=d["life_gained"],
+                trigger_fires=dict(d["trigger_fires"]),
                 won_turn=d["won_turn"], combos=[list(c) for c in d["combos"]],
                 combo_wins=list(d["combo_wins"]),
                 combo_assembled_turn=list(d["combo_assembled_turn"]),
@@ -167,8 +176,31 @@ def _rng_state_from_json(js):
     return (version, tuple(internal), gauss)
 
 
+def _synth_card(name: str, types: frozenset, produces: dict | None) -> SimCard:
+    return SimCard(data=CardData(name=name, cost=None, types=types, power=None,
+                                 toughness=None, keywords=frozenset(),
+                                 produces=produces, enters_tapped=False,
+                                 equip_cost=None, oracle=""),
+                   ann=None, scope_class=None)
+
+
+# Engine-created permanents the card pool must always resolve (g.card() would
+# KeyError otherwise). "Treasure" is a reusable-rock approximation: v1 never
+# sacrifices it, so it taps for any one color every turn — flagged in the
+# honesty report. "Token" is the typeless placeholder for create_token output;
+# its stats live on the Permanent (token_power/token_toughness). "Rock" is the
+# ramp_mana output: a generic colorless mana rock (Powerstone-like artifact).
+_SYNTHETIC_CARDS = (
+    ("Treasure", frozenset({"artifact"}), {c: 1 for c in COLORS}),
+    ("Token", frozenset(), None),
+    ("Rock", frozenset({"artifact"}), {"C": 1}),
+)
+
+
 def new_game(cards: dict, deck: list, commander: str, seed: int,
              opponents: int = 1, combos: list | None = None) -> Game:
+    for name, types, produces in _SYNTHETIC_CARDS:
+        cards.setdefault(name, _synth_card(name, types, produces))
     rng = random.Random(seed)
     library = list(deck)
     rng.shuffle(library)
@@ -284,3 +316,285 @@ def pay(g: Game, cost: Cost):
     for pid in ids:
         g.perm(pid).tapped = True
     g.mana_pool = {k: pool.get(k, 0) for k in list("WUBRG") + ["C", "any"]}
+
+
+# -- Effective stats (statics: anthem, equipment grants) --------------------
+
+def _equipment_grants(g: Game, eq: Permanent) -> dict:
+    """The equipment's `grants` annotation when present, else {} (auto-derived
+    grants from oracle text arrive with the Scryfall classifier, Task 17)."""
+    ann = g.card(eq.name).ann
+    return (ann.grants or {}) if ann is not None else {}
+
+
+def _is_creature_perm(g: Game, p: Permanent) -> bool:
+    # Not every engine token is a creature (Treasure/Rock are artifacts), but
+    # creature tokens always carry token stats — so key off token_power.
+    return g.card(p.name).is_creature or (p.is_token and p.token_power is not None)
+
+
+def effective_power(g: Game, p: Permanent) -> int:
+    card = g.card(p.name)
+    base = (p.token_power or 0) if p.is_token else (card.data.power or 0)
+    base += p.pump_perm[0] + p.pump_eot[0]
+    for eq_id in p.attached:
+        base += _equipment_grants(g, g.perm(eq_id)).get("power", 0)
+    if _is_creature_perm(g, p):
+        for src in g.battlefield:
+            for s in g.card(src.name).statics():
+                if s.kind == "anthem":
+                    base += s.power
+    return base
+
+
+def effective_keywords(g: Game, p: Permanent) -> set:
+    card = g.card(p.name)
+    kws = set(p.token_keywords if p.is_token else card.data.keywords)
+    for eq_id in p.attached:
+        kws |= set(_equipment_grants(g, g.perm(eq_id)).get("keywords", ()))
+    for src in g.battlefield:
+        for s in g.card(src.name).statics():
+            if s.kind == "anthem":
+                kws |= set(s.keywords)
+    return kws
+
+
+# -- Counts and conditions --------------------------------------------------
+
+def resolve_count(g: Game, count, ctx: dict) -> int:
+    if isinstance(count, int):
+        return count
+    if count == "per_artifact":
+        return sum(1 for p in g.battlefield if g.card(p.name).is_artifact)
+    if count == "per_creature":
+        return sum(1 for p in g.battlefield if _is_creature_perm(g, p))
+    if count == "per_land":
+        return sum(1 for p in g.battlefield if g.card(p.name).is_land)
+    if count == "per_spell_cast_this_turn":
+        return g.spells_cast_this_turn
+    if count == "per_attacker":
+        return len(ctx.get("attackers", ()))
+    if count == "per_equipped_attacker":
+        return sum(1 for pid in ctx.get("attackers", ()) if g.perm(pid).attached)
+    raise IllegalAction(f"unknown count {count!r}")
+
+
+def check_condition(g: Game, cond, source_perm, ctx) -> bool:
+    if cond is None:
+        return True
+    if cond[0] == "power_gte":
+        return source_perm is not None and effective_power(g, source_perm) >= cond[1]
+    if cond[0] == "metalcraft":
+        return sum(1 for p in g.battlefield if g.card(p.name).is_artifact) >= 3
+    if cond[0] == "equipped":
+        return source_perm is not None and bool(source_perm.attached)
+    return False
+
+
+# -- Verb execution ---------------------------------------------------------
+
+def _focus_target(g: Game) -> int:
+    """Focus-fire: first opponent still above 0, else 0."""
+    for i, life in enumerate(g.opponents):
+        if life > 0:
+            return i
+    return 0
+
+
+def _tutor_match(g: Game, f: str, name: str) -> bool:
+    if f == "any":
+        return True
+    if f.startswith("name:"):
+        return name == f[5:]
+    return f in g.card(name).data.types
+
+
+def _attach_target(g: Game) -> Permanent | None:
+    """Commander's permanent if fielded, else the highest-effective-power
+    creature (max keeps the first maximum — deterministic battlefield order)."""
+    for p in g.battlefield:
+        if p.name == g.commander_name and not p.is_token:
+            return p
+    creatures = [p for p in g.battlefield if _is_creature_perm(g, p)]
+    if not creatures:
+        return None
+    return max(creatures, key=lambda p: effective_power(g, p))
+
+
+def _do_attach(g: Game, eq: Permanent, tgt: Permanent):
+    eq.attached_to = tgt.id
+    tgt.attached.append(eq.id)
+    g.emit(f"attached {eq.name} to {tgt.name}")
+
+
+def execute_verb(g: Game, source, verb: str, ctx: dict | None = None, **params):
+    ctx = ctx or {}
+    n = resolve_count(g, params.get("count", 1), ctx)
+    if verb == "draw":
+        for _ in range(n):
+            if g.library:
+                card = g.library.pop(0)
+                g.hand.append(card)
+                g.emit(f"drew {card}")
+    elif verb == "damage":
+        if params.get("target") == "each_opponent":
+            g.opponents = [life - n for life in g.opponents]
+        else:
+            i = _focus_target(g)
+            g.opponents[i] -= n
+        g.emit(f"{n} damage ({params.get('target')})")
+    elif verb == "create_token":
+        doublers = sum(1 for p in g.battlefield
+                       for s in g.card(p.name).statics() if s.kind == "token_doubling")
+        total = n * (2 ** doublers)
+        for _ in range(total):
+            tok = g.new_perm(params.get("token_name", "Token"), is_token=True,
+                             token_power=params["power"],
+                             token_toughness=params["toughness"],
+                             token_keywords=tuple(params.get("keywords", ())))
+            fire(g, "creature_etb", entering=tok)
+        g.emit(f"created {total} token(s)")
+    elif verb == "treasure":
+        for _ in range(n):
+            g.new_perm("Treasure", is_token=True)   # Treasure SimCard added in new_game
+        g.emit(f"created {n} treasure(s)")
+    elif verb == "gain_life":
+        g.life_gained += n
+        g.emit(f"gained {n} life")
+    elif verb == "add_mana":
+        if params.get("pips"):
+            for color, qty in parse_cost(params["pips"]).pips.items():
+                if qty:
+                    # generic braces in an add_mana string mean colorless mana
+                    key = "C" if color == "generic" else color
+                    g.mana_pool[key] = g.mana_pool.get(key, 0) + qty * n
+            g.emit(f"added {params['pips']} to pool")
+        elif params.get("any_mana"):
+            g.mana_pool["any"] += n
+            g.emit(f"added {n} mana of any color to pool")
+    elif verb == "ramp_land":
+        # Cultivate-class common-case approximation: the first n lands in
+        # library order (deterministic) enter TAPPED.
+        for _ in range(n):
+            idx = next((i for i, name in enumerate(g.library)
+                        if g.card(name).is_land), None)
+            if idx is None:
+                g.emit("ramp found no land")
+                break
+            name = g.library.pop(idx)
+            perm = g.new_perm(name, tapped=True)
+            g.emit(f"ramped {name} onto battlefield (tapped)")
+            fire(g, "land_etb", entering=perm)
+    elif verb == "ramp_mana":
+        for _ in range(n):
+            g.new_perm("Rock", is_token=True)       # not a creature: no creature_etb
+        g.emit(f"created {n} mana rock(s)")
+    elif verb == "tutor":
+        f = params.get("tutor_filter") or "any"
+        for _ in range(n):
+            idx = next((i for i, name in enumerate(g.library)
+                        if _tutor_match(g, f, name)), None)
+            if idx is None:
+                g.emit("tutor whiffed")
+            else:
+                name = g.library.pop(idx)
+                g.hand.append(name)
+                g.emit(f"tutored {name}")
+    elif verb == "pump":
+        if source is None:
+            g.emit("pump with no source permanent — skipped")
+        else:
+            dest = (source.pump_eot if params.get("duration", "eot") == "eot"
+                    else source.pump_perm)
+            dest[0] += (params.get("power") or 0) * n
+            dest[1] += (params.get("toughness") or 0) * n
+            g.emit(f"{source.name} pumped +{dest[0]}/+{dest[1]} "
+                   f"({params.get('duration', 'eot')})")
+    elif verb == "attach":
+        for _ in range(n):
+            eq = next((p for p in g.battlefield
+                       if g.card(p.name).is_equipment and p.attached_to is None), None)
+            tgt = _attach_target(g)
+            if eq is None or tgt is None or tgt.id == eq.id:
+                g.emit("attach: nothing to attach")
+                break
+            _do_attach(g, eq, tgt)
+    elif verb == "attach_from_board":
+        if source is None:
+            g.emit("attach_from_board with no source permanent — skipped")
+        else:
+            eqs = [p for p in g.battlefield
+                   if g.card(p.name).is_equipment and p.attached_to is None
+                   and p.id != source.id][:n]
+            for eq in eqs:
+                _do_attach(g, eq, source)
+            if not eqs:
+                g.emit("attach_from_board: no unattached equipment")
+    elif verb == "extra_combat":
+        g.extra_combats += n
+        g.emit(f"+{n} extra combat(s)")
+    elif verb == "token_copy":
+        subject = None
+        if source is not None:
+            s_card = g.card(source.name)
+            if s_card.is_equipment and source.attached_to:
+                subject = g.perm(source.attached_to)
+            else:
+                subject = source
+        if subject is None:
+            g.emit("token_copy with no source permanent — skipped")
+        else:
+            card = g.card(subject.name)
+            # A copy takes printed stats plus permanent pumps; end-of-turn
+            # pumps and attached-equipment grants are not copied.
+            base_p = ((subject.token_power or 0) if subject.is_token
+                      else (card.data.power or 0)) + subject.pump_perm[0]
+            base_t = ((subject.token_toughness or 0) if subject.is_token
+                      else (card.data.toughness or 0)) + subject.pump_perm[1]
+            kws = tuple(subject.token_keywords if subject.is_token
+                        else sorted(card.data.keywords))
+            for _ in range(n):
+                tok = g.new_perm(subject.name, is_token=True, token_power=base_p,
+                                 token_toughness=base_t, token_keywords=kws)
+                g.emit(f"created token copy of {subject.name}")
+                fire(g, "creature_etb", entering=tok)
+    else:
+        raise IllegalAction(f"verb {verb!r} not implemented")
+
+
+# -- Event dispatch ---------------------------------------------------------
+
+def fire(g: Game, event: str, source_perm=None, entering=None, spell=None, ctx=None):
+    """Run all battlefield listeners for a global event. `entering` is skipped:
+    a permanent doesn't hear its own arrival as a global event. Self events
+    (cast/etb) are executed at cast time, not via fire(). Listeners are
+    snapshotted before execution so verb side effects (new tokens) don't feed
+    the same dispatch."""
+    listeners = []
+    for p in g.battlefield:
+        if entering is not None and p.id == entering.id:
+            continue          # a permanent doesn't hear its own arrival as a global event
+        for t in g.card(p.name).triggers_for(event):
+            if (event == "spell_cast" and spell is not None
+                    and not _spell_filter_ok(g, t.event_filter, spell)):
+                continue
+            listeners.append((p, t))
+    for p, t in listeners:
+        if check_condition(g, t.condition, p, ctx or {}):
+            g.emit(f"{p.name} trigger — {t.do}")
+            key = f"{p.name}|{t.on}|{t.do}"
+            g.trigger_fires[key] = g.trigger_fires.get(key, 0) + 1
+            execute_verb(g, p, t.do, ctx=ctx, count=t.count, target=t.target,
+                         power=t.power, toughness=t.toughness,
+                         keywords=t.keywords, tutor_filter=t.tutor_filter,
+                         pips=t.pips, any_mana=t.any_mana, duration=t.duration)
+
+
+def _spell_filter_ok(g: Game, f, spell_card: SimCard) -> bool:
+    if f in (None, "any"):
+        return True
+    if f == "instant_or_sorcery":
+        return bool(spell_card.data.types & {"instant", "sorcery"})
+    if f == "noncreature":
+        return not spell_card.is_creature
+    return False

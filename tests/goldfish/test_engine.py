@@ -2,15 +2,21 @@ import json
 
 import pytest
 
-from goldfish.cards import SimCard, parse_cost
+from goldfish.cards import SimCard, parse_cost, validate_annotations
 from goldfish.engine import (
     Game,
     IllegalAction,
     _payment_plan,
     can_pay,
+    check_condition,
     derive_seed,
+    effective_keywords,
+    effective_power,
+    execute_verb,
+    fire,
     new_game,
     pay,
+    resolve_count,
     untapped_producers,
 )
 from tests.goldfish.test_cards import make_data  # reuse the factory
@@ -19,6 +25,13 @@ from tests.goldfish.test_cards import make_data  # reuse the factory
 def bf_land(g, name):
     p = g.new_perm(name)
     return p
+
+
+def annotated(cards, name, ann_dict):
+    """Replace cards[name] with an annotated copy (module-level for reuse)."""
+    anns = validate_annotations([ann_dict])
+    c = cards[name]
+    cards[name] = SimCard(data=c.data, ann=anns[name], scope_class=None)
 
 
 def mini_cards():
@@ -63,6 +76,8 @@ def test_state_roundtrip():
     assert g.combos[0] is not combos_arg[0]["cards"]            # defensive copy in new_game
     g.rng.random()                                              # advance rng
     g.turn = 3
+    g.life_gained = 7
+    g.trigger_fires["Tremors|creature_etb|damage"] = 4
     p = g.new_perm("Hammer", attached=["b1"], pump_eot=[1, 2], pump_perm=[3, 4],
                    is_token=True, token_power=5, token_toughness=6,
                    token_keywords=("trample",))
@@ -92,6 +107,8 @@ def test_state_roundtrip():
     assert p2.token_power == p.token_power == 5
     assert p2.token_toughness == p.token_toughness == 6
     assert p2.token_keywords == p.token_keywords == ("trample",)
+    assert g2.life_gained == g.life_gained == 7
+    assert g2.trigger_fires == g.trigger_fires == {"Tremors|creature_etb|damage": 4}
     assert g2.rng.getstate() == g.rng.getstate()                # rng state travels
 
     # (b) aliasing regression guard: mutating the original game's combo
@@ -301,3 +318,343 @@ def test_pool_any_untouched_when_a_producer_covers_the_pip():
     pay(g, parse_cost("{R}"))
     assert g.mana_pool["any"] == 1
     assert g.battlefield[0].tapped is True
+
+
+# -- Task 6: events, verbs, counts, conditions ----------------------------
+
+def test_damage_each_opponent_and_one():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1, opponents=3)
+    execute_verb(g, source=None, verb="damage", count=3, target="each_opponent")
+    assert g.opponents == [37, 37, 37]
+    execute_verb(g, source=None, verb="damage", count=2, target="one_opponent")
+    assert g.opponents == [35, 37, 37]        # focus-fire: lowest index first
+
+
+def test_create_token_fires_creature_etb_per_token_and_doubles():
+    cards = mini_cards()
+    cards["Tremors"] = SimCard(data=make_data("Tremors", cost=parse_cost("{1}{R}"),
+                               types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    cards["Doubler"] = SimCard(data=make_data("Doubler", cost=parse_cost("{4}"),
+                               types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Tremors", {"name": "Tremors", "triggers": [
+        {"on": "creature_etb", "do": "damage", "target": "each_opponent", "count": 1}]})
+    annotated(cards, "Doubler", {"name": "Doubler", "statics": [{"kind": "token_doubling"}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("Tremors"); g.new_perm("Doubler")
+    execute_verb(g, source=None, verb="create_token", count=2, power=1, toughness=1)
+    tokens = [p for p in g.battlefield if p.is_token]
+    assert len(tokens) == 4                     # doubled
+    assert g.opponents == [36]                  # 4 Tremors pings
+
+
+def test_spell_cast_listener_requires_battlefield():
+    cards = mini_cards()
+    cards["Snipe"] = SimCard(data=make_data("Snipe", cost=parse_cost("{2}{R}"),
+                             types=frozenset({"creature"}), power=2, toughness=2),
+                             ann=None, scope_class=None)
+    annotated(cards, "Snipe", {"name": "Snipe", "triggers": [
+        {"on": "spell_cast", "filter": "instant_or_sorcery",
+         "do": "damage", "target": "each_opponent", "count": 2}]})
+    cards["Bolt"] = SimCard(data=make_data("Bolt", cost=parse_cost("{R}"),
+                            types=frozenset({"instant"})), ann=None, scope_class=None)
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    fire(g, "spell_cast", spell=cards["Bolt"])
+    assert g.opponents == [40]              # global listeners only hear from battlefield
+    g.new_perm("Snipe")
+    fire(g, "spell_cast", spell=cards["Bolt"])
+    assert g.opponents == [38]
+    fire(g, "spell_cast", spell=cards["Bear"])
+    assert g.opponents == [38]              # filter: creature spell ignored
+
+
+def test_per_spell_cast_count_reads_counter():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.spells_cast_this_turn = 3
+    before = len(g.hand)
+    execute_verb(g, None, "draw", count="per_spell_cast_this_turn")
+    assert len(g.hand) == before + 3
+
+
+def test_new_game_injects_synthetic_cards():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    assert set(g.card("Treasure").data.produces) == set("WUBRG")
+    assert g.card("Rock").data.produces == {"C": 1}
+    assert g.card("Token").data.types == frozenset()
+    assert g.card("Token").data.produces is None
+
+
+def test_gain_life_accumulates():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    execute_verb(g, None, "gain_life", count=4)
+    execute_verb(g, None, "gain_life", count=2)
+    assert g.life_gained == 6
+    assert any("gained 4 life" in line for line in g.log)
+
+
+def test_add_mana_pips_and_wildcard():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    execute_verb(g, None, "add_mana", pips="{R}{R}{G}")
+    assert g.mana_pool["R"] == 2 and g.mana_pool["G"] == 1
+    execute_verb(g, None, "add_mana", any_mana=True, count=2)
+    assert g.mana_pool["any"] == 2
+
+
+def test_treasure_tokens_produce_any_color():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    execute_verb(g, None, "treasure", count=2)
+    ts = [p for p in g.battlefield if p.name == "Treasure"]
+    assert len(ts) == 2 and all(p.is_token for p in ts)
+    assert can_pay(g, parse_cost("{U}{B}")) is True
+    assert can_pay(g, parse_cost("{U}{B}{R}")) is False
+    # treasures are artifacts, not creatures
+    assert resolve_count(g, "per_artifact", {}) == 2
+    assert resolve_count(g, "per_creature", {}) == 0
+
+
+def test_ramp_land_moves_lands_tapped_and_fires_land_etb():
+    cards = mini_cards()
+    cards["Landfall"] = SimCard(data=make_data("Landfall", cost=parse_cost("{1}{G}"),
+                                types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Landfall", {"name": "Landfall", "triggers": [
+        {"on": "land_etb", "do": "gain_life", "count": 1}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("Landfall")
+    g.library[:] = ["Bear", "Plains", "Bear", "Mountain", "Plains"]
+    execute_verb(g, None, "ramp_land", count=2)
+    ramped = [p for p in g.battlefield if g.card(p.name).is_land]
+    assert [p.name for p in ramped] == ["Plains", "Mountain"]   # library order
+    assert all(p.tapped for p in ramped)                        # enter tapped
+    assert g.library == ["Bear", "Bear", "Plains"]
+    assert g.life_gained == 2                                   # land_etb fired per land
+
+
+def test_ramp_mana_creates_rocks_without_creature_etb():
+    cards = mini_cards()
+    cards["Tremors"] = SimCard(data=make_data("Tremors", cost=parse_cost("{1}{R}"),
+                               types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Tremors", {"name": "Tremors", "triggers": [
+        {"on": "creature_etb", "do": "damage", "target": "each_opponent", "count": 1}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("Tremors")
+    execute_verb(g, None, "ramp_mana", count=2)
+    rocks = [p for p in g.battlefield if p.name == "Rock"]
+    assert len(rocks) == 2
+    assert g.opponents == [40]                  # rocks are not creatures
+    assert len(untapped_producers(g)) == 2
+
+
+def test_tutor_by_type_name_any_and_whiff():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.library[:] = ["Bear", "Plains", "Hammer", "Plains"]
+    execute_verb(g, None, "tutor", tutor_filter="equipment")
+    assert g.hand[-1] == "Hammer" and "Hammer" not in g.library
+    assert any("tutored Hammer" in line for line in g.log)
+    execute_verb(g, None, "tutor", tutor_filter="name:Bear")
+    assert g.hand[-1] == "Bear"
+    execute_verb(g, None, "tutor", tutor_filter="planeswalker")
+    assert any("tutor whiffed" in line for line in g.log)
+    execute_verb(g, None, "tutor")                              # any = first card
+    assert g.hand[-1] == "Plains" and g.library == ["Plains"]
+
+
+def test_pump_durations_count_and_no_source():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bear = g.new_perm("Bear")
+    execute_verb(g, bear, "pump", power=2, toughness=1)         # default eot
+    assert bear.pump_eot == [2, 1]
+    assert effective_power(g, bear) == 4
+    execute_verb(g, bear, "pump", power=1, toughness=1, duration="permanent", count=3)
+    assert bear.pump_perm == [3, 3]
+    assert effective_power(g, bear) == 7
+    log_len = len(g.log)
+    execute_verb(g, None, "pump", power=1, toughness=1)         # no source: logged no-op
+    assert len(g.log) == log_len + 1
+
+
+def test_attach_prefers_commander_then_biggest_creature():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    hammer = g.new_perm("Hammer")
+    g.new_perm("Bear")
+    boss = g.new_perm("Boss")
+    execute_verb(g, None, "attach")
+    assert hammer.attached_to == boss.id
+    assert boss.attached == [hammer.id]
+
+    g2 = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    h2 = g2.new_perm("Hammer")
+    g2.new_perm("Runner")
+    bear2 = g2.new_perm("Bear")
+    execute_verb(g2, None, "attach")
+    assert h2.attached_to == bear2.id           # highest effective power wins
+
+    g3 = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g3.new_perm("Hammer")
+    log_len = len(g3.log)
+    execute_verb(g3, None, "attach")            # no creature: logged no-op
+    assert len(g3.log) == log_len + 1
+
+
+def test_attach_from_board_attaches_up_to_n_to_source():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bear = g.new_perm("Bear")
+    h1 = g.new_perm("Hammer")
+    h2 = g.new_perm("Hammer")
+    h3 = g.new_perm("Hammer")
+    execute_verb(g, bear, "attach_from_board", count=2)
+    assert h1.attached_to == bear.id and h2.attached_to == bear.id
+    assert h3.attached_to is None
+    assert bear.attached == [h1.id, h2.id]
+
+
+def test_extra_combat_increments():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    execute_verb(g, None, "extra_combat", count=2)
+    assert g.extra_combats == 2
+
+
+def test_token_copy_copies_perm_pumps_not_eot_or_equipment():
+    cards = mini_cards()
+    cards["Watcher"] = SimCard(data=make_data("Watcher", cost=parse_cost("{W}"),
+                               types=frozenset({"creature"}), power=1, toughness=1),
+                               ann=None, scope_class=None)
+    annotated(cards, "Watcher", {"name": "Watcher", "triggers": [
+        {"on": "creature_etb", "do": "gain_life", "count": 1}]})
+    annotated(cards, "Hammer", {"name": "Hammer", "grants": {"power": 3}})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("Watcher")
+    runner = g.new_perm("Runner")
+    runner.pump_perm[:] = [1, 1]
+    runner.pump_eot[:] = [5, 5]
+    hammer = g.new_perm("Hammer")
+    hammer.attached_to = runner.id
+    runner.attached.append(hammer.id)
+    execute_verb(g, hammer, "token_copy")       # equipment source: copy what it's on
+    copies = [p for p in g.battlefield if p.is_token]
+    assert len(copies) == 1
+    tok = copies[0]
+    assert tok.name == "Runner" and tok.is_token
+    assert tok.token_power == 2                 # 1 base + 1 pump_perm; no eot, no grant
+    assert tok.token_toughness == 2
+    assert tok.token_keywords == ("haste",)     # keywords come from the card
+    assert g.life_gained == 1                   # copy fired creature_etb
+    execute_verb(g, runner, "token_copy")       # creature source: copies itself
+    assert sum(1 for p in g.battlefield if p.is_token) == 2
+    assert g.life_gained == 2
+
+
+def test_effective_power_and_keywords_anthem_and_grants():
+    cards = mini_cards()
+    cards["Anthem"] = SimCard(data=make_data("Anthem", cost=parse_cost("{2}"),
+                              types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Anthem", {"name": "Anthem", "statics": [
+        {"kind": "anthem", "power": 1, "toughness": 1, "keywords": ["haste"]}]})
+    annotated(cards, "Hammer", {"name": "Hammer",
+                                "grants": {"power": 3, "keywords": ["trample"]}})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bear = g.new_perm("Bear")
+    g.new_perm("Anthem")
+    hammer = g.new_perm("Hammer")
+    hammer.attached_to = bear.id
+    bear.attached.append(hammer.id)
+    assert effective_power(g, bear) == 6        # 2 base + 1 anthem + 3 grant
+    assert {"haste", "trample"} <= effective_keywords(g, bear)
+    assert effective_power(g, hammer) == 0      # grants boost the bearer, not the
+                                                # equipment; no base, no anthem
+    tok = g.new_perm("Token", is_token=True, token_power=2, token_toughness=2)
+    assert effective_power(g, tok) == 3         # token stats + anthem
+
+
+def test_resolve_count_symbolics_and_unknown():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bear = g.new_perm("Bear")
+    runner = g.new_perm("Runner")
+    hammer = g.new_perm("Hammer")
+    g.new_perm("Hammer")
+    bf_land(g, "Plains"); bf_land(g, "Mountain")
+    hammer.attached_to = bear.id
+    bear.attached.append(hammer.id)
+    g.spells_cast_this_turn = 5
+    assert resolve_count(g, 7, {}) == 7
+    assert resolve_count(g, "per_artifact", {}) == 2
+    assert resolve_count(g, "per_creature", {}) == 2
+    assert resolve_count(g, "per_land", {}) == 2
+    assert resolve_count(g, "per_spell_cast_this_turn", {}) == 5
+    ctx = {"attackers": [bear.id, runner.id]}
+    assert resolve_count(g, "per_attacker", ctx) == 2
+    assert resolve_count(g, "per_equipped_attacker", ctx) == 1
+    with pytest.raises(IllegalAction):
+        resolve_count(g, "per_goblin", {})
+
+
+def test_check_condition_variants():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bear = g.new_perm("Bear")
+    assert check_condition(g, None, None, {}) is True
+    assert check_condition(g, ("power_gte", 2), bear, {}) is True
+    assert check_condition(g, ("power_gte", 3), bear, {}) is False
+    assert check_condition(g, ("power_gte", 1), None, {}) is False
+    assert check_condition(g, ("equipped",), bear, {}) is False
+    assert check_condition(g, ("metalcraft",), None, {}) is False
+    g.new_perm("Hammer"); g.new_perm("Hammer")
+    assert check_condition(g, ("metalcraft",), None, {}) is False   # 2 artifacts
+    h3 = g.new_perm("Hammer")
+    assert check_condition(g, ("metalcraft",), None, {}) is True    # 3 artifacts
+    h3.attached_to = bear.id
+    bear.attached.append(h3.id)
+    assert check_condition(g, ("equipped",), bear, {}) is True
+    assert check_condition(g, ("equipped",), None, {}) is False
+
+
+def test_fire_records_trigger_fires_and_respects_condition():
+    cards = mini_cards()
+    cards["Sage"] = SimCard(data=make_data("Sage", cost=parse_cost("{1}{U}"),
+                            types=frozenset({"creature"}), power=1, toughness=1),
+                            ann=None, scope_class=None)
+    annotated(cards, "Sage", {"name": "Sage", "triggers": [
+        {"on": "upkeep", "if": "metalcraft", "do": "draw", "count": 1}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("Sage")
+    before = len(g.hand)
+    fire(g, "upkeep")
+    assert len(g.hand) == before and g.trigger_fires == {}      # condition unmet
+    for _ in range(3):
+        g.new_perm("Hammer")
+    fire(g, "upkeep")
+    assert len(g.hand) == before + 1
+    assert g.trigger_fires == {"Sage|upkeep|draw": 1}
+
+
+def test_fire_excludes_entering_permanent():
+    cards = mini_cards()
+    cards["Watcher"] = SimCard(data=make_data("Watcher", cost=parse_cost("{W}"),
+                               types=frozenset({"creature"}), power=1, toughness=1),
+                               ann=None, scope_class=None)
+    annotated(cards, "Watcher", {"name": "Watcher", "triggers": [
+        {"on": "creature_etb", "do": "gain_life", "count": 1}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    w = g.new_perm("Watcher")
+    fire(g, "creature_etb", entering=w)
+    assert g.life_gained == 0                   # doesn't hear its own arrival
+    b = g.new_perm("Bear")
+    fire(g, "creature_etb", entering=b)
+    assert g.life_gained == 1
+
+
+def test_unknown_verb_raises():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    with pytest.raises(IllegalAction):
+        execute_verb(g, None, "scry")
