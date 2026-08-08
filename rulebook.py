@@ -65,6 +65,20 @@ class RulesIndex:
         self.effective_date: str = ""               # "August 7, 2026"
         self.effective_yyyymmdd: str = ""            # "20260807"
 
+    def glossary_refs(self, term: str) -> list[str]:
+        """Rule numbers cited by a glossary definition, in order, deduped."""
+        seen: list[str] = []
+        for num in _RULE_REF_RE.findall(self.glossary.get(term.lower(), "")):
+            if num not in seen:
+                seen.append(num)
+        return seen
+
+    def suggest(self, ref: str, n: int = 5) -> list[str]:
+        """Closest rule numbers and glossary terms for a failed lookup."""
+        from difflib import get_close_matches
+        pool = list(self.rules) + list(self.glossary_display.values())
+        return get_close_matches(ref, pool, n=n, cutoff=0.6)
+
 
 def parse(text: str) -> RulesIndex:
     idx = RulesIndex()

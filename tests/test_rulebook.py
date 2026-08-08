@@ -64,6 +64,26 @@ def test_unknown_month_gives_empty_yyyymmdd():
     assert rulebook.parse(weird).effective_yyyymmdd == ""
 
 
+def test_glossary_definition_and_display(idx):
+    assert "especially effective" in idx.glossary["deathtouch"]
+    assert idx.glossary_display["deathtouch"] == "Deathtouch"
+
+
+def test_glossary_multi_paragraph_definition(idx):
+    assert "interchangeably" in idx.glossary["dies"]
+
+
+def test_glossary_refs_extracted_in_order(idx):
+    assert idx.glossary_refs("Deathtouch") == ["702.2"]
+    assert idx.glossary_refs("Destroy") == ["701.7"]
+    assert idx.glossary_refs("nonexistent term") == []
+
+
+def test_suggest_close_matches(idx):
+    assert "Deathtouch" in idx.suggest("deathtuch")
+    assert any(s.startswith("702.2") for s in idx.suggest("702.9"))
+
+
 def test_real_cr_parses_structurally():
     real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
     idx = rulebook.parse(real)
