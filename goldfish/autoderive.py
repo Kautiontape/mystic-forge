@@ -64,6 +64,8 @@ _DRAW_RE = re.compile(r"draw (a|an|one|two|three|four|five|six|seven|\d+) cards?
 _EQUIP_COST_RE = re.compile(r"\bEquip ((?:\{[^}]+\})+)")
 _GETS_RE = re.compile(r"Equipped creature gets \+(\d+)/\+(\d+)")
 _HAS_RE = re.compile(r"Equipped creature[^.\n]*?has ([^.\n]+)")
+_ALT_SPLIT_RE = re.compile(r"\s*,\s*(?:or\s+)?|\s+or\s+")
+_PROTECTION_RE = re.compile(r"protection from \w+(?: and from \w+)*")
 
 _WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
           "five": 5, "six": 6, "seven": 7}
@@ -98,32 +100,70 @@ def _strip_reminder(oracle: str) -> str:
     return "\n".join(ln for ln in lines if ln).strip()
 
 
-def _parse_produces(oracle: str, produced_mana) -> tuple[dict | None, list[str]]:
-    """Mana produced, with quantity, from the Add clause(s). Parsed from the
-    raw oracle so basics (whose whole ability is reminder text) still count.
-    "or"-alternatives take a per-color max, so {R} or {W} is qty 1 each while
-    {C}{C} is qty 2."""
+def _add_cost_is_pure_tap(line: str, add_start: int) -> bool:
+    """True when the activation cost preceding an Add clause is exactly {T}
+    (basics' reminder parens tolerated). Filter-land pips ("{U/R}, {T}:"),
+    generic costs ("{1}, {T}:"), sacrifice riders, and quoted gained
+    abilities all disqualify the clause — only pure-tap Adds count as the
+    card's own produce."""
+    before = line[:add_start]
+    if ":" not in before:
+        return True                     # bare "Add ..." (no activation cost)
+    cost = before.rsplit(":", 1)[0]
+    cost = cost.rsplit(".", 1)[-1]      # drop a prior sentence on this line
+    for junk in ("(", ")", '"', ","):
+        cost = cost.replace(junk, " ")
+    return not cost.replace("{T}", " ").strip()
+
+
+def _parse_produces(oracle: str, produced_mana) -> tuple[dict | None, list[str], bool]:
+    """(produces, notes, costed_add) — mana produced, with quantity, from
+    pure-{T} Add clauses. Parsed from the raw oracle so basics (whose whole
+    ability is reminder text) still count. Alternatives split on commas and
+    "or" take a per-color max, so "{R} or {W}" is qty 1 each while {C}{C} is
+    qty 2; a mixed alternative ("{W}{U}" — Karoos) yields its total for each
+    color (controller pin: engine (color-set, max-qty) then gives 2 mana of
+    either color). costed_add reports Add clauses skipped for having an
+    activation cost beyond {T} (filter lands)."""
     notes: list[str] = []
     produces: dict = {}
-    for m in _ADD_CLAUSE_RE.finditer(oracle):
-        clause = m.group(1)
-        if _ANY_COLOR_RE.search(clause):
-            qty = _count_word(clause.split()[0]) if clause.split() else 1
-            for c in COLORS:
-                produces[c] = max(produces.get(c, 0), qty)
-            notes.append(
-                f"any-color producer ('Add {clause.strip()}') approximated as "
-                f"producing all five colors")
-            continue
-        for alt in clause.split(" or "):
-            counts: dict = {}
-            for sym in _MANA_SYM_RE.findall(alt):
-                counts[sym] = counts.get(sym, 0) + 1
-            for c, q in counts.items():
-                produces[c] = max(produces.get(c, 0), q)
-    if not produces and produced_mana:
+    costed_add = False
+    for line in oracle.splitlines():
+        for m in _ADD_CLAUSE_RE.finditer(line):
+            if not _add_cost_is_pure_tap(line, m.start()):
+                costed_add = True
+                continue
+            clause = m.group(1)
+            if _ANY_COLOR_RE.search(clause):
+                qty = _count_word(clause.split()[0]) if clause.split() else 1
+                for c in COLORS:
+                    produces[c] = max(produces.get(c, 0), qty)
+                notes.append(
+                    f"any-color producer ('Add {clause.strip()}') approximated "
+                    f"as producing all five colors")
+                continue
+            for alt in _ALT_SPLIT_RE.split(clause):
+                syms = _MANA_SYM_RE.findall(alt)
+                counts: dict = {}
+                for sym in syms:
+                    counts[sym] = counts.get(sym, 0) + 1
+                if len(counts) > 1:
+                    # Karoo/bounce pin: a mixed fixed Add gives its total
+                    # quantity in the engine's (color-set, max-qty) shape.
+                    for c in counts:
+                        produces[c] = max(produces.get(c, 0), len(syms))
+                    notes.append(
+                        f"bounce land approximated as {len(syms)} mana of "
+                        f"either color; bounce drawback not modeled")
+                else:
+                    for c, q in counts.items():
+                        produces[c] = max(produces.get(c, 0), q)
+    if not produces and not costed_add and produced_mana:
         produces = {c: 1 for c in produced_mana if c in COLORS or c == "C"}
-    return (produces or None), notes
+    if produces and costed_add:
+        notes.append("Add ability with an activation cost beyond {T} ignored "
+                     "(filter-style)")
+    return (produces or None), notes, costed_add
 
 
 def _enters_tapped(stripped: str) -> tuple[bool, str | None]:
@@ -140,6 +180,20 @@ def _enters_tapped(stripped: str) -> tuple[bool, str | None]:
     return False, None
 
 
+def _grant_keywords(text: str) -> tuple:
+    """Keyword list from an "has X and Y" grant. "protection from red and
+    from blue" yields two whole "protection from <x>" keywords — never a
+    mangled "from blue" token."""
+    low = text.lower()
+    kws = []
+    for m in _PROTECTION_RE.finditer(low):
+        kws.extend(f"protection from {t}"
+                   for t in re.findall(r"from (\w+)", m.group(0)))
+    rest = _PROTECTION_RE.sub("", low)
+    kws.extend(k.strip() for k in re.split(r",| and ", rest) if k.strip())
+    return tuple(kws)
+
+
 def _equipment_grants(stripped: str) -> dict:
     grants: dict = {}
     m = _GETS_RE.search(stripped)
@@ -148,11 +202,21 @@ def _equipment_grants(stripped: str) -> dict:
         grants["toughness"] = int(m.group(2))
     m = _HAS_RE.search(stripped)
     if m:
-        kws = tuple(k.strip().lower()
-                    for k in re.split(r",| and ", m.group(1)) if k.strip())
+        kws = _grant_keywords(m.group(1))
         if kws:
             grants["keywords"] = kws
     return grants
+
+
+def _equipment_extra_text(stripped: str) -> bool:
+    """True when rules text remains beyond the grant sentences and the Equip
+    line (e.g. Sword of Fire and Ice's combat-damage trigger)."""
+    for line in stripped.splitlines():
+        for sent in line.split("."):
+            s = sent.strip()
+            if s and not s.startswith(("Equipped creature", "Equip")):
+                return True
+    return False
 
 
 def _is_vanilla(stripped: str, keywords: frozenset) -> bool:
@@ -165,7 +229,9 @@ def _is_vanilla(stripped: str, keywords: frozenset) -> bool:
     return all(t in keywords for t in tokens)
 
 
-def _d9_class(stripped: str, types: frozenset, type_line: str) -> str | None:
+def _d9_class(stripped: str, types: frozenset) -> str | None:
+    # Sagas are classified before the branch chain (a land-Saga must never
+    # reach the land branch), so no Saga check here.
     low = stripped.lower()
     if re.search(r"\b(destroy|exile) target\b", low):
         return "interaction_removal"
@@ -174,12 +240,11 @@ def _d9_class(stripped: str, types: frozenset, type_line: str) -> str | None:
         return "interaction_wipe"
     if "counter target" in low:
         return "interaction_counter"
-    if "instant" in types and ("hexproof" in low or "indestructible" in low):
+    if "instant" in types and ("hexproof" in low or "indestructible" in low
+                               or "protection" in low):
         return "protection"
     if "each opponent may" in low or re.search(r"\bvote(s|d)?\b", low):
         return "political"
-    if "Saga" in type_line:
-        return "unmodeled_other"                      # Sagas
     if "flip a coin" in low:
         return "unmodeled_other"                      # coin flips
     if re.search(r"sacrifice [^:\n.]*:", low):
@@ -220,6 +285,12 @@ def _derive_one(raw: dict) -> Derived:
             scope_class = "unmodeled_other"
             notes.append(f"unparseable mana cost {mana_cost!r}: {exc}")
 
+    # Sagas are pinned out of scope BEFORE the branch chain: a land-Saga
+    # (Urza's Saga) must not classify as a plain land, and quoted chapter
+    # abilities ('gains "{T}: Add {C}."') must not classify it as a rock.
+    if scope_class is None and "Saga" in type_line:
+        scope_class = "unmodeled_other"
+
     equip_cost: Cost | None = None
     if "equipment" in types:
         m = _EQUIP_COST_RE.search(stripped)
@@ -238,31 +309,48 @@ def _derive_one(raw: dict) -> Derived:
     if scope_class is not None:
         pass                                          # classified above, not asked
     elif "land" in types:
-        auto = True
         if _FETCH_RE.search(stripped):
             # Spec fetch semantics: sacrifice-to-search is a sac-self {T}
             # activation running ramp_land — the fetch is NOT a producer.
+            auto = True
             ann = Annotation(name=name, activated=[
                 Activated(do="ramp_land", mana=parse_cost(None), tap=True,
                           sac_self=True)])
-            notes.append("fetched land enters tapped per ramp_land pin; "
-                         "fetch timing approximated as sorcery-speed")
+            notes.append("fetched land enters tapped per ramp_land pin "
+                         "(conditional-untap fetches like Fabled Passage "
+                         "subsumed); fetch timing approximated as "
+                         "sorcery-speed")
         else:
-            produces, pnotes = _parse_produces(oracle, raw.get("produced_mana"))
+            produces, pnotes, costed_add = _parse_produces(
+                oracle, raw.get("produced_mana"))
             notes.extend(pnotes)
             enters_tapped, tnote = _enters_tapped(stripped)
             if tnote:
                 notes.append(tnote)
+            if produces is None and costed_add:
+                # Filter lands (Darkwater Catacombs): every mana ability has
+                # a cost beyond {T} — conservative, ask for an annotation.
+                needs = True
+                notes.append("filter land: every mana ability has an "
+                             "activation cost beyond {T}; not auto-modeled")
+            else:
+                auto = True
     elif "{T}: Add" in stripped:
-        auto = True
-        produces, pnotes = _parse_produces(oracle, raw.get("produced_mana"))
+        produces, pnotes, costed_add = _parse_produces(
+            oracle, raw.get("produced_mana"))
         notes.extend(pnotes)
         enters_tapped, tnote = _enters_tapped(stripped)
         if tnote:
             notes.append(tnote)
-        if "creature" in types:
-            notes.append("creature mana producer: engine has no "
-                         "summoning-sickness gate on mana tapping")
+        if produces is None and costed_add:
+            needs = True
+            notes.append("filter-style producer: every mana ability has an "
+                         "activation cost beyond {T}; not auto-modeled")
+        else:
+            auto = True
+            if "creature" in types:
+                notes.append("creature mana producer: engine has no "
+                             "summoning-sickness gate on mana tapping")
     elif (dm := _DRAW_RE.fullmatch(" ".join(stripped.split()))):
         auto = True
         ann = Annotation(name=name, triggers=[
@@ -275,10 +363,14 @@ def _derive_one(raw: dict) -> Derived:
         if "into your hand" in stripped:
             notes.append("battlefield-plus-hand land split approximated as "
                          "all searched lands onto the battlefield")
+        notes.append("ramp takes the first land in library order; 'basic "
+                     "land' search restrictions widened to any land")
     elif "equipment" in types and (grants := _equipment_grants(stripped)):
         auto = True
         ann = Annotation(name=name, grants=grants)
-    elif (d9 := _d9_class(stripped, types, type_line)) is not None:
+        if _equipment_extra_text(stripped):
+            notes.append("additional ability text not modeled")
+    elif (d9 := _d9_class(stripped, types)) is not None:
         scope_class = d9
     elif ("creature" in types and power is not None and toughness is not None
             and _is_vanilla(stripped, keywords)):

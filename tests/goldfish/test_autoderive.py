@@ -149,6 +149,54 @@ ASHNODS_ALTAR = {
     "oracle_text": "Sacrifice a creature: Add {C}{C}.",
     "keywords": [], "produced_mana": ["C"]}
 
+CASCADE_BLUFFS = {
+    "name": "Cascade Bluffs", "type_line": "Land", "mana_cost": "",
+    "oracle_text": "{T}: Add {C}.\n{U/R}, {T}: Add {U}{U}, {U}{R}, or {R}{R}.",
+    "keywords": [], "produced_mana": ["C", "R", "U"]}
+
+DARKWATER_CATACOMBS = {
+    "name": "Darkwater Catacombs", "type_line": "Land", "mana_cost": "",
+    "oracle_text": "{1}, {T}: Add {U}{B}.",
+    "keywords": [], "produced_mana": ["B", "U"]}
+
+URZAS_SAGA = {
+    "name": "Urza's Saga", "type_line": "Enchantment Land — Urza's Saga",
+    "mana_cost": "",
+    "oracle_text": "(As this Saga enters and after your draw step, add a lore "
+                   "counter. Sacrifice after III.)\n"
+                   "I — This Saga gains \"{T}: Add {C}.\"\n"
+                   "II — This Saga gains \"{2}, {T}: Create a 0/0 colorless "
+                   "Construct artifact creature token with 'This token gets "
+                   "+1/+1 for each artifact you control.'\"\n"
+                   "III — Search your library for an artifact card with mana "
+                   "cost {0} or {1}, put it onto the battlefield, then shuffle.",
+    "keywords": [], "produced_mana": ["C"]}
+
+TEFERIS_PROTECTION = {
+    "name": "Teferi's Protection", "type_line": "Instant", "mana_cost": "{2}{W}",
+    "oracle_text": "Until your next turn, your life total can't change and you "
+                   "gain protection from everything. All permanents you "
+                   "control phase out. (While they're phased out, they're "
+                   "treated as though they don't exist. They phase in before "
+                   "you untap during your untap step.)\n"
+                   "Exile Teferi's Protection.",
+    "keywords": []}
+
+AZORIUS_CHANCERY = {
+    "name": "Azorius Chancery", "type_line": "Land", "mana_cost": "",
+    "oracle_text": "This land enters tapped.\nWhen this land enters, return a "
+                   "land you control to its owner's hand.\n{T}: Add {W}{U}.",
+    "keywords": [], "produced_mana": ["U", "W"]}
+
+SWORD_OF_FIRE_AND_ICE = {
+    "name": "Sword of Fire and Ice", "type_line": "Artifact — Equipment",
+    "mana_cost": "{3}",
+    "oracle_text": "Equipped creature gets +2/+2 and has protection from red "
+                   "and from blue.\nWhenever equipped creature deals combat "
+                   "damage to a player, this Equipment deals 2 damage to any "
+                   "target and you draw a card.\nEquip {2}",
+    "keywords": ["Equip"]}
+
 NECROPOTENCE = {
     "name": "Necropotence", "type_line": "Enchantment", "mana_cost": "{B}{B}{B}",
     "oracle_text": "Skip your draw step.\nWhenever you discard a card, exile "
@@ -208,6 +256,58 @@ def test_land_current_scryfall_templating():
     assert got.auto_annotated is True and got.needs_annotation is False
 
 
+def test_filter_land_counts_only_pure_tap_add():
+    # Cascade Bluffs: "{T}: Add {C}." is this land's produce; the
+    # "{U/R}, {T}: Add {U}{U}, {U}{R}, or {R}{R}." clause has a mana
+    # activation cost and must NOT be counted (it previously derived as a
+    # free 3-mana tap).
+    d = derive([CASCADE_BLUFFS])
+    got = d["Cascade Bluffs"]
+    assert got.card.data.produces == {"C": 1}
+    assert got.auto_annotated is True and got.needs_annotation is False
+    assert any("ignored" in n for n in got.approx_notes)
+
+
+def test_filter_land_without_pure_tap_needs_annotation():
+    # Darkwater Catacombs has ONLY the costed Add clause: conservative —
+    # flagged for annotation, produced_mana deliberately not trusted.
+    d = derive([DARKWATER_CATACOMBS])
+    got = d["Darkwater Catacombs"]
+    assert got.needs_annotation is True
+    assert got.card.scope_class is None
+    assert got.card.data.produces is None
+    assert any("filter land" in n for n in got.approx_notes)
+
+
+def test_land_saga_is_unmodeled_other():
+    # Urza's Saga is a Land — but a Saga first: chapter text (including the
+    # quoted "{T}: Add {C}.") must not classify it as a mana land.
+    d = derive([URZAS_SAGA])
+    got = d["Urza's Saga"]
+    assert got.card.scope_class == "unmodeled_other"
+    assert got.needs_annotation is False and got.auto_annotated is False
+    assert got.card.data.produces is None
+
+
+def test_karoo_bounce_land_quantity_flows_through_engine():
+    from goldfish.engine import new_game, untapped_producers
+    from tests.goldfish.test_engine import mini_cards
+
+    d = derive([AZORIUS_CHANCERY])
+    got = d["Azorius Chancery"]
+    assert got.card.data.produces == {"W": 2, "U": 2}
+    assert got.card.data.enters_tapped is True
+    assert any("bounce land approximated as 2 mana of either color" in n
+               for n in got.approx_notes)
+    # the engine's (color-set, max-qty) shape must yield 2 mana of {W,U}
+    cards = mini_cards()
+    cards["Azorius Chancery"] = got.card
+    g = new_game(cards, ["Azorius Chancery"] * 40, "Boss", seed=1)
+    perm = g.new_perm("Azorius Chancery")            # untapped probe
+    (_p, colors, qty), = [t for t in untapped_producers(g) if t[0].id == perm.id]
+    assert colors == frozenset({"W", "U"}) and qty == 2
+
+
 def test_conditional_tapland_approximated_untapped():
     d = derive([DESERTED_BEACH])
     got = d["Deserted Beach"]
@@ -241,6 +341,8 @@ def test_fetch_derives_sac_self_ramp_activation():
     assert act.mana.mv == 0                            # cost is just the {T} + sac
     assert any("ramp_land pin" in n for n in got.approx_notes)
     assert any("sorcery-speed" in n for n in got.approx_notes)
+    # conditional-untap fetches (Fabled Passage) ride the same tapped pin
+    assert any("subsumed" in n for n in got.approx_notes)
     assert got.auto_annotated is True and got.needs_annotation is False
 
 
@@ -275,6 +377,8 @@ def test_ramp_spell_cultivate():
     assert got.auto_annotated is True
     # one land actually goes to hand — flagged, not silently over-modeled
     assert any("hand" in n for n in got.approx_notes)
+    # engine ramp takes the first land in library order, not the first basic
+    assert any("library order" in n for n in got.approx_notes)
 
 
 # ── Equipment ───────────────────────────────────────────────────────────────
@@ -297,6 +401,23 @@ def test_equipment_keyword_grants_equip_zero():
     assert "haste" in got.card.ann.grants["keywords"]
     assert got.card.data.equip_cost is not None
     assert got.card.data.equip_cost.mv == 0            # Equip {0} is a real cost
+    assert got.auto_annotated is True
+
+
+def test_equipment_protection_keywords_and_residual_note():
+    # "protection from red and from blue" must not split into mangled tokens
+    # like "from blue"; the combat-damage trigger is flagged, not silently
+    # dropped.
+    d = derive([SWORD_OF_FIRE_AND_ICE])
+    got = d["Sword of Fire and Ice"]
+    assert got.card.ann is not None and got.card.ann.grants is not None
+    grants = got.card.ann.grants
+    assert grants["power"] == 2 and grants["toughness"] == 2
+    assert "protection from red" in grants["keywords"]
+    assert "protection from blue" in grants["keywords"]
+    assert all(not k.startswith("from ") for k in grants["keywords"])
+    assert any("additional ability text not modeled" in n
+               for n in got.approx_notes)
     assert got.auto_annotated is True
 
 
@@ -329,6 +450,13 @@ def test_wipe_counter_protection_political():
     assert d["Heroic Intervention"].card.scope_class == "protection"
     assert d["Council's Judgment"].card.scope_class == "political"
     assert all(not d[n].needs_annotation for n in d)
+
+
+def test_protection_granting_instant_classified():
+    d = derive([TEFERIS_PROTECTION])
+    got = d["Teferi's Protection"]
+    assert got.card.scope_class == "protection"
+    assert got.needs_annotation is False
 
 
 def test_unmodeled_other_patterns():
