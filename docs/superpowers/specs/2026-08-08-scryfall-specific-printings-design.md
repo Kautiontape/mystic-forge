@@ -184,16 +184,24 @@ subset. See Decision D3.
 | `collector_number` | `str?` | `None` | adds `cn:<number>`; **requires** `set_code` |
 | `finish` | `nonfoil \| foil \| etched`? | `None` | adds `is:<finish>`; selects the leading price column |
 | `include_digital` | `bool` | `False` | when false, appends `-is:digital` |
-| `order` | `usd \| released \| set \| name` | `usd` | passed through to Scryfall |
 
 `collector_number` without `set_code` is a validation error, not a silent no-op —
 collector numbers are only unique within a set. Enforced with a Pydantic
 `model_validator`.
 
-**Null-price sorting.** Scryfall's ordering is kept as the request parameter, but
-results are re-sorted client-side before display: printings with a price in the
-selected finish first (ascending), unpriced printings last. This is the fix for the
-Counterspell case. The selected finish is `finish` if given, otherwise `nonfoil`.
+**No `order` field.** An earlier draft of this design added one, reasoning that
+"show me the expensive printings" should be reachable. It cannot survive the fix
+below: results are always re-sorted client-side by price, so `released`, `set`, and
+`name` would all produce the identical cheapest-first list, leaving a parameter whose
+description promised the calling model something untrue. A knob that exists only to
+be overridden is worse than no knob. `limit` (1–50) and `set_code` cover the same
+ground honestly. See Decision D8.
+
+**Null-price sorting.** The request asks Scryfall for `order=usd&dir=asc`, but that
+only decides which page-1 slice we get for cards with more printings than one page
+holds; results are re-sorted client-side before display: printings with a price in
+the selected finish first (ascending), unpriced printings last. This is the fix for
+the Counterspell case. The selected finish is `finish` if given, otherwise `nonfoil`.
 
 **Single-printing mode.** When `set_code` and `collector_number` together resolve to
 exactly one card, output switches from a list to a detail block: all price columns,
@@ -422,6 +430,10 @@ cleanly into `Decimal`.
   from its batch lookup (`server.py:1317-1327`), so the check costs no extra
   requests and would follow the existing `# WARNING:` pattern (`server.py:1340`).
   Recorded as a known risk below rather than implemented now.
+- **D8 — `scryfall_price` has no `order` parameter.** Added during design, removed
+  during implementation once it was clear the mandatory client-side price re-sort
+  makes every non-default value indistinguishable from the default. Kept here rather
+  than quietly deleted, so the idea is not re-proposed.
 - **D7 — `archidekt_export` emits markers by default, with no flag.** Echoing back
   Archidekt's own `modifier` in Archidekt's own syntax is fidelity, not invention.
   This does change output for any deck containing foils; that change is the bug fix.
@@ -436,6 +448,13 @@ Not in scope, recorded so it is not rediscovered from scratch:
   stamp `*F*` across every card including printings that have no foil.
 - Teaching `precon_export` and the EDHREC formatters about finishes. They emit
   suggested cards rather than owned ones, so finish is not meaningful there yet.
+- **Escaping card names in Scryfall queries.** `scryfall_price` interpolates the name
+  into `!"{name}"` with no escaping, so a card whose name contains a double quote
+  breaks the query. Real examples exist — Unhinged's `"Ach! Hans, Run!"` is literally
+  named with quotation marks. This predates the work in this spec (the tool has always
+  built its query this way) and none of these changes widen it, so it is recorded
+  rather than fixed here. `scryfall_price_list` is unaffected: it goes through
+  `/cards/collection` identifiers, which are JSON values, not query syntax.
 
 ## Testing
 
