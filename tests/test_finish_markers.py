@@ -169,3 +169,37 @@ async def test_archidekt_export_preserves_foil_and_etched_modifiers(monkeypatch)
     assert "1x Rhystic Study (j22) 114 [Maybeboard{noDeck}{noPrice}]" in lines
     # Maybeboard is excluded from the deck total.
     assert "# Total in deck: 3" in lines
+
+
+def test_emitted_lines_parse_back_to_the_same_entries():
+    # The emitters (Tasks 9/10) and the parser (Task 2) are two halves of one
+    # format. This is what stops them drifting apart.
+    cases = [
+        (1, "Counterspell", "dmr", "281", "foil", " [Draw]", ""),
+        (1, "Arcane Signet", "sld", "589", "etched", "", ""),
+        (2, "Sol Ring", "ltc", "284", None, " [Ramp]", " ^Have,#2ccce4^"),
+        (1, "Sephiroth, Fabled SOLDIER // Sephiroth, One-Winged Angel",
+         "fin", "382", "foil", " [Commander{top}]", ""),
+    ]
+    for qty, name, set_code, collector, finish, category, labels in cases:
+        line = server._archidekt_line(
+            quantity=qty, name=name, set_code=set_code, collector=collector,
+            finish=finish, category=category, labels=labels)
+        (entry,) = server._parse_decklist_entries(line)
+        assert entry.quantity == qty, line
+        assert entry.name == name, line
+        assert entry.set_code == set_code, line
+        assert entry.collector_number == collector, line
+        assert entry.finish == finish, line
+
+
+def test_round_trip_survives_a_multi_line_decklist():
+    decklist = "\n".join([
+        server._archidekt_line(1, "Counterspell", "dmr", "281", "foil", " [Draw]", ""),
+        server._archidekt_line(10, "Island", "unf", "240", None, " [Lands]", ""),
+        server._archidekt_line(1, "Arcane Signet", "sld", "589", "etched", "", ""),
+    ])
+    entries = server._parse_decklist_entries(decklist)
+    assert [e.finish for e in entries] == ["foil", None, "etched"]
+    assert [e.quantity for e in entries] == [1, 10, 1]
+    assert [e.set_code for e in entries] == ["dmr", "unf", "sld"]
