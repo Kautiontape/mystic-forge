@@ -1227,3 +1227,217 @@ def test_unknown_card_name_raises_illegal_action_not_keyerror():
     with pytest.raises(IllegalAction):
         step(g, {"type": "cast", "card": None})           # name must be a string
     assert g.to_dict() == snap
+
+
+# -- Task 8: attach / activate actions + equip statics ----------------------
+
+def test_attach_pays_equip_cost_and_free_static():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    bear = g.new_perm("Bear"); ham = g.new_perm("Hammer")
+    for _ in range(8):
+        g.new_perm("Plains")
+    step(g, {"type": "attach", "card": ham.id, "target": bear.id})
+    assert ham.attached_to == bear.id and bear.attached == [ham.id]
+    assert sum(1 for p in g.battlefield if p.tapped) == 8      # paid {8}
+    # free-equip static:
+    cards["Aid"] = SimCard(data=make_data("Aid", cost=parse_cost("{W}"),
+                           types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Aid", {"name": "Aid", "statics": ["equip_free"]})
+    g2 = started(cards, ["Plains"] * 40, hand=[])
+    b2, h2 = g2.new_perm("Bear"), g2.new_perm("Hammer")
+    g2.new_perm("Aid")
+    step(g2, {"type": "attach", "card": h2.id, "target": b2.id})
+    assert not any(p.tapped for p in g2.battlefield)           # free
+
+
+def test_tap_activation_respects_summoning_sickness():
+    cards = mini_cards()
+    cards["Krenko"] = SimCard(data=make_data("Krenko", cost=parse_cost("{2}{R}"),
+                              types=frozenset({"creature"}), power=3, toughness=3),
+                              ann=None, scope_class=None)
+    annotated(cards, "Krenko", {"name": "Krenko", "activated": [
+        {"cost": "{T}", "do": "create_token", "power": 1, "toughness": 1,
+         "count": "per_creature"}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    k = g.new_perm("Krenko")                     # arrived this turn, no haste
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "activate", "card": k.id, "ability": 0})
+    g.turn += 1                                  # next turn
+    step(g, {"type": "activate", "card": k.id, "ability": 0})
+    assert k.tapped and sum(1 for p in g.battlefield if p.is_token) == 1
+
+
+def test_attach_ambiguous_name_rejected_with_candidate_ids():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    b1 = g.new_perm("Bear")
+    b2 = g.new_perm("Bear")
+    ham = g.new_perm("Hammer")
+    for _ in range(8):
+        g.new_perm("Plains")
+    with pytest.raises(IllegalAction) as exc:
+        step(g, {"type": "attach", "card": ham.id, "target": "Bear"})
+    msg = str(exc.value)
+    assert b1.id in msg and b2.id in msg
+    # unresolvable ref is rejected too, distinctly from ambiguity
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "attach", "card": ham.id, "target": "Ghost"})
+
+
+def test_attach_reattach_moves_equipment_between_bearers():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    bear = g.new_perm("Bear")
+    boss = g.new_perm("Boss")
+    ham = g.new_perm("Hammer")
+    for _ in range(16):
+        g.new_perm("Plains")
+    step(g, {"type": "attach", "card": ham.id, "target": bear.id})
+    assert ham.attached_to == bear.id and bear.attached == [ham.id]
+    step(g, {"type": "attach", "card": ham.id, "target": boss.id})
+    assert ham.attached_to == boss.id
+    assert boss.attached == [ham.id]
+    assert bear.attached == []                    # old bearer's list emptied
+
+
+def test_attach_equip_free_if_metalcraft_gates_on_three_artifacts():
+    cards = mini_cards()
+    cards["Manual"] = SimCard(data=make_data("Manual", cost=parse_cost("{1}"),
+                              types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Manual", {"name": "Manual",
+                                "statics": ["equip_free_if_metalcraft"]})
+    # 3 artifacts on board (the equipment + 2 spares): metalcraft active, free
+    g = started(cards, ["Plains"] * 40, hand=[])
+    bear = g.new_perm("Bear")
+    ham = g.new_perm("Hammer")
+    g.new_perm("Hammer"); g.new_perm("Hammer")
+    g.new_perm("Manual")
+    step(g, {"type": "attach", "card": ham.id, "target": bear.id})
+    assert not any(p.tapped for p in g.battlefield)
+
+    # only 1 artifact on board: metalcraft inactive, cost is paid in full
+    g2 = started(cards, ["Plains"] * 40, hand=[])
+    bear2 = g2.new_perm("Bear")
+    ham2 = g2.new_perm("Hammer")
+    g2.new_perm("Manual")
+    for _ in range(8):
+        g2.new_perm("Plains")
+    step(g2, {"type": "attach", "card": ham2.id, "target": bear2.id})
+    assert sum(1 for p in g2.battlefield if p.tapped) == 8
+
+
+def test_attach_and_activate_illegal_variants_leave_game_unmutated():
+    cards = mini_cards()
+    cards["Krenko"] = SimCard(data=make_data("Krenko", cost=parse_cost("{2}{R}"),
+                              types=frozenset({"creature"}), power=3, toughness=3),
+                              ann=None, scope_class=None)
+    annotated(cards, "Krenko", {"name": "Krenko", "activated": [
+        {"cost": "{T}", "do": "create_token", "power": 1, "toughness": 1,
+         "count": "per_creature"}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    bear = g.new_perm("Bear")
+    boss = g.new_perm("Boss")
+    ham = g.new_perm("Hammer")
+    krenko = g.new_perm("Krenko")                # arrives this turn: summoning sick
+    snap = g.to_dict()
+    for bad in (
+        {"type": "attach", "card": bear.id, "target": ham.id},   # card not equipment
+        {"type": "attach", "card": ham.id, "target": ham.id},    # target not creature
+        {"type": "attach", "card": ham.id, "target": bear.id},   # can't pay {8}
+        {"type": "attach", "card": "Ghost", "target": bear.id},  # unresolvable card
+        {"type": "attach", "card": ham.id, "target": "Ghost"},   # unresolvable target
+        {"type": "activate", "card": krenko.id, "ability": 5},   # bad ability index
+        {"type": "activate", "card": krenko.id, "ability": 0},   # summoning sick
+        {"type": "activate", "card": "Ghost", "ability": 0},     # unresolvable
+        {"type": "activate", "card": boss.id, "ability": 0},     # no activated abilities
+    ):
+        with pytest.raises(IllegalAction):
+            step(g, bad)
+    assert g.to_dict() == snap
+
+
+def test_attach_and_activate_rejected_outside_main_phases():
+    cards = mini_cards()
+    cards["Krenko"] = SimCard(data=make_data("Krenko", cost=parse_cost("{2}{R}"),
+                              types=frozenset({"creature"}), power=3, toughness=3),
+                              ann=None, scope_class=None)
+    annotated(cards, "Krenko", {"name": "Krenko", "activated": [
+        {"cost": "{T}", "do": "draw", "count": 1}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    bear = g.new_perm("Bear")
+    ham = g.new_perm("Hammer")
+    krenko = g.new_perm("Krenko")
+    g.turn += 1
+    g.phase = "combat"
+    snap = g.to_dict()
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "attach", "card": ham.id, "target": bear.id})
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "activate", "card": krenko.id, "ability": 0})
+    assert g.to_dict() == snap
+
+
+def test_activate_by_unique_name():
+    cards = mini_cards()
+    cards["Krenko"] = SimCard(data=make_data("Krenko", cost=parse_cost("{2}{R}"),
+                              types=frozenset({"creature"}), power=3, toughness=3),
+                              ann=None, scope_class=None)
+    annotated(cards, "Krenko", {"name": "Krenko", "activated": [
+        {"cost": "{T}", "do": "create_token", "power": 1, "toughness": 1,
+         "count": "per_creature"}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    k = g.new_perm("Krenko")
+    g.turn += 1
+    step(g, {"type": "activate", "card": "Krenko", "ability": 0})
+    assert k.tapped and sum(1 for p in g.battlefield if p.is_token) == 1
+
+
+def test_activate_haste_creature_can_tap_on_arrival_turn():
+    cards = mini_cards()
+    annotated(cards, "Runner", {"name": "Runner", "activated": [
+        {"cost": "{T}", "do": "draw", "count": 1}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    runner = g.new_perm("Runner")                # arrives this turn, but has haste
+    before = len(g.hand)
+    step(g, {"type": "activate", "card": runner.id, "ability": 0})
+    assert runner.tapped and len(g.hand) == before + 1
+
+
+def test_activate_mana_cost_paid_and_untapped_ability_ignores_sickness():
+    # A non-{T} activated ability on a summoning-sick creature is legal: only
+    # {T} abilities are gated by D8.
+    cards = mini_cards()
+    annotated(cards, "Bear", {"name": "Bear", "activated": [
+        {"cost": "{1}{G}", "do": "gain_life", "count": 3}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    bear = g.new_perm("Bear")                    # arrives this turn, no haste
+    cards["Forest"] = SimCard(data=make_data("Forest", types=frozenset({"land"}),
+                              produces={"G": 1}), ann=None, scope_class=None)
+    g.new_perm("Forest"); g.new_perm("Plains")
+    step(g, {"type": "activate", "card": bear.id, "ability": 0})
+    assert bear.tapped is False                  # no {T} in the cost
+    assert g.life_gained == 3
+    assert all(p.tapped for p in g.battlefield if g.card(p.name).is_land)
+    assert any("activated Bear ability 0" in line for line in g.log)
+
+
+def test_legal_actions_includes_attach_and_activate_in_pinned_order():
+    cards = mini_cards()
+    annotated(cards, "Boss", {"name": "Boss", "activated": [
+        {"cost": "{T}", "do": "draw", "count": 1}]})
+    g = started(cards, ["Plains"] * 40, hand=["Plains", "Runner"])
+    g.new_perm("Mountain")                        # untapped R source for Runner
+    bear = g.new_perm("Bear")
+    boss = g.new_perm("Boss")
+    ham = g.new_perm("Hammer")
+    g.turn += 1                                   # clears Boss's summoning sickness
+    acts = legal_actions(g)
+    assert acts == [
+        {"type": "play_land", "card": "Plains"},
+        {"type": "cast", "card": "Runner"},
+        {"type": "attach", "card": ham.id, "target": bear.id},
+        {"type": "attach", "card": ham.id, "target": boss.id},
+        {"type": "activate", "card": boss.id, "ability": 0},
+        {"type": "pass"},
+    ]

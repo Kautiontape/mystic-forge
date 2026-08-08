@@ -749,6 +749,66 @@ def _cast_cost(g: Game, card: SimCard, tax: int) -> Cost:
     return Cost(pips)
 
 
+def _resolve_perm(g: Game, ref) -> Permanent:
+    """Resolve an attach/activate `card`/`target` reference: battlefield
+    instance id first, else a unique permanent name (spec §Interactive mode).
+    Ambiguous names raise IllegalAction listing every candidate id; a ref
+    matching neither an id nor exactly one name raises IllegalAction."""
+    if not isinstance(ref, str):
+        raise IllegalAction(f"permanent reference must be a string, got {ref!r}")
+    for p in g.battlefield:
+        if p.id == ref:
+            return p
+    matches = sorted((p for p in g.battlefield if p.name == ref),
+                     key=lambda p: int(p.id[1:]))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        ids = ", ".join(p.id for p in matches)
+        raise IllegalAction(f"ambiguous name {ref!r}; candidates: {ids}")
+    raise IllegalAction(f"no permanent matching {ref!r}")
+
+
+def _equip_free_active(g: Game) -> bool:
+    """True when a battlefield static grants free equipping: `equip_free`
+    unconditionally, or `equip_free_if_metalcraft` while metalcraft (spec
+    §Card annotation DSL) holds."""
+    for p in g.battlefield:
+        for s in g.card(p.name).statics():
+            if s.kind == "equip_free":
+                return True
+            if (s.kind == "equip_free_if_metalcraft"
+                    and check_condition(g, ("metalcraft",), None, {})):
+                return True
+    return False
+
+
+def _activated_abilities(card: SimCard) -> list:
+    """Same inert-gating as triggers_for/statics(): an inert card exposes no
+    activated abilities (defensive — annotations are never written for
+    out-of-scope cards in practice)."""
+    if card.ann is None or card.inert_reason:
+        return []
+    return card.ann.activated
+
+
+def _activation_tap_ok(g: Game, perm: Permanent) -> bool:
+    """{T} legality independent of the specific ability: untapped AND (not a
+    creature OR summoning sickness has passed OR haste) — spec §Engine, D8."""
+    if perm.tapped:
+        return False
+    if _is_creature_perm(g, perm) and perm.arrived_turn >= g.turn:
+        return "haste" in effective_keywords(g, perm)
+    return True
+
+
+def _ability_payable(g: Game, perm: Permanent, ability) -> bool:
+    """Combined legality for `legal_actions`: {T} part (if any) plus mana."""
+    if ability.tap and not _activation_tap_ok(g, perm):
+        return False
+    return can_pay(g, ability.mana)
+
+
 def step(g: Game, action: dict) -> None:
     """Apply one atomic action (D10). Validates completely first; on
     IllegalAction the game is guaranteed unmutated."""
@@ -757,11 +817,14 @@ def step(g: Game, action: dict) -> None:
         _step_play_land(g, action)
     elif kind == "cast":
         _step_cast(g, action)
+    elif kind == "attach":
+        _step_attach(g, action)
+    elif kind == "activate":
+        _step_activate(g, action)
     elif kind == "pass":
         _step_pass(g)
     else:
-        # attach/activate arrive in Task 8, attack in Task 9,
-        # mulligan/keep in Task 10.
+        # attack arrives in Task 9, mulligan/keep in Task 10.
         raise IllegalAction(f"unknown or unsupported action type {kind!r}")
     # A turn-advancing pass already recorded inside _begin_new_turn; this
     # second call is deliberate and idempotent (setdefault) — do not "fix" it.
@@ -846,6 +909,60 @@ def _step_cast(g: Game, action: dict):
             fire(g, "equipment_etb", entering=perm)
 
 
+def _step_attach(g: Game, action: dict):
+    if g.phase not in ("main1", "main2"):
+        raise IllegalAction(f"cannot attach during {g.phase}")
+    eq = _resolve_perm(g, action.get("card"))
+    tgt = _resolve_perm(g, action.get("target"))
+    eq_card = g.card(eq.name)
+    if not eq_card.is_equipment:
+        raise IllegalAction(f"{eq.name!r} is not equipment")
+    if not _is_creature_perm(g, tgt):
+        raise IllegalAction(f"{tgt.name!r} is not a creature")
+    free = _equip_free_active(g)
+    cost = parse_cost(None) if free else (eq_card.data.equip_cost or parse_cost(None))
+    if not free and not can_pay(g, cost):
+        raise IllegalAction(f"cannot pay equip cost for {eq.name!r}")
+    # --- all checks passed; mutation begins ---
+    if not free:
+        pay(g, cost)
+    if eq.attached_to is not None:
+        g.perm(eq.attached_to).attached.remove(eq.id)
+    _do_attach(g, eq, tgt)
+
+
+def _step_activate(g: Game, action: dict):
+    # v1 pin: activations are main-phase only. Real activated abilities (token
+    # producers, {T}: draw a card, ...) are frequently used mid-combat too,
+    # but that interacts with the extra_combat policy Task 9 introduces — so
+    # combat-phase activation is deferred there rather than half-modeled here.
+    if g.phase not in ("main1", "main2"):
+        raise IllegalAction(f"cannot activate during {g.phase}")
+    perm = _resolve_perm(g, action.get("card"))
+    idx = action.get("ability")
+    if not isinstance(idx, int) or isinstance(idx, bool):
+        raise IllegalAction(f"activate needs an integer ability index, got {idx!r}")
+    abilities = _activated_abilities(g.card(perm.name))
+    if not (0 <= idx < len(abilities)):
+        raise IllegalAction(f"{perm.name!r} has no activated ability {idx!r}")
+    ability = abilities[idx]
+    if ability.tap and not _activation_tap_ok(g, perm):
+        raise IllegalAction(
+            f"{perm.name!r} cannot activate a {{T}} ability now "
+            f"(tapped or summoning sick)")
+    if not can_pay(g, ability.mana):
+        raise IllegalAction(f"cannot pay activation cost for {perm.name!r}")
+    # --- all checks passed; mutation begins ---
+    pay(g, ability.mana)
+    if ability.tap:
+        perm.tapped = True
+    g.emit(f"activated {perm.name} ability {idx}")   # cause precedes the verb's effects
+    execute_verb(g, perm, ability.do, count=ability.count, target=ability.target,
+                power=ability.power, toughness=ability.toughness,
+                keywords=ability.keywords, tutor_filter=ability.tutor_filter,
+                pips=ability.pips, any_mana=ability.any_mana, duration=ability.duration)
+
+
 def _step_pass(g: Game):
     if g.phase not in ("main1", "combat", "main2", "end"):
         raise IllegalAction(f"cannot pass during {g.phase}")
@@ -893,8 +1010,12 @@ def legal_actions(g: Game) -> list:
     """Factored legal-action list (spec §Interactive mode), deterministic
     order: playable land names (deduped, name-sorted), castable spells sorted
     by (mv, name) — including the commander with tax and reductions applied —
-    then pass. Attach/activate (Task 8) and attack (Task 9) entries arrive in
-    later tasks; mulligan-phase actions in Task 10."""
+    then attach pairs (every equipment x creature combo on the battlefield,
+    sorted by (eq id, target id) numerically — not payability-filtered per
+    spec: "list pairs, it's fine"), then payable + untapped-eligible
+    activated-ability entries (sorted by (perm id, ability index)), then
+    pass. Attack (Task 9) entries arrive in a later task; mulligan-phase
+    actions in Task 10."""
     if g.phase == "mulligan":
         return []
     actions = []
@@ -916,5 +1037,18 @@ def legal_actions(g: Game) -> list:
                 castable.add(cname)
         actions += [{"type": "cast", "card": n}
                     for n in sorted(castable, key=lambda n: (g.card(n).mv, n))]
+        equipment = [p for p in g.battlefield if g.card(p.name).is_equipment]
+        creatures = [p for p in g.battlefield if _is_creature_perm(g, p)]
+        pairs = sorted(((eq, tgt) for eq in equipment for tgt in creatures),
+                       key=lambda pair: (int(pair[0].id[1:]), int(pair[1].id[1:])))
+        actions += [{"type": "attach", "card": eq.id, "target": tgt.id}
+                    for eq, tgt in pairs]
+        activations = sorted(
+            ((p, i) for p in g.battlefield
+             for i, ability in enumerate(_activated_abilities(g.card(p.name)))
+             if _ability_payable(g, p, ability)),
+            key=lambda t: (int(t[0].id[1:]), t[1]))
+        actions += [{"type": "activate", "card": p.id, "ability": i}
+                    for p, i in activations]
     actions.append({"type": "pass"})
     return actions
