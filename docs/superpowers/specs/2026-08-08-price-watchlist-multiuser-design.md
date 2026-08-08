@@ -168,11 +168,18 @@ error asking the user to create or supply one.
 
 Served via FastMCP `custom_route` alongside the MCP mount:
 
-- `GET /w/<passphrase>` — full view: label, current list with prices, complete
-  event chain (seq, timestamp, action, detail), lineage/supersession notices.
+- `GET /w/<passphrase>` — full view: label, stat tiles, card grid with 90-day
+  sparklines (click a card for a crosshair detail chart), and a paginated
+  revision rail; revision modal shows the snapshot with Fork / Restore.
   Public URL: `https://kautiontape.com/mtg/w/<passphrase>`.
-- `GET /s/<share_code>` — same page, read-only framing, no passphrase shown.
-  Public URL: `https://kautiontape.com/mtg/s/<share_code>`.
+- `GET /s/<share_code>` — same page, read-only framing, no passphrase shown,
+  fork allowed but no restore. Public URL: `https://kautiontape.com/mtg/s/<code>`.
+- Catppuccin Latte/Macchiato themes (prefers-color-scheme + toggle), inline
+  CSS/JS only — no external assets.
+- `GET /api/revision/<key>/<seq>` (snapshot JSON) and `POST /api/fork`
+  ({key, at_seq?, mode: fork|recover}) back the modals; `recover` requires the
+  passphrase key and marks the source superseded — same semantics as
+  `watchlist_clone`. Both keys accepted: passphrase or share code.
 - Plain server-rendered HTML, no JS required, no forms. Cloning instructions on
   the page point at the MCP tool.
 

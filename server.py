@@ -27,6 +27,7 @@ from mcp.server.fastmcp import FastMCP
 
 import watchlist_db
 import watchlist_ingest
+import watchlist_pages
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -2794,50 +2795,37 @@ async def health(request: Request):
     })
 
 
-def _render_page(db, row, editable: bool) -> str:
-    title = _esc(row["label"] or "Watchlist")
-    parts = [f"<!doctype html><meta charset=utf-8><title>{title}</title>",
-             "<style>body{font:15px system-ui;margin:2rem auto;max-width:52rem;"
-             "padding:0 1rem}table{border-collapse:collapse;width:100%}"
-             "td,th{border-bottom:1px solid #ccc;padding:.4rem;text-align:left}"
-             "code{background:#eee;padding:.1rem .3rem}</style>",
-             f"<h1>{title}</h1>"]
-    if row["superseded_by"]:
-        parts.append("<p>⚠️ This list was superseded by a recovery clone.</p>")
-    if not editable:
-        parts.append(f"<p>Read-only view via share code "
-                     f"<code>{_esc(row['share_code'])}</code></p>")
-    parts.append("<h2>Current cards</h2><table><tr><th>#</th><th>Card</th>"
-                 "<th>Price</th><th>Target</th><th>Note</th></tr>")
-    for e in watchlist_db.current_entries(db, row["id"]):
-        s = watchlist_db.entry_price_summary(db, e)
-        parts.append(
-            f"<tr><td>{e['entry_id']}</td><td>{_esc(e['card_name'])}</td>"
-            f"<td>{_fmt_summary_price(s)}</td>"
-            f"<td>{_fmt_price(e['target_price'])}</td>"
-            f"<td>{_esc(e['note'] or '')}</td></tr>")
-    parts.append("</table><h2>History</h2><table><tr><th>#</th><th>When</th>"
-                 "<th>Action</th><th>Detail</th></tr>")
-    for ev in db.execute("SELECT * FROM events WHERE list_id=? ORDER BY seq DESC",
-                         (row["id"],)):
-        payload = json.loads(ev["payload_json"])
-        detail = payload.get("card_name") or payload.get("label") or ""
-        parts.append(f"<tr><td>{ev['seq']}</td><td>{_esc(ev['ts'])}</td>"
-                     f"<td>{_esc(ev['action'])}</td><td>{_esc(str(detail))}</td></tr>")
-    parts.append("</table><p>Recover any revision in chat: "
-                 "<code>watchlist_clone(at_seq=N)</code></p>")
-    return "".join(parts)
+def _page_int(request, name) -> int:
+    try:
+        return max(1, int(request.query_params.get(name, "1")))
+    except ValueError:
+        return 1
+
+
+def _resolve_page_key(db, key: str):
+    """A page/API key is a passphrase (editable) or a share code (read-only)."""
+    row = watchlist_db.get_list_by_passphrase(db, key)
+    if row is not None:
+        return row, True
+    row = watchlist_db.get_list_by_share(db, key)
+    if row is not None:
+        return row, False
+    return None, False
 
 
 @mcp.custom_route("/w/{passphrase}", methods=["GET"])
 async def watch_page(request: Request):
     db = _wl_db()
     try:
-        row = watchlist_db.get_list_by_passphrase(
-            db, request.path_params["passphrase"])
+        key = request.path_params["passphrase"]
+        row = watchlist_db.get_list_by_passphrase(db, key)
         if row is None:
             return HTMLResponse("unknown passphrase", status_code=404)
-        return HTMLResponse(_render_page(db, row, editable=True))
+        row = dict(row)
+        row["_key"] = key
+        return HTMLResponse(watchlist_pages.render_page(
+            db, row, editable=True,
+            hp=_page_int(request, "hp"), cp=_page_int(request, "cp")))
     finally:
         db.close()
 
@@ -2846,11 +2834,64 @@ async def watch_page(request: Request):
 async def share_page(request: Request):
     db = _wl_db()
     try:
-        row = watchlist_db.get_list_by_share(
-            db, request.path_params["share_code"])
+        key = request.path_params["share_code"]
+        row = watchlist_db.get_list_by_share(db, key)
         if row is None:
             return HTMLResponse("unknown share code", status_code=404)
-        return HTMLResponse(_render_page(db, row, editable=False))
+        row = dict(row)
+        row["_key"] = row["share_code"]
+        return HTMLResponse(watchlist_pages.render_page(
+            db, row, editable=False,
+            hp=_page_int(request, "hp"), cp=_page_int(request, "cp")))
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/revision/{key}/{seq}", methods=["GET"])
+async def api_revision(request: Request):
+    """Snapshot of a list at a revision, for the page's revision modal."""
+    db = _wl_db()
+    try:
+        row, _ = _resolve_page_key(db, request.path_params["key"])
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        try:
+            seq = int(request.path_params["seq"])
+        except ValueError:
+            return JSONResponse({"error": "bad seq"}, status_code=400)
+        state = watchlist_db.state_at(db, row["id"], seq)
+        entries = sorted(state.values(), key=lambda e: e["entry_id"])
+        return JSONResponse({"seq": seq, "label": row["label"],
+                             "entries": entries})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/fork", methods=["POST"])
+async def api_fork(request: Request):
+    """Fork (anyone with a key) or recover (passphrase only) at a revision.
+
+    Non-destructive either way: recovery only marks the source superseded."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        mode = body.get("mode", "fork")
+        if mode == "recover" and not editable:
+            return JSONResponse(
+                {"error": "recovery needs the passphrase, not a share code"},
+                status_code=403)
+        at_seq = body.get("at_seq")
+        new_id, pp, sc = watchlist_db.clone_list(
+            db, row["id"], at_seq=at_seq, recovery=(mode == "recover"))
+        return JSONResponse({
+            "passphrase": pp, "share_code": sc,
+            "url": f"{PUBLIC_BASE}/mcp/{pp}", "page": f"{PUBLIC_BASE}/w/{pp}"})
     finally:
         db.close()
 
