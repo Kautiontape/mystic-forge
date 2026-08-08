@@ -42,6 +42,7 @@ _CSS = """
   --teal:#179299;--green:#40a02b;--red:#d20f39;--yellow:#df8e1d;
   --card:#ffffffcc;--glow1:#8839ef14;--glow2:#fe640b12;--shadow:#4c4f6922;
   --hitbg:#40a02b14;--hitglow:#40a02b33;
+  --green-text:#317717;--yellow-text:#8f6400;--peach-text:#b34605;
 }
 [data-theme=macchiato]{
   --base:#24273a;--mantle:#1e2030;--crust:#181926;--surface0:#363a4f;
@@ -50,6 +51,7 @@ _CSS = """
   --teal:#8bd5ca;--green:#a6da95;--red:#ed8796;--yellow:#eed49d;
   --card:#1e2030cc;--glow1:#c6a0f61a;--glow2:#f5a97f14;--shadow:#00000055;
   --hitbg:#a6da9518;--hitglow:#a6da9540;
+  --green-text:var(--green);--yellow-text:var(--yellow);--peach-text:var(--peach);
 }
 *{box-sizing:border-box;margin:0}
 html{background:var(--base)}   /* real navigations never flash white */
@@ -63,9 +65,10 @@ body{
 body::before{content:"";position:fixed;inset:0 0 auto 0;height:3px;z-index:5;
   background:linear-gradient(90deg,var(--mauve),var(--peach),var(--teal))}
 .wrap{max-width:72rem;margin:0 auto;padding:2.2rem 1.2rem 0}
-header.masthead{display:flex;align-items:center;gap:.7rem;margin-bottom:.4rem}
-h1{font-size:clamp(1.6rem,4vw,2.4rem);font-weight:600;letter-spacing:.01em}
+header.masthead{display:flex;align-items:flex-start;gap:.7rem;margin-bottom:.4rem}
+h1{font-size:clamp(1.6rem,4vw,2.4rem);font-weight:600;letter-spacing:.01em;flex:1 1 auto}
 h1 .rune{color:var(--mauve)}
+h1 .iconbtn{font-size:1.05rem;vertical-align:.35rem;margin-left:.2rem}
 .iconbtn{background:none;border:none;color:var(--sub);cursor:pointer;font-size:1.05rem;
   padding:.25rem;border-radius:.4rem;line-height:1}
 .iconbtn:hover{background:var(--mantle);color:var(--text)}
@@ -73,22 +76,31 @@ h1 .rune{color:var(--mauve)}
 .meta{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;color:var(--sub);
   font-size:.85rem;margin-bottom:1.1rem}
 .meta .mright{margin-left:auto;display:flex;gap:.5rem;align-items:center}
-.chip{font-family:var(--font-data);font-size:.75rem;background:var(--mantle);
-  border:1px solid var(--surface0);border-radius:999px;padding:.15rem .6rem;
-  color:var(--sub);text-decoration:none;display:inline-block}
+.chip{font-family:var(--font-display);font-size:.8rem;background:var(--mantle);
+  border:1px solid var(--surface0);border-radius:999px;padding:.2rem .7rem;
+  color:var(--text);text-decoration:none;display:inline-flex;align-items:center;gap:.25rem}
 button.chip{cursor:pointer}
-.chip:hover{border-color:var(--overlay);color:var(--text)}
+button.chip:hover,a.chip:hover{border-color:var(--overlay)}
+.chip.primary{background:var(--mauve);border-color:var(--mauve);color:var(--base)}
+.chip.primary:hover{filter:brightness(1.08)}
+.shopgrp{display:inline-flex;align-items:center;gap:.4rem}
+.shoplbl{font-size:.8rem;color:var(--sub)}
+.caption{color:var(--sub);font-size:.8rem;margin:-.6rem 0 1.1rem}
+.pagehead{font-size:1.1rem;letter-spacing:.05em;text-transform:uppercase;
+  color:var(--sub);text-align:center;margin-bottom:.6rem}
 .shops{display:inline-flex;border:1px solid var(--surface0);border-radius:999px;overflow:hidden}
 .shops a{font-family:var(--font-data);font-size:.75rem;padding:.18rem .6rem;
-  color:var(--sub);text-decoration:none}
+  color:var(--text);text-decoration:none}
 .shops a.on{background:var(--mauve);color:var(--base)}
 .shops a:not(.on):hover{background:var(--mantle)}
 .verdict{font-family:var(--font-data);font-size:.9rem;background:var(--card);
-  border:1px solid var(--surface0);border-left:3px solid var(--green);
+  border:1px solid var(--surface0);border-left:3px solid var(--surface1);
   border-radius:.8rem;padding:.65rem .95rem;margin-bottom:1rem;
   backdrop-filter:blur(6px);line-height:1.7}
-.verdict .buy{color:var(--green);font-weight:600}
-.verdict .wait{color:var(--yellow);font-weight:600}
+.verdict--buy{border-left-color:var(--green)}
+.verdict--wait{border-left-color:var(--yellow)}
+.verdict .buy{color:var(--green-text);font-weight:600}
+.verdict .wait{color:var(--yellow-text);font-weight:600}
 .verdict .quiet{color:var(--sub)}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(9.5rem,1fr));
   gap:.8rem;margin-bottom:1.6rem}
@@ -117,18 +129,18 @@ button.chip{cursor:pointer}
   vertical-align:2px;margin-left:.35rem;white-space:nowrap}
 .note{font-style:italic;color:var(--sub);font-size:.78rem;margin:.15rem 0 .4rem;min-height:1em}
 .price{font-family:var(--font-data);font-size:1.5rem;font-weight:600;letter-spacing:-.01em}
-.price small{font-size:.7rem;color:var(--peach);font-weight:400}
+.price small{font-size:.7rem;color:var(--peach-text);font-weight:400}
 .deltas{display:flex;gap:.7rem;font-family:var(--font-data);font-size:.75rem;
   color:var(--text);margin:.15rem 0 .35rem;flex-wrap:wrap}
 .deltas .lbl{color:var(--sub)}
 .deltas .pct{color:var(--sub)}
-.dn{color:var(--green)}.up{color:var(--red)}.fl{color:var(--overlay)}
+.dn{color:var(--green-text)}.up{color:var(--red)}.fl{color:var(--sub)}
 .target{font-size:.75rem;color:var(--sub);font-family:var(--font-data)}
-.target.hit{color:var(--green);font-weight:600}
+.target.hit{color:var(--green-text);font-weight:600}
 .spark{width:100%;height:auto;display:block;margin-top:.45rem}
 .spark polyline{stroke-dasharray:1;stroke-dashoffset:1;animation:draw 1.1s .15s forwards ease-out}
 @keyframes draw{to{stroke-dashoffset:0}}
-.nodata{color:var(--overlay);font-size:.78rem;font-style:italic;margin-top:.6rem}
+.nodata{color:var(--sub);font-size:.78rem;font-style:italic;margin-top:.6rem}
 .rail{background:var(--card);border:1px solid var(--surface0);border-radius:1rem;
   padding:1.1rem 1.2rem;backdrop-filter:blur(6px);max-width:44rem;margin:0 auto}
 .rev{display:flex;gap:.55rem;align-items:baseline;padding:.45rem .3rem;border-radius:.5rem;
@@ -141,7 +153,8 @@ button.chip{cursor:pointer}
 .rev .t{color:var(--sub);font-size:.72rem;white-space:nowrap}
 .pager{display:flex;justify-content:center;gap:.8rem;margin-top:.7rem;
   font-family:var(--font-data);font-size:.8rem}
-.pager a{color:var(--blue);text-decoration:none}.pager span{color:var(--sub)}
+.pager a{color:var(--blue);text-decoration:none;padding:.3rem .5rem}
+.pager span{color:var(--sub)}
 dialog{border:1px solid var(--surface1);border-radius:1rem;background:var(--base);
   color:var(--text);max-width:44rem;width:92vw;padding:1.3rem;margin:auto;
   max-height:90vh;overflow:auto;box-shadow:0 20px 60px var(--shadow)}
@@ -156,7 +169,7 @@ dialog .sub{color:var(--sub);font-size:.8rem;margin-bottom:.8rem}
 .sites a{font-family:var(--font-data);font-size:.72rem;border:1px solid var(--surface1);
   border-radius:.45rem;padding:.2rem .55rem;color:var(--sub);text-decoration:none}
 .sites a:hover{border-color:var(--lavender);color:var(--text)}
-.sites a::after{content:" ↗";color:var(--overlay)}
+.sites a::after{content:" ↗";color:var(--sub)}
 .tgtedit{display:flex;gap:.5rem;align-items:center;margin-top:.7rem;flex-wrap:wrap}
 .tgtedit label{font-size:.8rem;color:var(--sub)}
 .tgtedit input,#renameInput{font-family:var(--font-data);font-size:.85rem;
@@ -181,8 +194,10 @@ button.act:hover{filter:brightness(1.08)}
   border-radius:.4rem}
 .xclose:hover{background:var(--mantle);color:var(--text)}
 dialog{position:relative}
-.modalend{display:flex;gap:.6rem;margin-top:.9rem;justify-content:flex-end;
-  align-items:center;flex-wrap:wrap}
+.modalend{display:flex;gap:.6rem;margin-top:.9rem;justify-content:flex-start;
+  align-items:center;flex-wrap:wrap;position:sticky;bottom:-1.3rem;
+  background:var(--base);padding:.6rem 0;z-index:2}
+.modalend #removeBtn{margin-left:auto}
 #addInput{font-family:var(--font-data);font-size:.85rem;width:100%;margin:.5rem 0;
   background:var(--mantle);color:var(--text);border:1px solid var(--surface1);
   border-radius:.45rem;padding:.35rem .5rem}
@@ -195,14 +210,32 @@ footer a{color:var(--sub)}
 .targetline{stroke:var(--peach);stroke-width:1.5;stroke-dasharray:5 4}
 @media(max-width:40rem){
   .wrap{padding:1.3rem .9rem 0}
-  header.masthead{flex-wrap:wrap;gap:.3rem .6rem}
-  h1{flex:1 0 100%;font-size:1.75rem}          /* title gets the full width */
+  h1{font-size:1.75rem}                        /* full width; pencil rides inside */
   .iconbtn{font-size:1.35rem;padding:.45rem .6rem}
   .meta{gap:.55rem .5rem}
-  .meta .mright{margin-left:0}
-  .chip,.shops a{font-size:.85rem;padding:.45rem .75rem}   /* real tap targets */
-  button.act{padding:.65rem 1.1rem}
+  .meta .mright{margin-left:0;width:100%}
+  .shopgrp{width:100%}
+  .shops{display:flex;flex:1}
+  .shops a{flex:1;text-align:center;justify-content:center}
+  /* 44px-rule tap targets: height, not font inflation */
+  .chip,.shops a,.pager a{min-height:2.75rem;display:inline-flex;align-items:center}
+  .shops a{display:flex}
+  button.act{min-height:2.75rem;padding:.65rem 1.1rem}
+  .xclose{padding:.6rem .8rem}
+  .rev{padding:.75rem .3rem;flex-wrap:wrap}
+  .rev .d{flex:1 1 100%;white-space:normal;order:9;padding-left:1.15rem}
+  .pager a{padding:.6rem .8rem}
+  .stats{grid-template-columns:repeat(2,1fr);gap:.6rem}
+  .stat{padding:.55rem .7rem}
+  .stat b{font-size:1.1rem}
+  #addInput,#renameInput,.tgtedit input{font-size:1rem}  /* no iOS zoom-on-focus */
   .tgtedit input{width:8rem;padding:.5rem .6rem}
+  .axis{font-size:20px}                        /* ≈10px rendered at phone width */
+  .badge,.deltas,.rev .a,.sites a,.tip,.boughtnote{font-size:.8rem}
+  dialog{width:100vw;max-width:100vw;margin:auto 0 0;border-radius:1rem 1rem 0 0;
+    max-height:92dvh;padding:1rem}
+  .card::after{content:"›";position:absolute;top:.8rem;right:.9rem;
+    color:var(--sub);font-size:1.1rem}
 }
 """
 
@@ -225,7 +258,9 @@ async function refresh(){
   }catch(e){location.reload()}
 }
 const copyable=c=>c.onclick=e=>{
-  e.stopPropagation();navigator.clipboard.writeText(c.dataset.copy);
+  e.stopPropagation();
+  navigator.clipboard.writeText(c.dataset.copy.startsWith('/')
+    ?location.origin+c.dataset.copy:c.dataset.copy);
   if(!c.style.minWidth){c.style.minWidth=c.getBoundingClientRect().width+'px';
     c.style.textAlign='center'}       // lock width so the row never reflows
   if(!c.dataset.orig)c.dataset.orig=c.textContent;
@@ -248,7 +283,8 @@ function wire(){
   if(themeBtn)themeBtn.onclick=()=>{const h=document.documentElement;
     h.dataset.theme=h.dataset.theme==='latte'?'macchiato':'latte';
     localStorage.setItem('mf-theme',h.dataset.theme);
-    h.style.background=getComputedStyle(document.body).backgroundColor;
+    document.querySelector('meta[name=theme-color]').content=
+      h.dataset.theme==='macchiato'?'#24273a':'#eff1f5';
     themeGlyph();};
   themeGlyph();
   document.querySelectorAll('[data-copy]').forEach(copyable);
@@ -519,9 +555,9 @@ def _big_svg(points, name, cur, target=None, bought_at=None):
         tline = (f'<line class="targetline" x1="{CPAD}" y1="{ty}"'
                  f' x2="{CW - CPAD}" y2="{ty}"/>'
                  f'<text class="axis" x="{CW - CPAD}" y="{ty - 5}"'
-                 f' text-anchor="end" fill="var(--peach)">target {cur}{target:.2f}</text>')
+                 f' text-anchor="end" fill="var(--peach-text)">target {cur}{target:.2f}</text>')
     return (
-        f'<svg viewBox="0 0 {CW} {CH}" style="width:100%;height:auto;touch-action:none" role="img">'
+        f'<svg viewBox="0 0 {CW} {CH}" style="width:100%;height:auto;touch-action:pan-y" role="img">'
         f'<title>{esc(name)} — 90 day price history</title>{grid}{tline}{bline}'
         f'<text class="axis" x="{CPAD}" y="{CPAD - 6}">{cur}{hi:.2f}</text>'
         f'<text class="axis" x="{CPAD}" y="{CH - CPAD + 14}">{cur}{lo:.2f}</text>'
@@ -670,10 +706,13 @@ def _verdict(pairs) -> str:
     if not parts:
         if misses:
             gap, entry, s = min(misses, key=lambda t: t[0])
-            return (f'<div class="verdict"><span class="quiet">No buy windows open — '
-                    f'closest: {esc(entry["card_name"])} ${gap:.2f} above target.</span></div>')
+            return (f'<div class="verdict verdict--quiet"><span class="quiet">'
+                    f'No buy windows open — closest: {esc(entry["card_name"])} '
+                    f'${gap:.2f} above target.</span></div>')
         return ""
-    return '<div class="verdict">' + ' <span class="quiet">·</span> '.join(parts) + "</div>"
+    mood = "verdict--buy" if buys else "verdict--wait"
+    return (f'<div class="verdict {mood}">'
+            + ' <span class="quiet">·</span> '.join(parts) + "</div>")
 
 
 def _pager(base, param, page, total, per, keep=""):
@@ -698,14 +737,17 @@ def _shell(row, editable, body, dialogs, cur="$"):
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
+<meta name="theme-color" content="#eff1f5">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext x='8' y='13' font-size='14' text-anchor='middle' fill='%238839ef'%3E✦%3C/text%3E%3C/svg%3E">
 <title>{title} · Mystic Forge</title>
-<script>document.documentElement.dataset.theme=
-  localStorage.getItem('mf-theme')||
-  (matchMedia('(prefers-color-scheme: dark)').matches?'macchiato':'latte');</script>
+<script>(()=>{{const t=localStorage.getItem('mf-theme')||
+  (matchMedia('(prefers-color-scheme: dark)').matches?'macchiato':'latte');
+document.documentElement.dataset.theme=t;
+document.querySelector('meta[name=theme-color]').content=
+  t==='macchiato'?'#24273a':'#eff1f5';}})();</script>
 <style>{_CSS}</style></head><body>
 <div class="wrap">
-<header class="masthead"><h1><span class="rune">✦</span> {title}</h1>{rename}
+<header class="masthead"><h1><span class="rune">✦</span> {title}{rename}</h1>
 <button class="iconbtn" id="theme" aria-label="Toggle theme"></button></header>
 {body}
 <footer>forged in the Mystic Forge · card price watchlist ·
@@ -750,17 +792,19 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
     page = pairs[(cp - 1) * CARDS_PER_PAGE: cp * CARDS_PER_PAGE]
     cards = "".join(_card_html(db, e, disp_s, h, i, shop, cur)
                     for i, (e, _, disp_s, h, _b) in enumerate(page)) or \
-        '<p class="nodata">Nothing watched yet — use “+ add card” or ask Claude.</p>'
+        '<p class="nodata">Nothing watched yet — use “Add card” or ask Claude.</p>'
 
+    shop_names = {"tcgplayer": "TCGplayer", "cardkingdom": "Card Kingdom",
+                  "cardmarket": "Cardmarket"}
     shop_links = "".join(
-        f'<a href="{base}?shop={s}" class="{"on" if s == shop else ""}">{s}</a>'
+        f'<a href="{base}?shop={s}" class="{"on" if s == shop else ""}">{shop_names[s]}</a>'
         for s in SHOPS)
-    share = (f'<button class="chip" data-copy="{esc(row["share_code"])}" '
-             f'title="Copy this list\'s read-only share code — friends can view it at '
-             f'{base.replace("/w/", "/s/")}">share {esc(row["share_code"])} ⧉</button>'
-             if editable else '<span class="chip">viewing a shared list (read-only)</span>')
+    share_path = f"/s/{esc(row['share_code'])}"
+    share = (f'<button class="chip" data-copy="{share_path}" '
+             f'title="Copy the read-only link (code {esc(row["share_code"])})">'
+             f'Share ⧉</button>' if editable else '<span>Read-only view</span>')
     claim = ('' if editable else
-             '<button class="chip" id="claim">⑂ start my own list from this one</button>')
+             '<button class="chip primary" id="claim">Make my own copy</button>')
     superseded = ('<p class="note">⚠ superseded by a recovery clone — this copy '
                   'is historical.</p>' if row["superseded_by"] else "")
 
@@ -782,8 +826,8 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
     xbtn = '<button class="xclose" aria-label="Close">×</button>'
     dialogs = (f'<dialog id="cardDlg">{xbtn}<h3 id="cardTitle"></h3><p class="sub" id="cardSub"></p>'
                f'<div class="chart-wrap"><div id="chartHost"></div><div class="tip" id="tip"></div></div>'
-               f'<div id="siteHost"></div>{tgt_edit}<div id="snapHost"></div>'
-               f'{modal_actions}</dialog>')
+               f'{tgt_edit}{modal_actions}<div id="siteHost"></div><div id="snapHost"></div>'
+               f'</dialog>')
     topic = watchlist_ingest.ntfy_topic(row["share_code"])
     dialogs += (f'<dialog id="alertsDlg">{xbtn}<h3>Buy-window alerts</h3>'
                 f'<p class="sub">When a card first drops to its target, this list '
@@ -804,7 +848,7 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
         dialogs += (f'<dialog id="addDlg">{xbtn}<h3>Add a card</h3>'
                     '<p class="sub">Paste a Scryfall link to pin that exact printing, '
                     'or type a card name to track its cheapest printing.</p>'
-                    '<input id="addInput" placeholder="https://scryfall.com/card/c21/263/sol-ring — or just: Sol Ring">'
+                    '<input id="addInput" placeholder="Card name or Scryfall link">'
                     '<span class="err" id="addErr"></span>'
                     '<div id="addPreview"></div>'
                     '<div class="btnrow"><button class="act" id="addLookup">Preview</button>'
@@ -814,26 +858,30 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
         dialogs += (f'<dialog id="claimDlg">{xbtn}<h3>Your own watchlist</h3>'
                     '<div id="claimOut"></div></dialog>')
 
-    add_chip = ('<button class="chip" id="addCard">+ add card</button>'
+    add_chip = ('<button class="chip primary" id="addCard">＋ Add card</button>'
                 if editable else "")
-    freshness = (f'<span title="last ingest: {esc(last_ingest)}">prices through '
-                 f'{esc(through)}</span>' if through
-                 else '<span>no price data yet — first ingest tonight</span>')
+    hist_title = ("Every change ever made to this list — inspect or restore any point"
+                  if editable else "See every change made to this list")
+    freshness = (f"Buy prices through {esc(through)}" if through
+                 else "No price data yet — first ingest tonight")
+    usd_note = (" · targets always compare against TCGplayer USD"
+                if shop != "tcgplayer" else "")
+    net_cls = "dn" if net7 < 0 else "up" if net7 > 0 else "fl"
     body = f"""
-<div class="meta">{share}{add_chip}{claim}
-<span class="shops">{shop_links}</span>
-<span title="These are buy prices — falling (▼, green) is good news">▼ = getting cheaper</span>
-{freshness}
-<span class="mright"><button class="chip" id="alerts">🔔 alerts</button>
-<a class="chip" href="{base}/history{qshop}" title="Every change ever made to this list — inspect or restore any point">history</a></span></div>
+<div class="meta">{add_chip}{share}{claim}
+<span class="shopgrp"><span class="shoplbl">prices:</span><span class="shops">{shop_links}</span></span>
+<span class="mright"><button class="chip" id="alerts">Alerts</button>
+<a class="chip" href="{base}/history{qshop}" title="{hist_title}">History</a></span></div>
 {superseded}
 {_verdict([(e, bs, h) for e, bs, _, h, b in pairs if not b])}
 <div class="stats">
 <div class="stat"><b>{hits}</b><span>buy windows</span></div>
-<div class="stat"><b>{"▼" if net7 < 0 else "▲" if net7 > 0 else "·"}{cur}{abs(net7):.2f}</b><span>7-day net</span></div>
+<div class="stat" title="sum of 7-day changes — down is good">
+<b><span class="{net_cls}">{"▼" if net7 < 0 else "▲" if net7 > 0 else "·"}</span>{cur}{abs(net7):.2f}</b><span>7-day net</span></div>
 <div class="stat"><b>{cur}{total_val:.2f}</b><span>list total</span></div>
 <div class="stat"><b>{len(entries)}</b><span>cards</span></div>
 </div>
+<p class="caption">{freshness} · ▼ green = cheaper · ▲ red = pricier (these are buy prices){usd_note}</p>
 <div class="grid">{cards}</div>
 {_pager(base, "cp", cp, len(entries), CARDS_PER_PAGE, keep=keep)}"""
     return _shell(row, editable, body, dialogs, cur)
@@ -895,10 +943,15 @@ def render_history(db, row, editable: bool, hp: int = 1,
                f'<div id="revBody"></div><div id="forkOut"></div>'
                f'<div class="btnrow"><button class="act primary" id="forkBtn">⑂ Fork this revision</button>'
                f'{recover_btn}<button class="act close">Close</button></dialog>')
+    intro = ("every change, newest first — nothing is ever deleted. Tap a "
+             "revision to view, copy it, or restore it."
+             if editable else
+             "every change made to this list, newest first — tap one to view "
+             "or copy it.")
     body = f"""
-<div class="meta"><a class="chip" href="{base}{qshop}">← back to the board</a>
-<span>every change to this list, oldest to newest, nothing ever deleted ·
-click a revision to see the list as it was, copy it, or restore it</span></div>
+<div class="meta"><a class="chip" href="{base}{qshop}">← Back to board</a>
+<span>{intro}</span></div>
+<h2 class="pagehead">History</h2>
 <div class="rail">{revs}
 {_pager(base + "/history", "hp", hp, total_ev, EVENTS_PER_PAGE,
         keep=qshop.replace("?", "&") if qshop else "")}</div>"""

@@ -45,6 +45,7 @@ def test_watch_page_shows_list(db_path):
     assert "&lt;script&gt;alert(1)" in r.text
     assert 'class="rev"' not in r.text        # history lives in its own view
     assert "/history" in r.text               # ...linked from the board
+    assert f"/s/{pp}" not in r.text           # passphrase never leaks in share hints
 
 
 def test_watch_page_404_on_bad_passphrase(db_path):
@@ -221,7 +222,7 @@ def test_hits_sort_before_misses(db_path):
     with client() as c:
         page = c.get(f"/w/{pp}").text
     assert page.index("Hit One") < page.index("Miss One")
-    assert 'class="verdict"' in page and "BUY" in page
+    assert 'class="verdict verdict--buy"' in page and "BUY" in page
 
 
 def test_freshness_shows_price_date_not_ingest_date(db_path):
@@ -245,8 +246,8 @@ def test_share_page_offers_claim_and_owner_page_does_not(db_path):
     with client() as c:
         share = c.get(f"/s/{sc}").text
         own = c.get(f"/w/{pp}").text
-    assert "start my own list" in share
-    assert "start my own list" not in own
+    assert "Make my own copy" in share
+    assert "Make my own copy" not in own
     assert 'id="renameDlg"' in own and 'id="renameDlg"' not in share
     assert "prompt(" not in own                # bespoke dialog, not browser chrome
 
