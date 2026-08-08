@@ -533,10 +533,26 @@ def render_history(db, row, editable: bool, hp: int = 1) -> str:
     events = db.execute(
         "SELECT * FROM events WHERE list_id=? ORDER BY seq DESC LIMIT ? OFFSET ?",
         (row["id"], EVENTS_PER_PAGE, (hp - 1) * EVENTS_PER_PAGE)).fetchall()
+    # set_target/set_note/remove payloads carry only entry_id — resolve the
+    # card name through the add event that minted that entry (entry_id == seq).
+    adds = {ev["seq"]: json.loads(ev["payload_json"]).get("card_name", "")
+            for ev in db.execute(
+                "SELECT seq, payload_json FROM events WHERE list_id=?"
+                " AND action='add'", (row["id"],))}
+
+    def _detail(ev, payload):
+        d = payload.get("card_name") or payload.get("label") or ""
+        if not d and payload.get("entry_id") in adds:
+            d = adds[payload["entry_id"]]
+            if ev["action"] == "set_target":
+                tp = payload.get("target_price")
+                d += " → no target" if tp is None else f" → ${tp:.2f}"
+        return d
+
     revs = "".join(
         f'<div class="rev" data-seq="{ev["seq"]}"><span class="n">#{ev["seq"]}</span>'
-        f'<span class="a">{esc(ev["action"])}</span>'
-        f'<span class="d">{esc(json.loads(ev["payload_json"]).get("card_name") or json.loads(ev["payload_json"]).get("label") or "")}</span>'
+        f'<span class="a">{esc(ev["action"].replace("_", " "))}</span>'
+        f'<span class="d">{esc(_detail(ev, json.loads(ev["payload_json"])))}</span>'
         f'<span class="t">{_ago(ev["ts"])}</span></div>'
         for ev in events)
     recover_btn = ('<button class="act" id="recoverBtn">Restore here (supersede)</button>'

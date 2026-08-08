@@ -94,6 +94,18 @@ def test_history_view_pagination(db_path):
     assert "#1</span>" in p2
 
 
+def test_history_resolves_entry_names_for_target_events(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    seq, _ = watchlist_db.add_card(db, list_id, "Sol Ring")
+    watchlist_db.set_entry_target(db, list_id, seq, 2.5)
+    db.close()
+    with client() as c:
+        r = c.get(f"/w/{pp}/history").text
+    assert "set target" in r
+    assert "Sol Ring → $2.50" in r
+
+
 def test_share_history_view_has_no_restore(db_path):
     db = watchlist_db.connect(db_path)
     _, _, sc = watchlist_db.create_list(db)
