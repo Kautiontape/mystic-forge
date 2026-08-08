@@ -45,6 +45,20 @@ A unified MCP (Model Context Protocol) server for Magic: The Gathering. Combines
 | `precon_export` | Export a precon in Archidekt import format |
 | `precon_diff` | Exact cut/added cards between a precon and a specific deck |
 
+### Goldfish — Deck Simulation
+| Tool | Description |
+|---|---|
+| `goldfish_annotate` | Pre-flight a deck: auto-derive card effects, list only the cards needing a manual annotation |
+| `goldfish_run` | Seeded Monte Carlo goldfish stats with 95% CIs and an honesty report |
+| `goldfish_ab` | Paired A/B of two lists: per-metric deltas ± CI with significance flags |
+| `goldfish_odds` | Exact hypergeometric draw odds (flat or multi-group joint) |
+| `goldfish_report` | Self-contained HTML report of a stored run, rendered verbatim from its metrics |
+| `goldfish_start` | Start an interactive seeded game (or resume one from a state blob) |
+| `goldfish_step` | Advance an interactive game: policy step, explicit action, or fast-forward |
+| `goldfish_state` | Current state and legal actions of an interactive game |
+
+Workflow: run `goldfish_annotate` on the deck first — it auto-derives what the engine models on its own and hands back the short list of cards that need a manual annotation. Pass those annotations to `goldfish_run` (or `goldfish_ab` for a paired swap comparison), then publish the numbers with `goldfish_report` — reports are rendered from the stored run's metrics, never hand-authored. Goldfish sims measure speed and consistency only; they cannot value interaction. For hosted reports, set `GOLDFISH_REPORT_DIR` to persist each run's HTML (served at `/goldfish/r/<run_code>`), and `GOLDFISH_PUBLIC_BASE_URL` to have run outputs include the public report link; leave both unset and reports are served from memory via `goldfish_report` only.
+
 ## Quick Start
 
 ### Docker

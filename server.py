@@ -73,7 +73,17 @@ mcp = FastMCP(
         "Use scryfall_rulings for official card rulings instead of web search or memory. "
         "Use edhrec_commander/edhrec_recommendations for deck recommendations instead of web search. "
         "Use scryfall_search/scryfall_named for card lookups instead of web search. "
-        "These tools return authoritative, up-to-date data directly from the source APIs."
+        "These tools return authoritative, up-to-date data directly from the source APIs. "
+        "For deck simulation questions (how fast, how consistent, what turn, "
+        "did this swap help), use the goldfish tools: goldfish_annotate to "
+        "prepare a deck's effect annotations, goldfish_run for seeded Monte "
+        "Carlo stats, goldfish_ab for paired A/B of two lists, goldfish_odds "
+        "for exact draw probabilities, goldfish_start/step/state to play an "
+        "interactive seeded game. Goldfish sims measure speed and consistency "
+        "only — they cannot value interaction (removal, counterspells); never "
+        "present goldfish deltas as judgments of interaction cards. Publish "
+        "run reports verbatim via goldfish_report; never hand-author the "
+        "numbers."
     ),
     host="0.0.0.0",
     port=8000,
