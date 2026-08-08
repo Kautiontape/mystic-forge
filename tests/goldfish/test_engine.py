@@ -1441,3 +1441,133 @@ def test_legal_actions_includes_attach_and_activate_in_pinned_order():
         {"type": "activate", "card": boss.id, "ability": 0},
         {"type": "pass"},
     ]
+
+
+# -- Task 8 review fixes: tap-reservation, self-attach, id cap, re-equip -----
+
+def test_activation_cannot_fund_its_own_tap_cost_from_itself():
+    # Reviewer repro: a lone land that produces {C} with a "{T}{C}: draw"
+    # ability must NOT be able to tap itself for the {T} symbol and also
+    # supply the {C} pip from its own mana ability in the same activation.
+    cards = mini_cards()
+    cards["Temple"] = SimCard(data=make_data("Temple", types=frozenset({"land"}),
+                              produces={"C": 1}), ann=None, scope_class=None)
+    annotated(cards, "Temple", {"name": "Temple", "activated": [
+        {"cost": "{T}{C}", "do": "draw", "count": 1}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    temple = g.new_perm("Temple")
+    before = len(g.hand)
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "activate", "card": temple.id, "ability": 0})
+    assert len(g.hand) == before
+    assert temple.tapped is False               # reservation restored on failure
+    assert not any(a["type"] == "activate" for a in legal_actions(g))
+
+    # a second real {C} producer makes the same activation legal
+    g2 = started(cards, ["Plains"] * 40, hand=[])
+    temple_a = g2.new_perm("Temple")
+    temple_b = g2.new_perm("Temple")
+    before2 = len(g2.hand)
+    assert any(a == {"type": "activate", "card": temple_a.id, "ability": 0}
+               for a in legal_actions(g2))
+    step(g2, {"type": "activate", "card": temple_a.id, "ability": 0})
+    assert temple_a.tapped and temple_b.tapped   # {T} on a, {C} paid by b
+    assert len(g2.hand) == before2 + 1
+
+
+def test_attach_self_attach_rejected():
+    # Only exercisable by an equipment that is also creature-typed (a living
+    # weapon); the eq.id == tgt.id guard must reject it before either the
+    # "is equipment" or "is a creature" check would otherwise let it through.
+    cards = mini_cards()
+    cards["LivingBlade"] = SimCard(data=make_data(
+        "LivingBlade", cost=parse_cost("{2}"),
+        types=frozenset({"artifact", "equipment", "creature"}),
+        power=0, toughness=0, equip_cost=parse_cost("{1}")),
+        ann=None, scope_class=None)
+    g = started(cards, ["Plains"] * 40, hand=[])
+    blade = g.new_perm("LivingBlade")
+    snap = g.to_dict()
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "attach", "card": blade.id, "target": blade.id})
+    assert g.to_dict() == snap
+
+
+def test_resolve_perm_ambiguity_caps_candidate_list_at_eight():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    bears = [g.new_perm("Bear") for _ in range(12)]
+    ham = g.new_perm("Hammer")
+    with pytest.raises(IllegalAction) as exc:
+        step(g, {"type": "attach", "card": ham.id, "target": "Bear"})
+    msg = str(exc.value)
+    for b in bears[:8]:
+        assert b.id in msg
+    for b in bears[8:]:
+        assert b.id not in msg
+    assert "and 4 more" in msg
+
+
+def test_legal_actions_skips_reequip_current_bearer_pair():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    bear = g.new_perm("Bear")
+    boss = g.new_perm("Boss")
+    ham = g.new_perm("Hammer")
+    ham.attached_to = bear.id
+    bear.attached.append(ham.id)
+    attaches = [a for a in legal_actions(g) if a["type"] == "attach"]
+    assert attaches == [{"type": "attach", "card": ham.id, "target": boss.id}]
+
+
+def test_reattach_to_current_bearer_is_legal_and_not_duplicated():
+    # Excluded from legal_actions (previous test) but still a legal explicit
+    # action: it re-pays the equip cost and leaves no duplicate entry.
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    bear = g.new_perm("Bear")
+    ham = g.new_perm("Hammer")
+    for _ in range(16):
+        g.new_perm("Plains")
+    step(g, {"type": "attach", "card": ham.id, "target": bear.id})
+    assert bear.attached == [ham.id]
+    tapped_after_first = sum(1 for p in g.battlefield if p.tapped)
+    step(g, {"type": "attach", "card": ham.id, "target": bear.id})
+    assert bear.attached == [ham.id]             # no duplicate
+    assert ham.attached_to == bear.id
+    tapped_after_second = sum(1 for p in g.battlefield if p.tapped)
+    assert tapped_after_second == tapped_after_first + 8   # re-paid the cost
+
+
+def test_legal_actions_excludes_activate_when_tapped_sick_or_unpayable():
+    cards = mini_cards()
+    annotated(cards, "Bear", {"name": "Bear", "activated": [
+        {"cost": "{T}", "do": "draw", "count": 1}]})
+    annotated(cards, "Boss", {"name": "Boss", "activated": [
+        {"cost": "{2}{W}", "do": "draw", "count": 1}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    tapped_bear = g.new_perm("Bear")
+    g.turn += 1                                  # tapped_bear no longer sick
+    tapped_bear.tapped = True                    # but tapped -> {T} blocked
+    sick_bear = g.new_perm("Bear")                # arrives this (new) turn: sick
+    g.new_perm("Boss")                            # untapped, not sick, unpayable
+    assert sick_bear.tapped is False
+    acts = [a for a in legal_actions(g) if a["type"] == "activate"]
+    assert acts == []
+
+
+def test_activate_non_tap_ability_legal_on_tapped_permanent():
+    cards = mini_cards()
+    annotated(cards, "Bear", {"name": "Bear", "activated": [
+        {"cost": "{1}{G}", "do": "gain_life", "count": 2}]})
+    cards["Forest"] = SimCard(data=make_data("Forest", types=frozenset({"land"}),
+                              produces={"G": 1}), ann=None, scope_class=None)
+    g = started(cards, ["Plains"] * 40, hand=[])
+    bear = g.new_perm("Bear")
+    bear.tapped = True                            # already tapped; no {T} in cost
+    g.new_perm("Forest"); g.new_perm("Plains")
+    assert any(a == {"type": "activate", "card": bear.id, "ability": 0}
+               for a in legal_actions(g))
+    step(g, {"type": "activate", "card": bear.id, "ability": 0})
+    assert g.life_gained == 2
+    assert bear.tapped is True                    # unaffected by the ability

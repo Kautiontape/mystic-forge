@@ -749,11 +749,16 @@ def _cast_cost(g: Game, card: SimCard, tax: int) -> Cost:
     return Cost(pips)
 
 
+_MAX_CANDIDATE_IDS = 8      # ambiguity-error id list cap; see _resolve_perm
+
+
 def _resolve_perm(g: Game, ref) -> Permanent:
     """Resolve an attach/activate `card`/`target` reference: battlefield
     instance id first, else a unique permanent name (spec §Interactive mode).
-    Ambiguous names raise IllegalAction listing every candidate id; a ref
-    matching neither an id nor exactly one name raises IllegalAction."""
+    Ambiguous names raise IllegalAction listing candidate ids (capped at
+    _MAX_CANDIDATE_IDS, "... and N more" beyond that so a token-flooded army
+    of same-named tokens can't blow up the error message); a ref matching
+    neither an id nor exactly one name raises IllegalAction."""
     if not isinstance(ref, str):
         raise IllegalAction(f"permanent reference must be a string, got {ref!r}")
     for p in g.battlefield:
@@ -764,7 +769,10 @@ def _resolve_perm(g: Game, ref) -> Permanent:
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        ids = ", ".join(p.id for p in matches)
+        shown = matches[:_MAX_CANDIDATE_IDS]
+        ids = ", ".join(p.id for p in shown)
+        if len(matches) > _MAX_CANDIDATE_IDS:
+            ids += f", … and {len(matches) - _MAX_CANDIDATE_IDS} more"
         raise IllegalAction(f"ambiguous name {ref!r}; candidates: {ids}")
     raise IllegalAction(f"no permanent matching {ref!r}")
 
@@ -803,9 +811,21 @@ def _activation_tap_ok(g: Game, perm: Permanent) -> bool:
 
 
 def _ability_payable(g: Game, perm: Permanent, ability) -> bool:
-    """Combined legality for `legal_actions`: {T} part (if any) plus mana."""
-    if ability.tap and not _activation_tap_ok(g, perm):
-        return False
+    """Combined legality for `legal_actions`: {T} part (if any) plus mana.
+    Mirrors _step_activate's tap-before-planning fix: while ability.tap,
+    perm is reserved (marked tapped) before pricing the mana part so it can't
+    be counted as its own producer — untapped_producers() only sees untapped
+    permanents, and a {T} ability's own tap is spent on the {T} symbol, not
+    still available to fund the rest of the cost."""
+    if ability.tap:
+        if not _activation_tap_ok(g, perm):
+            return False
+        was_tapped = perm.tapped
+        perm.tapped = True
+        try:
+            return can_pay(g, ability.mana)
+        finally:
+            perm.tapped = was_tapped
     return can_pay(g, ability.mana)
 
 
@@ -914,6 +934,8 @@ def _step_attach(g: Game, action: dict):
         raise IllegalAction(f"cannot attach during {g.phase}")
     eq = _resolve_perm(g, action.get("card"))
     tgt = _resolve_perm(g, action.get("target"))
+    if eq.id == tgt.id:
+        raise IllegalAction(f"{eq.name!r} cannot equip itself")
     eq_card = g.card(eq.name)
     if not eq_card.is_equipment:
         raise IllegalAction(f"{eq.name!r} is not equipment")
@@ -927,6 +949,11 @@ def _step_attach(g: Game, action: dict):
     if not free:
         pay(g, cost)
     if eq.attached_to is not None:
+        # M3 escape hatch: eq.attached_to only ever dangles (no matching
+        # battlefield id) if a resume blob was hand-tampered — the engine's
+        # own paths always keep both directions in sync — and g.perm() would
+        # raise here *after* pay() already tapped mana; Task 20's resume-state
+        # validation is the real fix for that corrupted-input case, not this.
         g.perm(eq.attached_to).attached.remove(eq.id)
     _do_attach(g, eq, tgt)
 
@@ -950,12 +977,26 @@ def _step_activate(g: Game, action: dict):
         raise IllegalAction(
             f"{perm.name!r} cannot activate a {{T}} ability now "
             f"(tapped or summoning sick)")
-    if not can_pay(g, ability.mana):
+    if ability.tap:
+        # Reserve the tap BEFORE pricing the mana part: a {T} ability must
+        # not be able to fund its own cost by tapping this same permanent for
+        # mana (repro: a land that produces {C} with a "{T}{C}: draw" ability
+        # — the {T} symbol spends the permanent, so it can't also act as a
+        # mana source for the same activation). untapped_producers() only
+        # considers untapped permanents, so flipping this early removes perm
+        # from the solver's candidate pool; restored on a payment failure so
+        # step() leaves the game unmutated on IllegalAction.
+        perm.tapped = True
+        try:
+            if not can_pay(g, ability.mana):
+                raise IllegalAction(f"cannot pay activation cost for {perm.name!r}")
+        except IllegalAction:
+            perm.tapped = False
+            raise
+    elif not can_pay(g, ability.mana):
         raise IllegalAction(f"cannot pay activation cost for {perm.name!r}")
     # --- all checks passed; mutation begins ---
     pay(g, ability.mana)
-    if ability.tap:
-        perm.tapped = True
     g.emit(f"activated {perm.name} ability {idx}")   # cause precedes the verb's effects
     execute_verb(g, perm, ability.do, count=ability.count, target=ability.target,
                 power=ability.power, toughness=ability.toughness,
@@ -1011,8 +1052,9 @@ def legal_actions(g: Game) -> list:
     order: playable land names (deduped, name-sorted), castable spells sorted
     by (mv, name) — including the commander with tax and reductions applied —
     then attach pairs (every equipment x creature combo on the battlefield,
-    sorted by (eq id, target id) numerically — not payability-filtered per
-    spec: "list pairs, it's fine"), then payable + untapped-eligible
+    excluding an equipment's current bearer — see legal_actions body — sorted
+    by (eq id, target id) numerically; not payability-filtered per spec:
+    "list pairs, it's fine"), then payable + untapped-eligible
     activated-ability entries (sorted by (perm id, ability index)), then
     pass. Attack (Task 9) entries arrive in a later task; mulligan-phase
     actions in Task 10."""
@@ -1039,7 +1081,12 @@ def legal_actions(g: Game) -> list:
                     for n in sorted(castable, key=lambda n: (g.card(n).mv, n))]
         equipment = [p for p in g.battlefield if g.card(p.name).is_equipment]
         creatures = [p for p in g.battlefield if _is_creature_perm(g, p)]
-        pairs = sorted(((eq, tgt) for eq in equipment for tgt in creatures),
+        # eq.attached_to == tgt.id (re-equipping the current bearer) is a
+        # legal action via step() but is skipped here: it's a costed no-op
+        # that a naive consumer looping over legal_actions under a free-equip
+        # static could re-fire forever without changing game state.
+        pairs = sorted(((eq, tgt) for eq in equipment for tgt in creatures
+                        if eq.attached_to != tgt.id),
                        key=lambda pair: (int(pair[0].id[1:]), int(pair[1].id[1:])))
         actions += [{"type": "attach", "card": eq.id, "target": tgt.id}
                     for eq, tgt in pairs]
