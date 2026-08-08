@@ -121,9 +121,10 @@ class Game:
             "opponents": [{"life": l, "cmdr_dmg": d}
                           for l, d in zip(self.opponents, self.cmdr_damage)],
             "won_turn": self.won_turn,
-            "combos": self.combos, "combo_wins": self.combo_wins,
-            "combo_assembled_turn": self.combo_assembled_turn,
-            "combo_castable_turn": self.combo_castable_turn,
+            "combos": [list(c) for c in self.combos],
+            "combo_wins": list(self.combo_wins),
+            "combo_assembled_turn": list(self.combo_assembled_turn),
+            "combo_castable_turn": list(self.combo_castable_turn),
             "rng_state": _rng_state_to_json(self.rng.getstate()),
             "log": list(self.log), "next_id": self._next_id,
         }
@@ -146,7 +147,7 @@ class Game:
                 combats_done=d["combats_done"], extra_combats=d["extra_combats"],
                 mulligans_taken=d["mulligans_taken"],
                 free_mulligan_used=d["free_mulligan_used"],
-                won_turn=d["won_turn"], combos=list(d["combos"]),
+                won_turn=d["won_turn"], combos=[list(c) for c in d["combos"]],
                 combo_wins=list(d["combo_wins"]),
                 combo_assembled_turn=list(d["combo_assembled_turn"]),
                 combo_castable_turn=list(d["combo_castable_turn"]))
@@ -178,7 +179,7 @@ def new_game(cards: dict, deck: list, commander: str, seed: int,
              combos=list(combos or []))
     g.combo_wins = [bool(c.get("wins")) if isinstance(c, dict) else False
                     for c in g.combos]
-    g.combos = [c["cards"] if isinstance(c, dict) else list(c) for c in g.combos]
+    g.combos = [list(c["cards"]) if isinstance(c, dict) else list(c) for c in g.combos]
     g.combo_assembled_turn = [None] * len(g.combos)
     g.combo_castable_turn = [None] * len(g.combos)
     g.rng = rng

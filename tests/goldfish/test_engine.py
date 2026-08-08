@@ -1,3 +1,5 @@
+import json
+
 from goldfish.cards import SimCard, parse_cost
 from goldfish.engine import Game, derive_seed, new_game
 from tests.goldfish.test_cards import make_data  # reuse the factory
@@ -40,9 +42,45 @@ def test_new_game_shuffles_and_draws_seven():
 
 def test_state_roundtrip():
     cards = mini_cards()
-    g = new_game(cards, ["Plains"] * 40, commander="Boss", seed=3)
+    combos_arg = [{"cards": ["Plains", "Boss"], "wins": True}]
+    g = new_game(cards, ["Plains"] * 40, commander="Boss", seed=3, combos=combos_arg)
     g.rng.random()                                              # advance rng
-    blob = g.to_dict()
+    g.turn = 3
+    p = g.new_perm("Hammer", attached=["b1"], pump_eot=[1, 2], pump_perm=[3, 4],
+                   is_token=True, token_power=5, token_toughness=6,
+                   token_keywords=("trample",))
+    g.emit("equipped Hammer")
+
+    raw_blob = g.to_dict()                                      # pre-mutation snapshot
+    blob = json.loads(json.dumps(raw_blob))                     # actual JSON round trip
     g2 = Game.from_dict(blob, cards)
-    assert g2.rng.random() == g.rng.random()                    # rng state travels
-    assert g2.hand == g.hand and g2.turn == g.turn
+
+    # (a) field-by-field equality, including the new permanent's tracked state
+    assert g2.turn == g.turn == 3
+    assert g2.phase == g.phase
+    assert g2.hand == g.hand
+    assert g2.library == g.library
+    assert g2.log == g.log
+    assert g2.combos == g.combos == [["Plains", "Boss"]]
+    assert g2.combo_wins == g.combo_wins == [True]
+    assert g2.combo_assembled_turn == g.combo_assembled_turn == [None]
+    assert g2.combo_castable_turn == g.combo_castable_turn == [None]
+    assert len(g2.battlefield) == len(g.battlefield) == 1
+    p2 = g2.battlefield[0]
+    assert p2 == p
+    assert p2.attached == p.attached == ["b1"]
+    assert p2.pump_eot == p.pump_eot == [1, 2]
+    assert p2.pump_perm == p.pump_perm == [3, 4]
+    assert p2.is_token is p.is_token is True
+    assert p2.token_power == p.token_power == 5
+    assert p2.token_toughness == p.token_toughness == 6
+    assert p2.token_keywords == p.token_keywords == ("trample",)
+    assert g2.rng.getstate() == g.rng.getstate()                # rng state travels
+
+    # (b) aliasing regression guard: mutating the original game's combo
+    # tracking list, and the caller's combos argument, after to_dict() was
+    # called must NOT retroactively change the already-produced blob.
+    g.combo_assembled_turn[0] = 3
+    combos_arg[0]["cards"].append("Mountain")
+    assert raw_blob["combo_assembled_turn"] == [None]
+    assert raw_blob["combos"] == [["Plains", "Boss"]]
