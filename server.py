@@ -3041,7 +3041,9 @@ async def watch_page(request: Request):
         return HTMLResponse(watchlist_pages.render_main(
             db, row, editable=True, cp=_page_int(request, "cp"),
             shop=request.query_params.get("shop", "tcgplayer"),
-            filling=filling))
+            filling=filling,
+            sort=request.query_params.get("sort", "target"),
+            show_bought=request.query_params.get("bought") != "hide"))
     finally:
         db.close()
 
@@ -3116,7 +3118,9 @@ async def share_page(request: Request):
         return HTMLResponse(watchlist_pages.render_main(
             db, row, editable=False, cp=_page_int(request, "cp"),
             shop=request.query_params.get("shop", "tcgplayer"),
-            filling=filling))
+            filling=filling,
+            sort=request.query_params.get("sort", "target"),
+            show_bought=request.query_params.get("bought") != "hide"))
     finally:
         db.close()
 

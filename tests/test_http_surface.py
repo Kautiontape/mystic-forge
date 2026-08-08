@@ -277,6 +277,85 @@ def test_shop_survives_history_roundtrip(db_path):
     assert f'href="{px}/w/{pp}?shop=cardmarket"' in hist
 
 
+def _sorting_fixture(db_path):
+    """Four cards with distinct signals + one bought.
+
+    Alpha  $10, target 12 → hit  (distance -2)
+    Beta   $30, target 31 → near (distance -? no: +... 30-31=-1 hit!) —
+           use target 28 → distance +2 (near miss)
+    Gamma  $5,  no target, d7 -4 (biggest drop), d30 -1
+    Delta  $50, no target, d7 +1, d30 -20 (biggest 30d drop)
+    Omega  bought, $1
+    """
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    prices = {"Alpha": (10, 12.0), "Beta": (30, 28.0),
+              "Gamma": (5, None), "Delta": (50, None), "Omega": (1, None)}
+    for name, (cur, tgt) in prices.items():
+        seq, _ = watchlist_db.add_card(db, list_id, name, target_price=tgt)
+        u = f"u-{name}"
+        db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES (?,?)",
+                   (name, u))
+        d7ref = {"Gamma": cur + 4, "Delta": cur - 1}.get(name, cur)
+        d30ref = {"Gamma": cur + 1, "Delta": cur + 20}.get(name, cur)
+        watchlist_db.upsert_price(db, u, "2026-07-09", "tcgplayer", "normal", d30ref)
+        watchlist_db.upsert_price(db, u, "2026-08-01", "tcgplayer", "normal", d7ref)
+        watchlist_db.upsert_price(db, u, "2026-08-08", "tcgplayer", "normal", cur)
+        if name == "Omega":
+            watchlist_db.set_bought(db, list_id, seq)
+    db.close()
+    return pp
+
+
+def _order(page, names):
+    return sorted(names, key=lambda n: page.index(f"<h3>{n}"))
+
+
+def test_sort_default_is_distance_to_target_bought_last(db_path):
+    pp = _sorting_fixture(db_path)
+    with client() as c:
+        page = c.get(f"/w/{pp}").text
+    order = _order(page, ["Alpha", "Beta", "Gamma", "Delta", "Omega"])
+    assert order[0] == "Alpha"            # hit: below target
+    assert order[1] == "Beta"             # nearest above target
+    assert order[-1] == "Omega"           # bought always last
+    assert 'class="sortbar"' in page and ">near target</a>" in page
+
+
+def test_sort_variants(db_path):
+    pp = _sorting_fixture(db_path)
+    with client() as c:
+        cheap = c.get(f"/w/{pp}?sort=price").text
+        d7 = c.get(f"/w/{pp}?sort=d7").text
+        d30 = c.get(f"/w/{pp}?sort=d30").text
+        age = c.get(f"/w/{pp}?sort=age").text
+        bogus = c.get(f"/w/{pp}?sort=banana").text
+    live = ["Alpha", "Beta", "Gamma", "Delta"]
+    assert _order(cheap, live)[0] == "Gamma"          # $5 cheapest
+    assert _order(cheap, live + ["Omega"])[-1] == "Omega"
+    assert _order(d7, live)[0] == "Gamma"             # -4 biggest 7d drop
+    assert _order(d30, live)[0] == "Delta"            # -20 biggest 30d drop
+    assert _order(age, live)[0] == "Delta"            # newest add first
+    assert _order(bogus, live)[0] == "Alpha"          # unknown → default
+
+
+def test_bought_toggle_hides_and_shows(db_path):
+    pp = _sorting_fixture(db_path)
+    with client() as c:
+        shown = c.get(f"/w/{pp}").text
+        hidden = c.get(f"/w/{pp}?bought=hide").text
+    assert "<h3>Omega" in shown and "hide bought (1)" in shown
+    assert "<h3>Omega" not in hidden and "show bought (1)" in hidden
+    assert "bought=hide" in hidden        # state preserved in view links
+
+
+def test_sort_state_survives_shop_switch(db_path):
+    pp = _sorting_fixture(db_path)
+    with client() as c:
+        page = c.get(f"/w/{pp}?sort=d7&bought=hide").text
+    assert f"/w/{pp}?sort=d7&shop=cardkingdom&bought=hide" in page
+
+
 def test_mint_throttle_limits_new_lists(db_path, monkeypatch):
     """Spec mitigation: a public no-auth URL can't be farmed for lists."""
     import server as srv

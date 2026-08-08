@@ -99,6 +99,8 @@ button.chip:hover{border-color:var(--overlay)}
 .shoplbl{font-size:.8rem;color:var(--sub)}
 .pagehead{font-size:1.1rem;letter-spacing:.05em;text-transform:uppercase;
   color:var(--sub);text-align:center;margin-bottom:.6rem}
+.sortbar{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;
+  margin:-.5rem 0 .9rem}
 .shops{display:inline-flex;gap:.1rem}           /* view tabs, not buttons */
 .shops a{font-family:var(--font-ui);font-size:.82rem;padding:.3rem .55rem;
   color:var(--sub);text-decoration:none;border-bottom:2px solid transparent}
@@ -806,15 +808,53 @@ document.querySelector('meta[name=theme-color]').content=
 </body></html>"""
 
 
+SORTS = (("target", "near target"), ("age", "newest"), ("price", "cheapest"),
+         ("d7", "7d drop"), ("d30", "30d drop"))
+_INF = float("inf")
+
+
+def _sort_key(sort, e, base_s, disp_s):
+    """Ordering value, smaller first. No-signal entries sink (never above
+    priced/targeted ones); bought partitioning happens outside."""
+    if sort == "age":
+        return -e["entry_id"]                       # newest added first
+    if sort == "price":
+        return disp_s["current"] if disp_s else _INF
+    if sort == "d7":
+        return disp_s["d7"] if disp_s and disp_s["d7"] is not None else _INF
+    if sort == "d30":
+        return disp_s["d30"] if disp_s and disp_s["d30"] is not None else _INF
+    # default "target": USD distance to target — buy windows go negative,
+    # so "target met first" falls out of the same ordering.
+    if base_s and e.get("target_price") is not None:
+        return base_s["current"] - e["target_price"]
+    return _INF
+
+
 def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
-                filling: bool = False) -> str:
+                filling: bool = False, sort: str = "target",
+                show_bought: bool = True) -> str:
     """The board: verdict + stat tiles + card grid, buy windows first."""
     key = row["_key"]
     shop = shop if shop in SHOPS else "tcgplayer"
     cur = SHOPS[shop]
     base = (f"{PREFIX}/w/{esc(key)}" if editable
             else f"{PREFIX}/s/{esc(key)}")
-    keep = f"&shop={shop}" if shop != "tcgplayer" else ""
+    sort = sort if sort in dict(SORTS) else "target"
+    # view-state query string, minus defaults; cp handled by the pager
+    state = [p for p in (
+        f"sort={sort}" if sort != "target" else "",
+        f"shop={shop}" if shop != "tcgplayer" else "",
+        "" if show_bought else "bought=hide") if p]
+
+    def _url(**over):
+        parts = [p for p in (
+            f"sort={over.get('sort', sort)}" if over.get('sort', sort) != "target" else "",
+            f"shop={over.get('shop', shop)}" if over.get('shop', shop) != "tcgplayer" else "",
+            "" if over.get('show_bought', show_bought) else "bought=hide") if p]
+        return base + ("?" + "&".join(parts) if parts else "")
+
+    keep = "".join(f"&{p}" for p in state)
     qshop = f"?shop={shop}" if shop != "tcgplayer" else ""
     entries = watchlist_db.current_entries(db, row["id"])
 
@@ -827,7 +867,13 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
                   else watchlist_db.entry_price_summary(db, e, provider=shop))
         bought = bool(e.get("bought_at"))
         pairs.append((e, base_s, disp_s, _hit(e, base_s) and not bought, bought))
-    pairs.sort(key=lambda t: (t[4], not t[3]))  # buy windows first, bought last
+    # chosen ordering; bought always last regardless of sort
+    pairs.sort(key=lambda t: (t[4], _sort_key(sort, t[0], t[1], t[2])))
+    bought_n = sum(1 for t in pairs if t[4])
+    if not show_bought:
+        grid_pairs = [t for t in pairs if not t[4]]
+    else:
+        grid_pairs = pairs
 
     active = [(e, bs, ds, h) for e, bs, ds, h, b in pairs if not b]
     total_val = sum(s["current"] for _, _, s, _ in active if s)
@@ -839,7 +885,7 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
         "SELECT value FROM meta WHERE key='last_ingest'").fetchone()
     last_ingest = last_ingest["value"] if last_ingest else "never"
 
-    page = pairs[(cp - 1) * CARDS_PER_PAGE: cp * CARDS_PER_PAGE]
+    page = grid_pairs[(cp - 1) * CARDS_PER_PAGE: cp * CARDS_PER_PAGE]
     cards = "".join(_card_html(db, e, disp_s, h, i, shop, cur, filling)
                     for i, (e, _, disp_s, h, _b) in enumerate(page)) or \
         '<p class="nodata">Nothing watched yet — use “Add card” or ask Claude.</p>'
@@ -847,8 +893,17 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
     shop_names = {"tcgplayer": "TCGplayer", "cardkingdom": "Card Kingdom",
                   "cardmarket": "Cardmarket"}
     shop_links = "".join(
-        f'<a href="{base}?shop={s}" class="{"on" if s == shop else ""}">{shop_names[s]}</a>'
+        f'<a href="{_url(shop=s)}" class="{"on" if s == shop else ""}">{shop_names[s]}</a>'
         for s in SHOPS)
+    sort_links = "".join(
+        f'<a href="{_url(sort=k)}" class="{"on" if k == sort else ""}">{label}</a>'
+        for k, label in SORTS)
+    bought_toggle = ""
+    if bought_n:
+        bought_toggle = (f'<a class="textlink mla" href="{_url(show_bought=not show_bought)}">'
+                         f'{"hide" if show_bought else "show"} bought ({bought_n})</a>')
+    sortbar = (f'<div class="sortbar"><span class="shoplbl">sort:</span>'
+               f'<span class="shops">{sort_links}</span>{bought_toggle}</div>')
     share_path = f"{PREFIX}/s/{esc(row['share_code'])}"
     share = (f'<button class="textlink" data-copy="{share_path}" '
              f'title="Copy the read-only link (code {esc(row["share_code"])})">'
@@ -940,8 +995,9 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
 <div class="stat"><b>{cur}{total_val:.2f}</b><span>list total</span></div>
 <div class="stat"><b>{len(entries)}</b><span>cards</span></div>
 </div>
+{sortbar}
 <div class="grid">{cards}</div>
-{_pager(base, "cp", cp, len(entries), CARDS_PER_PAGE, keep=keep)}"""
+{_pager(base, "cp", cp, len(grid_pairs), CARDS_PER_PAGE, keep=keep)}"""
     return _shell(row, editable, body, dialogs, cur,
                   subtitle=subtitle, rightnav=rightnav)
 
