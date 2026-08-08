@@ -1966,17 +1966,19 @@ git commit -m "docs: Document printing-aware pricing and finish round trip"
 
 ## Verification checklist
 
-Before calling this done, confirm each with actual command output rather than by inspection:
+All confirmed against the live API on 2026-08-08, from command output rather than
+inspection:
 
-- [ ] `pytest` passes with no failures or errors.
-- [ ] `scryfall_price(name="Counterspell")` returns printings that have prices and a `Cheapest nonfoil:` line — the defect in Task 8 Step 10 is gone.
-- [ ] `scryfall_price(name="Counterspell", set_code="dmr", collector_number="281", finish="foil")` returns the single-printing detail view.
-- [ ] `scryfall_price(name="Sol Ring", collector_number="284")` raises a validation error.
-- [ ] `scryfall_price_list` prices `1x Counterspell (dmr) 281 *F*` at the **foil** price, not the nonfoil price.
-- [ ] `scryfall_price_list` puts `1x Arcane Signet (sld) 589 *F*` in the no-price section and excludes it from the total — it does not fall back to the nonfoil price.
-- [ ] `format_archidekt` output is unchanged when no entry sets `finish` (Task 9 Step 8).
-- [ ] `archidekt_export` on deck `1585124` emits `*F*` and `*E*` markers.
-- [ ] `validate_decklist` and `precon_diff` still work on a decklist carrying set codes and finish markers.
+- [x] `pytest` passes — **94 tests**, no failures.
+- [x] `scryfall_price(name="Counterspell")` returns printings that have prices and a `Cheapest nonfoil:` line, with zero "No price data" rows — the defect is gone.
+- [x] `scryfall_price(name="Counterspell", set_code="dmr", collector_number="281", finish="foil")` returns the single-printing detail view.
+- [x] `scryfall_price(name="Sol Ring", collector_number="284")` raises a validation error.
+- [x] `scryfall_price_list` prices `1x Counterspell (dmr) 281 *F*` at the **foil** price; the nonfoil price appears nowhere in the output.
+- [x] `scryfall_price_list` puts `1x Arcane Signet (sld) 589 *F*` in the no-price section and totals \$0.00 — no cross-finish fallback.
+- [x] `format_archidekt` output is byte-identical to the pre-Task-9 commit when no entry sets `finish`, verified by diffing both versions in separate worktrees.
+- [x] `archidekt_export` on deck `1585124` emits exactly 6 `*F*` and 1 `*E*`, matching that deck's API-reported modifiers.
+- [x] That exported deck parses back through `_parse_decklist_entries` with all 7 finishes intact — the full round trip on real data.
+- [x] `validate_decklist` accepts a decklist carrying set codes and finish markers without reporting the cards as unrecognized.
 
 ## Changes made during execution
 
