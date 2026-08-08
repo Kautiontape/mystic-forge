@@ -29,6 +29,8 @@ SHOPS = {"tcgplayer": "$", "cardkingdom": "$", "cardmarket": "€"}
 # Public path prefix stripped by the gateway (set from PUBLIC_BASE by server.py).
 # Every emitted link and fetch must include it; empty when served at the root.
 PREFIX = ""
+# Absolute public base for OG tags (scrapers need absolute image URLs).
+PUBLIC_BASE = ""
 
 # Chart geometry shared with the inline JS crosshair (keep in sync there).
 CW, CH, CPAD = 640, 220, 34
@@ -140,6 +142,7 @@ button.chip:hover{border-color:var(--overlay)}
 .card.bought .price{color:var(--sub)}
 .boughtnote{font-size:.75rem;color:var(--lavender);font-family:var(--font-data)}
 @keyframes rise{from{opacity:0;transform:translateY(10px)}}
+.wrap.nofx .card{animation:none}   /* same-view morphs land instantly */
 .card h3{font-family:var(--font-display);font-size:1.05rem;font-weight:600;line-height:1.25}
 dialog h3{font-family:var(--font-display)}
 .badge{font-family:var(--font-data);font-size:.7rem;color:var(--sub);
@@ -185,8 +188,16 @@ a.pnum:hover{border-color:var(--lavender)}
 .gap{padding:.4rem .15rem;color:var(--sub)}
 dialog{border:1px solid var(--surface1);border-radius:1rem;background:var(--base);
   color:var(--text);max-width:44rem;width:92vw;padding:1.3rem;margin:auto;
-  max-height:90vh;overflow:auto;box-shadow:0 20px 60px var(--shadow)}
-dialog::backdrop{background:#0006;backdrop-filter:blur(3px)}
+  max-height:90vh;overflow:auto;box-shadow:0 20px 60px var(--shadow);
+  overscroll-behavior:contain}
+dialog[open]{animation:dlgin .28s cubic-bezier(.2,.9,.3,1.05)}
+@keyframes dlgin{from{opacity:0;transform:translateY(14px) scale(.985)}}
+dialog::backdrop{background:#0006;backdrop-filter:blur(3px);
+  animation:backdropin .28s ease-out}
+@keyframes backdropin{from{opacity:0}}
+body:has(dialog[open]){overflow:hidden}   /* page can't scroll behind a sheet */
+@media(prefers-reduced-motion:reduce){
+  dialog[open],dialog::backdrop,.card,.spark polyline{animation:none}}
 dialog h3{font-size:1.2rem;margin-bottom:.2rem}
 dialog .sub{color:var(--sub);font-size:.8rem;margin-bottom:.8rem}
 .chart-wrap{position:relative}
@@ -263,9 +274,11 @@ footer a{color:var(--sub)}
   .badge,.deltas,.rev .a,.sites a,.tip,.boughtnote{font-size:.8rem}
   dialog{width:100vw;max-width:100vw;margin:auto 0 0;border-radius:1rem 1rem 0 0;
     max-height:92dvh;padding:1rem}
+  dialog[open]{animation:sheetin .32s cubic-bezier(.2,.9,.3,1.02)}
   .card::after{content:"›";position:absolute;top:.8rem;right:.9rem;
     color:var(--sub);font-size:1.1rem}
 }
+@keyframes sheetin{from{opacity:.4;transform:translateY(100%)}}
 """
 
 _JS = r"""
@@ -277,11 +290,13 @@ const X=s=>String(s??'').replace(/[&<>"']/g,
 // ── flashless navigation: every internal link and mutation morphs in place ──
 async function morphNavigate(url,push=true){
   try{
+    const sameView=new URL(url,location.origin).pathname===location.pathname;
     const r=await fetch(url);
     if(!r.ok)throw 0;
     const doc=new DOMParser().parseFromString(await r.text(),'text/html');
     const nw=doc.querySelector('.wrap');
     if(!nw)throw 0;
+    if(sameView)nw.classList.add('nofx');   // filter/sort/page: no re-entrance
     const apply=()=>{
       document.querySelector('.wrap').replaceWith(nw);
       document.querySelectorAll('body > dialog').forEach(d=>d.remove());
@@ -289,11 +304,13 @@ async function morphNavigate(url,push=true){
       document.title=doc.title;
       wire();wireDialogs();
     };
-    if(document.startViewTransition)document.startViewTransition(apply);
+    // crossfade only when actually changing views — instant otherwise
+    if(!sameView&&document.startViewTransition)document.startViewTransition(apply);
     else apply();
     if(push&&url!==location.href)history.pushState({},'',url);
   }catch(e){location.href=url}
 }
+const normName=s=>s.toLowerCase().replace(/[^a-z0-9]/g,'');
 const refresh=()=>morphNavigate(location.href,false);
 window.onpopstate=()=>morphNavigate(location.href,false);
 const copyable=c=>c.onclick=e=>{
@@ -351,14 +368,20 @@ function wire(){
     document.querySelectorAll('.rev').forEach(wireRev);
   const fl=document.getElementById('filter');
   if(fl){
-    fl.oninput=()=>{clearTimeout(fl._t);fl._t=setTimeout(()=>{
+    fl.oninput=()=>{
+      // instant: hide non-matching cards on THIS page right away…
+      const nq=normName(fl.value);
+      document.querySelectorAll('.card[data-name]').forEach(c=>
+        c.style.display=normName(c.dataset.name).includes(nq)?'':'none');
+      // …then reconcile with the server (matches on other pages, pager, URL)
+      clearTimeout(fl._t);fl._t=setTimeout(()=>{
       const u=new URL(location.href);
       if(fl.value.trim())u.searchParams.set('q',fl.value.trim());
       else u.searchParams.delete('q');
       u.searchParams.delete('cp');
       window._refocusFilter=true;
       morphNavigate(u.pathname+u.search);
-    },250)};
+    },250);};
     fl.onkeydown=e=>{if(e.key==='Escape'){fl.value='';fl.oninput()}};
     if(window._refocusFilter){
       fl.focus();fl.setSelectionRange(fl.value.length,fl.value.length);
@@ -852,6 +875,16 @@ def _shell(row, editable, body, dialogs, cur="$", subtitle="", rightnav=""):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
 <meta name="theme-color" content="#eff1f5">
+<meta property="og:site_name" content="Mystic Forge">
+<meta property="og:type" content="website">
+<meta property="og:title" content="{title} · a Magic price watchlist">
+<meta property="og:description" content="Buy-window targets, 90 days of price
+history, and shareable boards — forged in Mystic Forge. Nothing here goes
+stale: open the link for live prices.">
+<meta property="og:image" content="{PUBLIC_BASE}/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext x='8' y='13' font-size='14' text-anchor='middle' fill='%238839ef'%3E✦%3C/text%3E%3C/svg%3E">
 <title>{title} · Mystic Forge</title>
 <script>(()=>{{const t=localStorage.getItem('mf-theme')||

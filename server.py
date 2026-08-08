@@ -128,6 +128,7 @@ PUBLIC_BASE = os.environ.get("MYSTIC_FORGE_PUBLIC_BASE",
 # carry it, or they resolve against the origin root and 404.
 PUBLIC_PREFIX = urllib.parse.urlparse(PUBLIC_BASE).path.rstrip("/")
 watchlist_pages.PREFIX = PUBLIC_PREFIX
+watchlist_pages.PUBLIC_BASE = PUBLIC_BASE
 
 
 class PassphraseMiddleware:
@@ -3520,6 +3521,14 @@ from html import escape as _esc
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
+
+
+@mcp.custom_route("/og.png", methods=["GET"])
+async def og_image(request: Request):
+    """Static Open Graph banner for link previews (no perishable data)."""
+    from starlette.responses import FileResponse
+    return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "og.png"), media_type="image/png")
 
 
 @mcp.custom_route("/health", methods=["GET"])

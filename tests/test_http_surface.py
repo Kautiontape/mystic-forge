@@ -356,6 +356,25 @@ def test_sort_state_survives_shop_switch(db_path):
     assert f"/w/{pp}?sort=d7&shop=cardkingdom&bought=hide" in page
 
 
+def test_og_preview_tags_static_and_served(db_path):
+    """Link previews get a real card; nothing perishable in the description."""
+    db = watchlist_db.connect(db_path)
+    _, pp, sc = watchlist_db.create_list(db, label="Cloud Voltron")
+    db.close()
+    with client() as c:
+        share = c.get(f"/s/{sc}").text
+        img = c.get("/og.png")
+    assert 'og:title" content="Cloud Voltron · a Magic price watchlist"' in share
+    assert 'og:image" content="' in share and "/og.png" in share
+    assert 'twitter:card" content="summary_large_image"' in share
+    import re
+    desc = re.search(r'og:description" content="([^"]*)"', share, re.S).group(1)
+    assert "$" not in desc and "202" not in desc      # no prices, no dates
+    assert img.status_code == 200
+    assert img.headers["content-type"] == "image/png"
+    assert img.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
 def test_pager_numbered_and_sort_agnostic(db_path):
     db = watchlist_db.connect(db_path)
     list_id, pp, _ = watchlist_db.create_list(db)

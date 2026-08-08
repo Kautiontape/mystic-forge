@@ -4,4 +4,5 @@ __pycache__/
 .venv/
 .playwright-mcp/
 *.png
+!og.png
 nohup.out
