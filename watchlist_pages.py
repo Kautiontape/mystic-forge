@@ -67,38 +67,42 @@ body{
 body::before{content:"";position:fixed;inset:0 0 auto 0;height:3px;z-index:5;
   background:linear-gradient(90deg,var(--mauve),var(--peach),var(--teal))}
 .wrap{max-width:72rem;margin:0 auto;padding:2.2rem 1.2rem 0}
-header.masthead{display:block;margin-bottom:.4rem}
+header.masthead{display:block;margin-bottom:.1rem}
 h1{font-family:var(--font-display);font-size:clamp(1.6rem,4vw,2.4rem);
-  font-weight:600;letter-spacing:.01em}
+  font-weight:600;letter-spacing:.01em;line-height:1.08;text-wrap:balance}
+h1.long{font-size:clamp(1.3rem,3.4vw,1.9rem)}   /* long titles step down */
 h1 .rune{color:var(--mauve)}
 h1 .iconbtn{font-size:1.05rem;vertical-align:.35rem;margin-left:.2rem}
 .iconbtn{background:none;border:none;color:var(--sub);cursor:pointer;font-size:1.05rem;
   padding:.25rem;border-radius:.4rem;line-height:1}
 .iconbtn:hover{background:var(--mantle);color:var(--text)}
-#theme{float:right;font-size:1.2rem;margin:.3rem 0 .3rem .6rem}  /* title flows around it */
-.meta{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;color:var(--sub);
-  font-size:.85rem;margin-bottom:1.1rem}
-.meta .mright{margin-left:auto;display:flex;gap:.5rem;align-items:center}
-.chip{font-family:var(--font-ui);font-size:.8rem;background:var(--mantle);
-  border:1px solid var(--surface0);border-radius:.55rem;padding:.25rem .7rem;
+.mright{float:right;display:flex;gap:.2rem;align-items:center;
+  margin:.35rem 0 .35rem .8rem}   /* quiet top-right cluster; title flows around */
+#theme{font-size:1.2rem}
+.subtitle{color:var(--sub);font-size:.85rem;margin:.35rem 0 1.2rem}
+.actions{display:flex;align-items:center;gap:.9rem;flex-wrap:wrap;margin-bottom:1.3rem}
+.mla{margin-left:auto}
+.textlink{font-family:var(--font-ui);font-size:.85rem;background:none;border:none;
+  color:var(--sub);cursor:pointer;text-decoration:none;padding:.25rem .4rem;
+  border-radius:.4rem;display:inline-flex;align-items:center;gap:.25rem}
+.textlink:hover{color:var(--text);text-decoration:underline}
+.chip{font-family:var(--font-data);font-size:.78rem;background:var(--mantle);
+  border:1px solid var(--surface0);border-radius:.45rem;padding:.2rem .55rem;
   color:var(--text);text-decoration:none;display:inline-flex;align-items:center;gap:.25rem}
 button.chip{cursor:pointer}
-button.chip:hover,a.chip:hover{border-color:var(--overlay)}
-.chip.primary{background:var(--mauve);border-color:var(--mauve);color:var(--base)}
-.chip.primary:hover{filter:brightness(1.08)}
+button.chip:hover{border-color:var(--overlay)}
 .shopgrp{display:inline-flex;align-items:center;gap:.4rem}
 .shoplbl{font-size:.8rem;color:var(--sub)}
-.caption{color:var(--sub);font-size:.8rem;margin:-.6rem 0 1.1rem}
 .pagehead{font-size:1.1rem;letter-spacing:.05em;text-transform:uppercase;
   color:var(--sub);text-align:center;margin-bottom:.6rem}
-.shops{display:inline-flex;border:1px solid var(--surface0);border-radius:.55rem;overflow:hidden}
-.shops a{font-family:var(--font-data);font-size:.75rem;padding:.18rem .6rem;
-  color:var(--text);text-decoration:none}
-.shops a.on{background:var(--mauve);color:var(--base)}
-.shops a:not(.on):hover{background:var(--mantle)}
+.shops{display:inline-flex;gap:.1rem}           /* view tabs, not buttons */
+.shops a{font-family:var(--font-ui);font-size:.82rem;padding:.3rem .55rem;
+  color:var(--sub);text-decoration:none;border-bottom:2px solid transparent}
+.shops a.on{color:var(--text);border-bottom-color:var(--mauve);font-weight:600}
+.shops a:not(.on):hover{color:var(--text)}
 .verdict{font-family:var(--font-data);font-size:.9rem;background:var(--card);
-  border:1px solid var(--surface0);border-left:3px solid var(--surface1);
-  border-radius:.8rem;padding:.65rem .95rem;margin-bottom:1rem;
+  border:none;border-left:3px solid var(--surface1);
+  border-radius:.5rem;padding:.65rem .95rem;margin-bottom:1rem;
   backdrop-filter:blur(6px);line-height:1.7}
 .verdict--buy{border-left-color:var(--green)}
 .verdict--wait{border-left-color:var(--yellow)}
@@ -107,7 +111,7 @@ button.chip:hover,a.chip:hover{border-color:var(--overlay)}
 .verdict .quiet{color:var(--sub)}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(9.5rem,1fr));
   gap:.8rem;margin-bottom:1.6rem}
-.stat{background:var(--card);border:1px solid var(--surface0);border-radius:.7rem;
+.stat{background:var(--card);border:none;border-radius:.7rem;
   padding:.65rem .85rem;backdrop-filter:blur(6px)}
 .stat b{display:block;font-family:var(--font-data);font-size:1.4rem;font-weight:600}
 .stat span{font-size:.72rem;color:var(--sub);text-transform:uppercase;letter-spacing:.09em}
@@ -217,13 +221,13 @@ footer a{color:var(--sub)}
   .wrap{padding:1.3rem .9rem 0}
   h1{font-size:1.6rem}                         /* full width; pencil rides inside */
   .iconbtn{font-size:1.35rem;padding:.45rem .6rem}
-  .meta{gap:.55rem .5rem}
-  .meta .mright{margin-left:0;width:100%}
-  .shopgrp{width:100%}
+  .mright{float:none;justify-content:flex-end;margin:0 0 .3rem}
+  .actions{gap:.6rem}
+  .shopgrp{width:100%;margin-left:0}
   .shops{display:flex;flex:1}
   .shops a{flex:1;text-align:center;justify-content:center}
   /* 44px-rule tap targets: height, not font inflation */
-  .chip,.shops a,.pager a{min-height:2.75rem;display:inline-flex;align-items:center}
+  .chip,.shops a,.pager a,.textlink{min-height:2.75rem;display:inline-flex;align-items:center}
   .shops a{display:flex}
   button.act{min-height:2.75rem;padding:.65rem 1.1rem}
   .xclose{padding:.6rem .8rem}
@@ -737,9 +741,11 @@ def _pager(base, param, page, total, per, keep=""):
     return f'<nav class="pager">{prev}<span>{page}/{pages}</span>{nxt}</nav>'
 
 
-def _shell(row, editable, body, dialogs, cur="$"):
+def _shell(row, editable, body, dialogs, cur="$", subtitle="", rightnav=""):
     key = row["_key"]
-    title = esc(row["label"] or "Watchlist")
+    label = row["label"] or "Watchlist"
+    title = esc(label)
+    long_cls = ' class="long"' if len(label) > 16 else ""
     js = _JS % {"key": json.dumps(key), "editable": json.dumps(editable),
                 "cpad": CPAD, "cw": CW, "ch": CH, "cur": json.dumps(cur)}
     rename = (f'<button class="iconbtn" id="rename" title="Rename list" '
@@ -764,8 +770,9 @@ document.querySelector('meta[name=theme-color]').content=
   t==='macchiato'?'#24273a':'#eff1f5';}})();</script>
 <style>{_CSS}</style></head><body>
 <div class="wrap">
-<header class="masthead"><button class="iconbtn" id="theme" aria-label="Toggle theme"></button>
-<h1><span class="rune">✦</span> {title_html}</h1></header>
+<header class="masthead"><span class="mright">{rightnav}<button class="iconbtn" id="theme" aria-label="Toggle theme"></button></span>
+<h1{long_cls}><span class="rune">✦</span> {title_html}</h1></header>
+{f'<p class="subtitle">{subtitle}</p>' if subtitle else ''}
 {body}
 <footer>forged in the Mystic Forge · card price watchlist ·
 <a href="/health" title="server status">status</a></footer>
@@ -817,11 +824,11 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
         f'<a href="{base}?shop={s}" class="{"on" if s == shop else ""}">{shop_names[s]}</a>'
         for s in SHOPS)
     share_path = f"/s/{esc(row['share_code'])}"
-    share = (f'<button class="chip" data-copy="{share_path}" '
+    share = (f'<button class="textlink" data-copy="{share_path}" '
              f'title="Copy the read-only link (code {esc(row["share_code"])})">'
-             f'Share ⧉</button>' if editable else '<span>Read-only view</span>')
+             f'Share ⧉</button>' if editable else "")
     claim = ('' if editable else
-             '<button class="chip primary" id="claim">Make my own copy</button>')
+             '<button class="act primary" id="claim">Make my own copy</button>')
     superseded = ('<p class="note">⚠ superseded by a recovery clone — this copy '
                   'is historical.</p>' if row["superseded_by"] else "")
 
@@ -875,20 +882,24 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
         dialogs += (f'<dialog id="claimDlg">{xbtn}<h3>Your own watchlist</h3>'
                     '<div id="claimOut"></div></dialog>')
 
-    add_chip = ('<button class="chip primary" id="addCard">＋ Add card</button>'
-                if editable else "")
+    add_btn = ('<button class="act primary" id="addCard">＋ Add card</button>'
+               if editable else "")
     hist_title = ("Every change ever made to this list — inspect or restore any point"
                   if editable else "See every change made to this list")
     freshness = (f"Buy prices through {esc(through)}" if through
                  else "No price data yet — first ingest tonight")
     usd_note = (" · targets always compare against TCGplayer USD"
                 if shop != "tcgplayer" else "")
+    ro_note = "" if editable else "Read-only view · "
+    subtitle = (f"{ro_note}{freshness} · ▼ green = cheaper · ▲ red = pricier "
+                f"(these are buy prices){usd_note}")
+    rightnav = (f'<button class="textlink" id="alerts">Alerts</button>'
+                f'<a class="textlink" href="{base}/history{qshop}" '
+                f'title="{hist_title}">History</a>')
     net_cls = "dn" if net7 < 0 else "up" if net7 > 0 else "fl"
     body = f"""
-<div class="meta">{add_chip}{share}{claim}
-<span class="shopgrp"><span class="shoplbl">prices:</span><span class="shops">{shop_links}</span></span>
-<span class="mright"><button class="chip" id="alerts">Alerts</button>
-<a class="chip" href="{base}/history{qshop}" title="{hist_title}">History</a></span></div>
+<div class="actions">{add_btn}{claim}{share}
+<span class="shopgrp mla"><span class="shoplbl">prices:</span><span class="shops">{shop_links}</span></span></div>
 {superseded}
 {_verdict([(e, bs, h) for e, bs, _, h, b in pairs if not b])}
 <div class="stats">
@@ -898,10 +909,10 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
 <div class="stat"><b>{cur}{total_val:.2f}</b><span>list total</span></div>
 <div class="stat"><b>{len(entries)}</b><span>cards</span></div>
 </div>
-<p class="caption">{freshness} · ▼ green = cheaper · ▲ red = pricier (these are buy prices){usd_note}</p>
 <div class="grid">{cards}</div>
 {_pager(base, "cp", cp, len(entries), CARDS_PER_PAGE, keep=keep)}"""
-    return _shell(row, editable, body, dialogs, cur)
+    return _shell(row, editable, body, dialogs, cur,
+                  subtitle=subtitle, rightnav=rightnav)
 
 
 _ACTION_LABELS = {"create": ("forged", "var(--mauve)"),
@@ -960,16 +971,16 @@ def render_history(db, row, editable: bool, hp: int = 1,
                f'<div id="revBody"></div><div id="forkOut"></div>'
                f'<div class="btnrow"><button class="act primary" id="forkBtn">⑂ Fork this revision</button>'
                f'{recover_btn}<button class="act close">Close</button></dialog>')
-    intro = ("every change, newest first — nothing is ever deleted. Tap a "
+    intro = ("Every change, newest first — nothing is ever deleted. Tap a "
              "revision to view, copy it, or restore it."
              if editable else
-             "every change made to this list, newest first — tap one to view "
+             "Every change made to this list, newest first — tap one to view "
              "or copy it.")
+    rightnav = f'<a class="textlink" href="{base}{qshop}">← Back to board</a>'
     body = f"""
-<div class="meta"><a class="chip" href="{base}{qshop}">← Back to board</a>
-<span>{intro}</span></div>
 <h2 class="pagehead">History</h2>
 <div class="rail">{revs}
 {_pager(base + "/history", "hp", hp, total_ev, EVENTS_PER_PAGE,
         keep=qshop.replace("?", "&") if qshop else "")}</div>"""
-    return _shell(row, editable, body, dialogs)
+    return _shell(row, editable, body, dialogs,
+                  subtitle=intro, rightnav=rightnav)
