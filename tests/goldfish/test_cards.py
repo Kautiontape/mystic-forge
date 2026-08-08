@@ -3,7 +3,6 @@ import pytest
 from goldfish.cards import (
     Annotation,
     AnnotationError,
-    CardData,
     CostParseError,
     SimCard,
     merge_card,
@@ -11,13 +10,9 @@ from goldfish.cards import (
     validate_annotations,
 )
 
-
-def make_data(name, **kw):
-    base = {"name": name, "cost": None, "types": frozenset(), "power": None,
-            "toughness": None, "keywords": frozenset(), "produces": None,
-            "enters_tapped": False, "equip_cost": None, "oracle": ""}
-    base.update(kw)
-    return CardData(**base)
+# make_data moved to tests/goldfish/helpers.py (Task 15 consolidation); the
+# re-import keeps `from tests.goldfish.test_cards import make_data` working.
+from tests.goldfish.helpers import make_data
 
 
 def test_parse_simple_cost():

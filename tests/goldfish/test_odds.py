@@ -85,6 +85,23 @@ def test_single_group_via_odds_groups_matches_odds_at_least():
     assert grouped == pytest.approx(flat, abs=1e-12)
 
 
+def test_sim_matches_hypergeometric_within_1pct():
+    # Acceptance criterion 3: >=1 Runner in the opening 7 (mulligans skew the
+    # kept-hand distribution, so disable them via a wide-open keep window).
+    from goldfish.engine import MulliganRules
+    from goldfish.runner import run_batch
+    from tests.goldfish.helpers import mini_cards
+
+    cards = mini_cards()
+    deck = ["Plains"] * 30 + ["Runner"] * 9
+    r = run_batch(cards, deck, "Boss", n=4000, seed=9, until_turn=1,
+                  rules=MulliganRules(min_sources=0, max_sources=7,
+                                      min_real_lands=0))
+    seen = sum(1 for rec in r["records"] if "Runner" in rec.opening_hand) / 4000
+    expected = odds_at_least(39, 7, copies=9, min_successes=1)
+    assert abs(seen - expected) < 0.01
+
+
 def test_odds_at_least_is_exact_float_division_of_exact_integers():
     # math.comb is exact integer arithmetic; the only float op is the final
     # division, so results should be reproducible bit-for-bit across calls

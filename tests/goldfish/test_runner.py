@@ -1,15 +1,15 @@
-"""Task 14: batch runner — determinism, timeline records, per-turn action cap."""
+"""Task 14: batch runner — determinism, timeline records, per-turn action cap.
+Task 15: A/B — position-stable alignment, paired statistics, correlation."""
 import json
+import random
 from collections import Counter
 
+import pytest
+
+from goldfish.cards import SimCard, parse_cost
 from goldfish.engine import MulliganRules, auto_mulligan, new_game
-from goldfish.runner import play_one_game, run_batch
-from tests.goldfish.test_engine import annotated, mini_cards
-
-
-def small_deck():
-    return ["Plains"] * 15 + ["Mountain"] * 15 + ["Bear"] * 5 + ["Runner"] * 4
-
+from goldfish.runner import align_decks, play_one_game, run_ab, run_batch
+from tests.goldfish.helpers import annotated, make_data, mini_cards, small_deck
 
 # -- plan tests ---------------------------------------------------------------
 
@@ -39,9 +39,6 @@ def livelock_cards():
     activation taps one producer and mints a fresh untapped Treasure, so the
     multi-pass policy loop would re-fire it forever."""
     cards = mini_cards()
-    from goldfish.cards import SimCard, parse_cost
-    from tests.goldfish.test_cards import make_data
-
     cards["Mint"] = SimCard(data=make_data(
         "Mint", cost=parse_cost("{1}"), types=frozenset({"artifact"})),
         ann=None, scope_class=None)
@@ -145,3 +142,114 @@ def test_metrics_json_round_trip():
     r = run_batch(cards, small_deck(), "Boss", n=8, seed=9, until_turn=6)
     m = r["metrics"]
     assert json.loads(json.dumps(m)) == m
+
+
+# -- Task 15: A/B alignment (plan tests) --------------------------------------
+
+
+def test_align_decks_perturbs_exactly_k_positions():
+    a = ["Plains"] * 10 + ["Bear"] * 5 + ["Hammer"] * 5
+    b = ["Plains"] * 10 + ["Bear"] * 5 + ["Hammer"] * 4 + ["Runner"]
+    a2, b2 = align_decks(a, b)
+    assert sorted(a2) == sorted(a) and sorted(b2) == sorted(b)
+    diffs = sum(1 for x, y in zip(a2, b2) if x != y)
+    assert diffs == 1                              # 1-card swap → 1 position
+
+
+def test_align_decks_sorted_multiset_deterministic():
+    # Any input ordering of the same multisets aligns identically (sorted
+    # multiset order is the pinned tie-break), and shared cards sit at
+    # identical indices.
+    a = ["Plains"] * 10 + ["Bear"] * 5 + ["Hammer"] * 5
+    b = ["Runner"] + ["Hammer"] * 4 + ["Bear"] * 5 + ["Plains"] * 10
+    canonical = align_decks(a, b)
+    for seed in (0, 1, 2):
+        rng = random.Random(seed)
+        ap, bp = list(a), list(b)
+        rng.shuffle(ap)
+        rng.shuffle(bp)
+        assert align_decks(ap, bp) == canonical
+    a2, b2 = canonical
+    shared = len(a) - 1                            # everything but the swap
+    assert a2[:shared] == b2[:shared] == sorted(a2[:shared])
+
+
+def test_align_decks_unequal_sizes_raise():
+    with pytest.raises(ValueError):
+        align_decks(["Plains"] * 10, ["Plains"] * 9)
+
+
+# -- Task 15: run_ab paired statistics ----------------------------------------
+
+
+def test_ab_identical_decks_zero_delta():
+    cards = mini_cards()
+    d = small_deck()
+    r = run_ab(cards, d, "Boss", cards, list(d), "Boss",
+               n=10, seed=42, until_turn=6)
+    for name, metric in r["deltas"].items():
+        assert abs(metric["mean"]) < 1e-12, name
+    assert r["pair_correlation"] == 1.0
+
+
+def test_ab_one_swap_high_correlation():
+    cards = mini_cards()
+    a = small_deck()
+    b = list(a)
+    b[b.index("Bear")] = "Runner"
+    r = run_ab(cards, a, "Boss", cards, b, "Boss",
+               n=30, seed=42, until_turn=6)
+    assert r["pair_correlation"] > 0.5             # the acceptance floor
+
+
+def test_ab_different_commanders_guarded():
+    cards = mini_cards()
+    cards["Chief"] = SimCard(data=make_data(
+        "Chief", cost=parse_cost("{2}{R}"),
+        types=frozenset({"creature", "legendary", "commander"}),
+        power=3, toughness=3), ann=None, scope_class=None)
+    d = small_deck()
+    with pytest.raises(ValueError, match="commander"):
+        run_ab(cards, d, "Boss", cards, list(d), "Chief",
+               n=2, seed=1, until_turn=3)
+    r = run_ab(cards, d, "Boss", cards, list(d), "Chief",
+               n=2, seed=1, until_turn=3, allow_different_commanders=True)
+    assert r["n"] == 2
+
+
+def test_ab_delta_shape_covers_pinned_scalars():
+    cards = mini_cards()
+    d = small_deck()
+    r = run_ab(cards, d, "Boss", cards, list(d), "Boss",
+               n=6, seed=3, until_turn=6,
+               combos=[{"cards": ["Plains", "Boss"], "wins": False}])
+    expected = {
+        "commander_cast_by_t4", "commander_cast_by_t5", "commander_cast_by_t6",
+        "kill_by_until_turn", "cmdr21_by_until_turn", "total_damage",
+        "kept_hand_lands", "mulligans_taken", "casts_total", "max_cast_chain",
+        "on_curve_through_t5",
+        "combo0_assembled_by_t6", "combo0_castable_by_t6",
+    }
+    assert set(r["deltas"]) == expected
+    for name, metric in r["deltas"].items():
+        assert set(metric) == {"mean", "sd", "n", "ci_low", "ci_high",
+                               "significant", "mcnemar_p"}, name
+        assert metric["n"] == 6, name
+    # binary scalars carry an exact McNemar p (spec §Statistics)
+    assert r["deltas"]["kill_by_until_turn"]["mcnemar_p"] is not None
+    assert r["deltas"]["on_curve_through_t5"]["mcnemar_p"] is not None
+    # pinned output keys ride along
+    assert {"n", "seed", "deltas", "pair_correlation", "metrics_a",
+            "metrics_b", "records_a", "records_b"} <= set(r)
+    assert r["metrics_a"]["n"] == len(r["records_a"]) == 6
+
+
+def test_ab_deterministic_same_seed():
+    cards = mini_cards()
+    a = small_deck()
+    b = list(a)
+    b[b.index("Bear")] = "Runner"
+    r1 = run_ab(cards, a, "Boss", cards, b, "Boss", n=8, seed=5, until_turn=6)
+    r2 = run_ab(cards, a, "Boss", cards, b, "Boss", n=8, seed=5, until_turn=6)
+    assert r1["deltas"] == r2["deltas"]
+    assert r1["pair_correlation"] == r2["pair_correlation"]

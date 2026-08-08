@@ -23,6 +23,9 @@ imputation).
 """
 from __future__ import annotations
 
+import math
+from collections import Counter
+from dataclasses import asdict
 from typing import Any
 
 from .engine import (
@@ -35,7 +38,7 @@ from .engine import (
     new_game,
     step,
 )
-from .metrics import GameRecord, aggregate
+from .metrics import GameRecord, aggregate, paired_delta
 from .policy import choose_action
 
 # Per-turn action cap (graceful degradation): a degenerate-but-legal
@@ -344,4 +347,169 @@ def run_batch(
         "until_turn": until_turn,
         "metrics": aggregate(records, until_turn),
         "records": records,
+    }
+
+
+# --------------------------------------------------------------------------
+# Task 15: A/B — position-stable alignment + paired statistics
+# --------------------------------------------------------------------------
+
+# Standing caveat (spec §Statistics), carried in every run_ab output: the
+# shared policy plays both decks, so its bias cancels for most swaps — but
+# NOT for swaps whose value is sequencing (Sigarda's Aid-class cards); those
+# are systematically undervalued by the paired deltas.
+_AB_SEQUENCING_CAVEAT = (
+    "Both decks are played by the same policy, so policy bias cancels for "
+    "most swaps — but not for cards whose value is sequencing (e.g. "
+    "Sigarda's Aid-class flash enablers); those are systematically "
+    "undervalued."
+)
+
+
+def align_decks(deck_a: list, deck_b: list) -> tuple[list, list]:
+    """Position-stable A/B alignment (spec §Statistics): shared cards occupy
+    identical indices; swapped cards fill the leftover tail slots. Both the
+    shared base and the unique tails are laid out in sorted multiset order,
+    so the result is deterministic regardless of input ordering and a k-card
+    swap perturbs exactly k positions."""
+    if len(deck_a) != len(deck_b):
+        raise ValueError(
+            f"align_decks requires equal-size decks (got {len(deck_a)} vs "
+            f"{len(deck_b)}); deck-size validation belongs upstream, but the "
+            "runner refuses to mis-align"
+        )
+    ca, cb = Counter(deck_a), Counter(deck_b)
+    shared = ca & cb
+    only_a = sorted((ca - shared).elements())
+    only_b = sorted((cb - shared).elements())
+    base = sorted(shared.elements())
+    return base + only_a, base + only_b
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float:
+    """Pearson r of two equal-length series. Degenerate-variance pin: if
+    either series has zero variance, r is 1.0 when the series are identical
+    (an A/A run) and 0.0 otherwise. Rounding is clamped to [-1, 1]."""
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx == 0.0 or vy == 0.0:
+        return 1.0 if xs == ys else 0.0
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    return max(-1.0, min(1.0, cov / math.sqrt(vx * vy)))
+
+
+def _ab_scalars(
+    records: list[GameRecord], until_turn: int
+) -> dict[str, list[float]]:
+    """The pinned per-game scalar per A/B metric, one list entry per game."""
+
+    # Turn-to-event fields may carry until_turn+1 (upkeep kills fire after
+    # the horizon check); the <=T censoring here handles it, same as aggregate.
+    def by(turn: int | None, t: int) -> int:
+        return 1 if turn is not None and turn <= t else 0
+
+    out: dict[str, list[float]] = {}
+    for t in (4, 5, 6):
+        out[f"commander_cast_by_t{t}"] = [
+            by(r.commander_cast_turn, t) for r in records
+        ]
+    out["kill_by_until_turn"] = [by(r.kill_turn, until_turn) for r in records]
+    out["cmdr21_by_until_turn"] = [
+        by(r.cmdr21_turn, until_turn) for r in records
+    ]
+    out["total_damage"] = [
+        float(sum(r.damage_by_turn[:until_turn])) for r in records
+    ]
+    out["kept_hand_lands"] = [r.kept_hand_lands for r in records]
+    out["mulligans_taken"] = [r.mulligans_taken for r in records]
+    out["casts_total"] = [
+        sum(r.casts_by_turn[:until_turn]) for r in records
+    ]
+    out["max_cast_chain"] = [
+        max(r.casts_by_turn[:until_turn], default=0) for r in records
+    ]
+    horizon = min(5, until_turn)
+    out["on_curve_through_t5"] = [
+        1 if all(v >= 1 for v in r.lands_played_by_turn[:horizon]) else 0
+        for r in records
+    ]
+    n_combos = max((len(r.combo_assembled_turn) for r in records), default=0)
+    for i in range(n_combos):
+        out[f"combo{i}_assembled_by_t6"] = [
+            by(
+                r.combo_assembled_turn[i]
+                if i < len(r.combo_assembled_turn)
+                else None,
+                6,
+            )
+            for r in records
+        ]
+        out[f"combo{i}_castable_by_t6"] = [
+            by(
+                r.combo_castable_turn[i]
+                if i < len(r.combo_castable_turn)
+                else None,
+                6,
+            )
+            for r in records
+        ]
+    return out
+
+
+def run_ab(
+    cards_a: dict,
+    deck_a: list,
+    commander_a: str,
+    cards_b: dict,
+    deck_b: list,
+    commander_b: str,
+    n: int,
+    seed: int,
+    until_turn: int,
+    opponents: int = 1,
+    combos: list | None = None,
+    rules: MulliganRules | None = None,
+    allow_different_commanders: bool = False,
+) -> dict:
+    """Paired A/B run (spec §Statistics): align the decks position-stably,
+    run both arms game-for-game under identical ``derive_seed(seed, i)``
+    seeds, and report per-metric paired deltas (± 1.96·sd/√n, exact McNemar
+    for binaries) plus the achieved pair correlation — the Pearson r of the
+    per-game total-damage-by-until_turn series between arms."""
+    if commander_a != commander_b and not allow_different_commanders:
+        raise ValueError(
+            f"A/B decks have different commanders ({commander_a!r} vs "
+            f"{commander_b!r}); cross-commander deltas confound every metric "
+            "— pass allow_different_commanders=True to compare anyway"
+        )
+    aligned_a, aligned_b = align_decks(deck_a, deck_b)
+    batch_a = run_batch(
+        cards_a, aligned_a, commander_a, n, seed, until_turn,
+        opponents=opponents, combos=combos, rules=rules,
+    )
+    batch_b = run_batch(
+        cards_b, aligned_b, commander_b, n, seed, until_turn,
+        opponents=opponents, combos=combos, rules=rules,
+    )
+    scalars_a = _ab_scalars(batch_a["records"], until_turn)
+    scalars_b = _ab_scalars(batch_b["records"], until_turn)
+    deltas = {
+        name: asdict(paired_delta(scalars_a[name], scalars_b[name]))
+        for name in scalars_a
+        if name in scalars_b
+    }
+    return {
+        "n": n,
+        "seed": seed,
+        "deltas": deltas,
+        "pair_correlation": _pearson(
+            scalars_a["total_damage"], scalars_b["total_damage"]
+        ),
+        "metrics_a": batch_a["metrics"],
+        "metrics_b": batch_b["metrics"],
+        "records_a": batch_a["records"],
+        "records_b": batch_b["records"],
+        "caveat": _AB_SEQUENCING_CAVEAT,
     }

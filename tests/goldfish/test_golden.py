@@ -5,8 +5,7 @@ CONSCIOUSLY — that is the point of the test (spec §Architecture: same seed +
 deck + annotations + policy -> byte-identical log).
 """
 from goldfish.runner import play_one_game
-from tests.goldfish.test_engine import mini_cards
-from tests.goldfish.test_runner import small_deck
+from tests.goldfish.helpers import mini_cards, small_deck
 
 # Frozen at implementation time from a real run (game_seed=1234, until_turn=6).
 GOLDEN_PREFIX = [
@@ -32,4 +31,7 @@ def test_golden_log_byte_identical():
                                game_seed=1234, until_turn=6)
     assert log1 == log2                    # full determinism, byte-identical
     assert rec1 == rec2
-    assert log1[:12] == GOLDEN_PREFIX
+    assert log1[: len(GOLDEN_PREFIX)] == GOLDEN_PREFIX, (
+        "seed-1234 golden log drifted — if the engine/policy change is "
+        "intentional, update GOLDEN_PREFIX consciously"
+    )
