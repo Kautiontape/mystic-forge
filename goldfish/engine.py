@@ -69,7 +69,8 @@ class Game:
     phase: str = "mulligan"
     commander_casts: int = 0
     mana_pool: dict = field(default_factory=lambda: {c: 0 for c in COLORS} | {"C": 0, "any": 0})
-    land_drops_remaining: int = 0
+    _land_drops_used: int = 0         # serialized as "land_drops_used";
+                                      # land_drops_remaining is a computed property
     spells_cast_this_turn: int = 0
     combats_done: int = 0
     extra_combats: int = 0
@@ -81,6 +82,8 @@ class Game:
                                       # accumulates here for metrics
     trigger_fires: dict = field(default_factory=dict)  # "card|event|verb" -> fire
                                       # count (string keys so it JSON-serializes)
+    static_active_turn: dict = field(default_factory=dict)  # "card|static_kind" or
+                                      # "condition|metalcraft" -> first turn active
     combos: list = field(default_factory=list)          # [[names], ...]
     combo_wins: list = field(default_factory=list)      # [bool per combo]
     combo_assembled_turn: list = field(default_factory=list)   # [int|None per combo]
@@ -95,6 +98,14 @@ class Game:
     _depth_warned: bool = False       # one suppression line per cascade
 
     # -- identity helpers -------------------------------------------------
+    @property
+    def land_drops_remaining(self) -> int:
+        """Dynamic (spec §Engine): allowed drops are recomputed from the
+        battlefield on every read, so an extra_land_drops static arriving
+        mid-turn raises the remaining count immediately (Azusa grants drops
+        the turn she lands)."""
+        return _land_drops_allowed(self) - self._land_drops_used
+
     def card(self, name: str) -> SimCard:
         return self.cards[name]
 
@@ -119,13 +130,15 @@ class Game:
         return {
             "turn": self.turn, "phase": self.phase,
             "mana_pool": dict(self.mana_pool),
-            "land_drops_remaining": self.land_drops_remaining,
+            "land_drops_remaining": self.land_drops_remaining,  # computed, display only
+            "land_drops_used": self._land_drops_used,           # state; from_dict reads this
             "spells_cast_this_turn": self.spells_cast_this_turn,
             "combats_done": self.combats_done, "extra_combats": self.extra_combats,
             "mulligans_taken": self.mulligans_taken,
             "free_mulligan_used": self.free_mulligan_used,
             "life_gained": self.life_gained,
             "trigger_fires": dict(self.trigger_fires),
+            "static_active_turn": dict(self.static_active_turn),
             "zones": {"library": list(self.library), "hand": list(self.hand),
                       "battlefield": [p.to_dict() for p in self.battlefield],
                       "graveyard": list(self.graveyard), "command": list(self.command)},
@@ -154,13 +167,14 @@ class Game:
                 turn=d["turn"], phase=d["phase"],
                 commander_casts=d["commander"]["cast_count"],
                 mana_pool=dict(d["mana_pool"]),
-                land_drops_remaining=d["land_drops_remaining"],
+                _land_drops_used=d["land_drops_used"],
                 spells_cast_this_turn=d["spells_cast_this_turn"],
                 combats_done=d["combats_done"], extra_combats=d["extra_combats"],
                 mulligans_taken=d["mulligans_taken"],
                 free_mulligan_used=d["free_mulligan_used"],
                 life_gained=d["life_gained"],
                 trigger_fires=dict(d["trigger_fires"]),
+                static_active_turn=dict(d["static_active_turn"]),
                 won_turn=d["won_turn"], combos=[list(c) for c in d["combos"]],
                 combo_wins=list(d["combo_wins"]),
                 combo_assembled_turn=list(d["combo_assembled_turn"]),
@@ -646,14 +660,21 @@ def _dispatch(g: Game, event: str, entering, spell, ctx):
                 continue
             listeners.append((p, t))
     for p, t in listeners:
-        if check_condition(g, t.condition, p, ctx or {}):
-            g.emit(f"{p.name} trigger — {t.do}")
-            key = f"{p.name}|{t.on}|{t.do}"
-            g.trigger_fires[key] = g.trigger_fires.get(key, 0) + 1
-            execute_verb(g, p, t.do, ctx=ctx, count=t.count, target=t.target,
-                         power=t.power, toughness=t.toughness,
-                         keywords=t.keywords, tutor_filter=t.tutor_filter,
-                         pips=t.pips, any_mana=t.any_mana, duration=t.duration)
+        _run_trigger(g, p.name, p, t, ctx)
+
+
+def _run_trigger(g: Game, name: str, source_perm, t, ctx):
+    """Shared per-trigger execution — condition gate, log line, fire count,
+    verb — used by global dispatch and by cast-time self (cast/etb) triggers."""
+    if not check_condition(g, t.condition, source_perm, ctx or {}):
+        return
+    g.emit(f"{name} trigger — {t.do}")
+    key = f"{name}|{t.on}|{t.do}"
+    g.trigger_fires[key] = g.trigger_fires.get(key, 0) + 1
+    execute_verb(g, source_perm, t.do, ctx=ctx, count=t.count, target=t.target,
+                 power=t.power, toughness=t.toughness,
+                 keywords=t.keywords, tutor_filter=t.tutor_filter,
+                 pips=t.pips, any_mana=t.any_mana, duration=t.duration)
 
 
 def _spell_filter_ok(g: Game, f, spell_card: SimCard) -> bool:
@@ -664,3 +685,221 @@ def _spell_filter_ok(g: Game, f, spell_card: SimCard) -> bool:
     if f == "noncreature":
         return not spell_card.is_creature
     return False
+
+
+# -- Actions: play_land / cast / pass + turn engine --------------------------
+
+def check_combos(g: Game) -> None:
+    """Combo detection stub — Task 11 fills it. Called when a main phase ends."""
+
+
+def _land_drops_allowed(g: Game) -> int:
+    extra = sum(s.count for p in g.battlefield
+                for s in g.card(p.name).statics() if s.kind == "extra_land_drops")
+    return 1 + extra
+
+
+def _record_activations(g: Game):
+    """Static/condition activation metric: record the first turn each
+    battlefield static (key "card|kind") and the metalcraft condition
+    (key "condition|metalcraft") is seen active. Cheap: setdefault only.
+    Runs after every successful step mutation and at each turn start."""
+    for p in g.battlefield:
+        for s in g.card(p.name).statics():
+            g.static_active_turn.setdefault(f"{p.name}|{s.kind}", g.turn)
+    if ("condition|metalcraft" not in g.static_active_turn
+            and check_condition(g, ("metalcraft",), None, {})):
+        g.static_active_turn["condition|metalcraft"] = g.turn
+
+
+def _cost_reduction_applies(g: Game, f: str, card: SimCard) -> bool:
+    """cost_reduction filter vocabulary (spec §Card annotation DSL)."""
+    if f == "any":
+        return True
+    if f == "instant_or_sorcery":
+        return bool(card.data.types & {"instant", "sorcery"})
+    if f == "noncreature":
+        return not card.is_creature
+    if f == "creature":
+        return card.is_creature
+    if f == "artifact":
+        return card.is_artifact
+    if f == "equipment":
+        return card.is_equipment
+    if f.startswith("color:"):
+        # the card's cost carries that colored pip; generic never counts
+        return bool(card.data.cost and card.data.cost.pips.get(f[6:], 0) > 0)
+    return False
+
+
+def _cast_cost(g: Game, card: SimCard, tax: int) -> Cost:
+    """Card cost + commander tax on generic, then cost_reduction statics shave
+    generic only — after the tax, floored at 0; colored pips are never touched
+    (spec §Engine: reductions run before the pip solver)."""
+    pips = dict(card.data.cost.pips) if card.data.cost else dict(parse_cost(None).pips)
+    reduction = sum(
+        s.amount for p in g.battlefield for s in g.card(p.name).statics()
+        if s.kind == "cost_reduction" and _cost_reduction_applies(g, s.filter, card))
+    pips["generic"] = max(0, pips.get("generic", 0) + tax - reduction)
+    return Cost(pips)
+
+
+def step(g: Game, action: dict) -> None:
+    """Apply one atomic action (D10). Validates completely first; on
+    IllegalAction the game is guaranteed unmutated."""
+    kind = action.get("type") if isinstance(action, dict) else None
+    if kind == "play_land":
+        _step_play_land(g, action)
+    elif kind == "cast":
+        _step_cast(g, action)
+    elif kind == "pass":
+        _step_pass(g)
+    else:
+        # attach/activate arrive in Task 8, attack in Task 9,
+        # mulligan/keep in Task 10.
+        raise IllegalAction(f"unknown or unsupported action type {kind!r}")
+    _record_activations(g)
+
+
+def _step_play_land(g: Game, action: dict):
+    name = action.get("card")
+    if g.phase not in ("main1", "main2"):
+        raise IllegalAction(f"cannot play a land during {g.phase}")
+    if name not in g.hand:
+        raise IllegalAction(f"{name!r} is not in hand")
+    card = g.card(name)
+    if not card.is_land:
+        raise IllegalAction(f"{name!r} is not a land")
+    if g.land_drops_remaining <= 0:
+        raise IllegalAction("no land drops remaining this turn")
+    # --- all checks passed; mutation begins ---
+    g.hand.remove(name)
+    perm = g.new_perm(name, tapped=card.data.enters_tapped)
+    g._land_drops_used += 1
+    g.emit(f"played {name}")                    # cause precedes the ETB effects
+    fire(g, "land_etb", entering=perm)
+
+
+def _step_cast(g: Game, action: dict):
+    name = action.get("card")
+    if g.phase not in ("main1", "main2"):
+        raise IllegalAction(f"cannot cast during {g.phase}")
+    in_hand = name in g.hand
+    from_command = (not in_hand and name == g.commander_name
+                    and name in g.command)
+    if not in_hand and not from_command:
+        raise IllegalAction(f"{name!r} is not in hand or the command zone")
+    card = g.card(name)
+    if card.is_land:
+        raise IllegalAction(f"{name!r} is a land — use play_land")
+    if card.inert_reason:
+        raise IllegalAction(f"{name!r} is not simulable ({card.inert_reason})")
+    tax = 2 * g.commander_casts if from_command else 0
+    cost = _cast_cost(g, card, tax)
+    if not can_pay(g, cost):
+        raise IllegalAction(f"cannot pay for {name!r}")
+    # --- all checks passed; mutation begins ---
+    pay(g, cost)
+    if in_hand:
+        g.hand.remove(name)
+    g.spells_cast_this_turn += 1      # BEFORE the spell's own cast triggers:
+                                      # Grapeshot-style counts include the spell
+    if from_command and tax > 0:
+        g.emit(f"cast {name} (commander, tax {tax})")
+    else:
+        g.emit(f"cast {name}")        # cause precedes trigger effects in the log
+    # Battlefield listeners only: the spell is in no battlefield zone yet, so
+    # it never hears its own cast (spec §Card annotation DSL).
+    fire(g, "spell_cast", spell=card)
+    if card.data.types & {"instant", "sorcery"}:
+        for t in card.triggers_for("cast"):
+            _run_trigger(g, name, None, t, {})
+        g.graveyard.append(name)
+    else:
+        # Permanents enter untapped unless the card data says enters_tapped
+        # (lands are rejected above — they are played, never cast).
+        perm = g.new_perm(name, tapped=card.data.enters_tapped)
+        for t in card.triggers_for("cast"):
+            _run_trigger(g, name, perm, t, {})
+        for t in card.triggers_for("etb"):
+            _run_trigger(g, name, perm, t, {})
+        if card.is_creature:
+            fire(g, "creature_etb", entering=perm)
+        if card.is_equipment:
+            fire(g, "equipment_etb", entering=perm)
+    if from_command:
+        g.command.remove(name)
+        g.commander_casts += 1
+
+
+def _step_pass(g: Game):
+    if g.phase not in ("main1", "combat", "main2", "end"):
+        raise IllegalAction(f"cannot pass during {g.phase}")
+    # --- all checks passed; mutation begins ---
+    if g.phase in ("main1", "main2"):
+        check_combos(g)               # end-of-main-phase combo snapshot (Task 11)
+    if g.phase == "main1":
+        g.phase = "combat"
+        g.emit("phase: combat")
+    elif g.phase == "combat":
+        # Task 9 adds extra-combat replays; for now combat always ends.
+        g.phase = "main2"
+        g.emit("phase: main2")
+    else:
+        # main2 (or a resumed "end") rolls through end straight into the next
+        # turn — "end" is a transient phase, never a resting state.
+        _begin_new_turn(g)
+
+
+def _begin_new_turn(g: Game):
+    """End the current turn and start the next: untap, clear end-of-turn
+    pumps, reset per-turn counters and the mana pool (spec §Engine: the pool
+    persists for the whole turn — not across turns), upkeep, draw."""
+    g.turn += 1
+    g.phase = "main1"
+    for p in g.battlefield:
+        p.tapped = False
+        p.pump_eot[:] = [0, 0]
+    g.mana_pool = {c: 0 for c in COLORS} | {"C": 0, "any": 0}
+    g._land_drops_used = 0
+    g.spells_cast_this_turn = 0
+    g.combats_done = 0
+    g.extra_combats = 0
+    g.emit(f"turn {g.turn} begins")
+    fire(g, "upkeep")
+    # This solitaire format always draws — turn 1 included: the hypergeometric
+    # acceptance tests count 7 + N cards seen by turn N.
+    execute_verb(g, None, "draw", count=1)
+    _record_activations(g)            # turn start, after upkeep/draw (Task 10's
+                                      # turn-one entry reuses this path)
+
+
+def legal_actions(g: Game) -> list:
+    """Factored legal-action list (spec §Interactive mode), deterministic
+    order: playable land names (deduped, name-sorted), castable spells sorted
+    by (mv, name) — including the commander with tax and reductions applied —
+    then pass. Attach/activate (Task 8) and attack (Task 9) entries arrive in
+    later tasks; mulligan-phase actions in Task 10."""
+    if g.phase == "mulligan":
+        return []
+    actions = []
+    if g.phase in ("main1", "main2"):
+        if g.land_drops_remaining > 0:
+            actions += [{"type": "play_land", "card": n}
+                        for n in sorted({n for n in g.hand if g.card(n).is_land})]
+        castable = set()
+        for n in set(g.hand):
+            card = g.card(n)
+            if (not card.is_land and not card.inert_reason
+                    and can_pay(g, _cast_cost(g, card, tax=0))):
+                castable.add(n)
+        cname = g.commander_name
+        if cname in g.command and cname not in g.hand:
+            card = g.card(cname)
+            if (not card.is_land and not card.inert_reason
+                    and can_pay(g, _cast_cost(g, card, tax=2 * g.commander_casts))):
+                castable.add(cname)
+        actions += [{"type": "cast", "card": n}
+                    for n in sorted(castable, key=lambda n: (g.card(n).mv, n))]
+    actions.append({"type": "pass"})
+    return actions

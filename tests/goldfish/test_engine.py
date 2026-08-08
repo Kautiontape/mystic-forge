@@ -8,15 +8,18 @@ from goldfish.engine import (
     IllegalAction,
     _payment_plan,
     can_pay,
+    check_combos,
     check_condition,
     derive_seed,
     effective_keywords,
     effective_power,
     execute_verb,
     fire,
+    legal_actions,
     new_game,
     pay,
     resolve_count,
+    step,
     untapped_producers,
 )
 from tests.goldfish.test_cards import make_data  # reuse the factory
@@ -25,6 +28,18 @@ from tests.goldfish.test_cards import make_data  # reuse the factory
 def bf_land(g, name):
     p = g.new_perm(name)
     return p
+
+
+def started(cards, deck, seed=1, hand=None):
+    """A game skipped past the mulligan into turn 1 main1 (module-level for
+    reuse by later task tests). Land drops derive from _land_drops_used (0 by
+    default), so one drop is available without further setup."""
+    g = new_game(cards, deck, "Boss", seed=seed)
+    g.phase = "main1"
+    g.turn = 1
+    if hand is not None:
+        g.hand[:] = hand
+    return g
 
 
 def annotated(cards, name, ann_dict):
@@ -78,6 +93,8 @@ def test_state_roundtrip():
     g.turn = 3
     g.life_gained = 7
     g.trigger_fires["Tremors|creature_etb|damage"] = 4
+    g._land_drops_used = 1
+    g.static_active_turn["Doubler|token_doubling"] = 2
     p = g.new_perm("Hammer", attached=["b1"], pump_eot=[1, 2], pump_perm=[3, 4],
                    is_token=True, token_power=5, token_toughness=6,
                    token_keywords=("trample",))
@@ -110,6 +127,13 @@ def test_state_roundtrip():
     assert g2.life_gained == g.life_gained == 7
     assert g2.trigger_fires == g.trigger_fires == {"Tremors|creature_etb|damage": 4}
     assert g2.rng.getstate() == g.rng.getstate()                # rng state travels
+    # land drops serialize as the used counter; remaining is computed display
+    assert g2._land_drops_used == g._land_drops_used == 1
+    assert g2.land_drops_remaining == g.land_drops_remaining == 0   # 1 allowed - 1 used
+    assert blob["land_drops_used"] == 1
+    assert blob["land_drops_remaining"] == 0
+    assert (g2.static_active_turn == g.static_active_turn
+            == {"Doubler|token_doubling": 2})
 
     # (b) aliasing regression guard: mutating the original game's combo
     # tracking list, and the caller's combos argument, after to_dict() was
@@ -858,3 +882,329 @@ def test_token_doubling_stacks_multiplicatively():
     g.new_perm("Doubler"); g.new_perm("Doubler")
     execute_verb(g, None, "create_token", count=1, power=1, toughness=1)
     assert sum(1 for p in g.battlefield if p.is_token) == 4     # 1 * 2^2
+
+
+# -- Task 7: play_land / cast / pass actions + turn engine -----------------
+
+def test_play_land_and_drop_counter():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=["Plains", "Plains"])
+    step(g, {"type": "play_land", "card": "Plains"})
+    assert g.land_drops_remaining == 0
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "play_land", "card": "Plains"})
+    assert len(g.hand) == 1                      # unmutated on rejection
+
+
+def test_play_land_enters_tapped_and_fires_land_etb():
+    cards = mini_cards()
+    cards["Gate"] = SimCard(data=make_data("Gate", types=frozenset({"land"}),
+                            produces={"W": 1}, enters_tapped=True),
+                            ann=None, scope_class=None)
+    cards["Landfall"] = SimCard(data=make_data("Landfall", cost=parse_cost("{1}{G}"),
+                                types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Landfall", {"name": "Landfall", "triggers": [
+        {"on": "land_etb", "do": "gain_life", "count": 1}]})
+    g = started(cards, ["Plains"] * 40, hand=["Gate"])
+    g.new_perm("Landfall")
+    step(g, {"type": "play_land", "card": "Gate"})
+    gate = next(p for p in g.battlefield if p.name == "Gate")
+    assert gate.tapped is True                   # enters_tapped respected
+    assert g.life_gained == 1                    # land_etb fired for the drop
+    played = next(i for i, line in enumerate(g.log) if "played Gate" in line)
+    trig = next(i for i, line in enumerate(g.log) if "Landfall trigger" in line)
+    assert played < trig                         # cause precedes effects
+
+
+def test_cast_commander_with_tax():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    for _ in range(3):
+        g.new_perm("Mountain")
+    step(g, {"type": "cast", "card": "Boss"})            # {2}{R}, exact
+    assert g.commander_casts == 1 and g.command == []
+    # return to command zone by hand for tax test:
+    g.battlefield = [p for p in g.battlefield if p.name != "Boss"]
+    g.command = ["Boss"]
+    for p in g.battlefield:
+        p.tapped = False
+    assert not any(a["type"] == "cast" and a["card"] == "Boss"
+                   for a in legal_actions(g))            # 3 lands can't pay {4}{R}
+
+
+def test_commander_recast_logs_tax():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.commander_casts = 1                                # simulate a prior cast
+    for _ in range(5):
+        g.new_perm("Mountain")
+    step(g, {"type": "cast", "card": "Boss"})            # {2}{R} + {2} tax, exact
+    assert g.commander_casts == 2 and g.command == []
+    assert any("cast Boss (commander, tax 2)" in line for line in g.log)
+
+
+def test_pass_advances_and_new_turn_untaps_draws():
+    cards = mini_cards()
+    g = started(cards, ["Bear"] * 40, hand=[])
+    p = g.new_perm("Plains"); p.tapped = True
+    for ph in ("combat", "main2", "end"):
+        step(g, {"type": "pass"})
+        if ph != "end":
+            assert g.phase == ph
+    assert g.turn == 2 and g.phase == "main1"
+    assert p.tapped is False and len(g.hand) == 1        # untap + draw
+    assert g.land_drops_remaining == 1 and g.spells_cast_this_turn == 0
+
+
+def test_new_turn_clears_pump_eot_pool_and_counters():
+    cards = mini_cards()
+    g = started(cards, ["Bear"] * 40, hand=[])
+    bear = g.new_perm("Bear")
+    bear.pump_eot[:] = [3, 3]
+    bear.pump_perm[:] = [1, 1]
+    g.spells_cast_this_turn = 2
+    g._land_drops_used = 1
+    g.combats_done = 1
+    g.extra_combats = 1
+    g.mana_pool["R"] = 2                        # pool persists for the turn only
+    for _ in range(3):
+        step(g, {"type": "pass"})
+    assert g.turn == 2
+    assert bear.pump_eot == [0, 0] and bear.pump_perm == [1, 1]
+    assert g.spells_cast_this_turn == 0 and g.land_drops_remaining == 1
+    assert g.combats_done == 0 and g.extra_combats == 0
+    assert g.mana_pool == {c: 0 for c in "WUBRG"} | {"C": 0, "any": 0}
+
+
+def test_dynamic_extra_land_drops():
+    cards = mini_cards()
+    cards["Azusa"] = SimCard(data=make_data("Azusa", cost=parse_cost("{2}{G}"),
+                             types=frozenset({"creature"}), power=1, toughness=2),
+                             ann=None, scope_class=None)
+    annotated(cards, "Azusa", {"name": "Azusa",
+                               "statics": [{"kind": "extra_land_drops", "count": 2}]})
+    g = started(cards, ["Plains"] * 40, hand=["Plains", "Plains", "Plains"])
+    step(g, {"type": "play_land", "card": "Plains"})
+    g.new_perm("Azusa")                                   # arrives mid-turn
+    assert g.land_drops_remaining == 2                    # dynamic: 1+2 total, 1 used
+    step(g, {"type": "play_land", "card": "Plains"})
+    step(g, {"type": "play_land", "card": "Plains"})
+    assert g.land_drops_remaining == 0
+
+
+def test_cast_counts_spell_before_own_triggers_and_feeds_listeners():
+    # Pinned (spec §Card annotation DSL, Counts): a spell's own cast increments
+    # spells_cast_this_turn BEFORE its triggers resolve — Grapeshot-style
+    # counts include the spell itself — and battlefield spell_cast listeners
+    # DO hear the cast (the spell itself is not a listener).
+    cards = mini_cards()
+    cards["Bolt"] = SimCard(data=make_data("Bolt", cost=parse_cost("{R}"),
+                            types=frozenset({"instant"})), ann=None, scope_class=None)
+    annotated(cards, "Bolt", {"name": "Bolt", "triggers": [
+        {"on": "cast", "do": "damage", "target": "one_opponent",
+         "count": "per_spell_cast_this_turn"}]})
+    cards["Shrine"] = SimCard(data=make_data("Shrine", cost=parse_cost("{2}"),
+                              types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Shrine", {"name": "Shrine", "triggers": [
+        {"on": "spell_cast", "do": "gain_life", "count": 1}]})
+    g = started(cards, ["Plains"] * 40, hand=["Bolt"])
+    g.new_perm("Shrine")
+    for _ in range(3):
+        g.new_perm("Mountain")
+    step(g, {"type": "cast", "card": "Bolt"})
+    assert g.opponents == [39]                  # exactly 1 damage, not 0
+    assert g.life_gained == 1                   # battlefield listener fired
+    assert g.graveyard == ["Bolt"]              # instant resolved to graveyard
+    assert g.spells_cast_this_turn == 1
+    assert g.trigger_fires["Bolt|cast|damage"] == 1
+
+
+def test_cast_permanent_self_triggers_then_global_etb_excluding_self():
+    cards = mini_cards()
+    cards["Herald"] = SimCard(data=make_data("Herald", cost=parse_cost("{1}"),
+                              types=frozenset({"creature"}), power=1, toughness=1),
+                              ann=None, scope_class=None)
+    annotated(cards, "Herald", {"name": "Herald", "triggers": [
+        {"on": "cast", "do": "treasure", "count": 1},
+        {"on": "etb", "do": "gain_life", "count": 1},
+        {"on": "creature_etb", "do": "draw", "count": 1}]})
+    cards["Watcher"] = SimCard(data=make_data("Watcher", cost=parse_cost("{2}"),
+                               types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Watcher", {"name": "Watcher", "triggers": [
+        {"on": "creature_etb", "do": "draw", "count": 1}]})
+    g = started(cards, ["Plains"] * 40, hand=["Herald"])
+    g.new_perm("Watcher")
+    g.new_perm("Plains")
+    step(g, {"type": "cast", "card": "Herald"})
+    assert sum(1 for p in g.battlefield if p.name == "Treasure") == 1   # self cast
+    assert g.life_gained == 1                                           # self etb
+    assert len(g.hand) == 1                     # Watcher drew exactly 1; Herald's own
+                                                # creature_etb listener was excluded
+    assert "Herald|creature_etb|draw" not in g.trigger_fires
+    cast_i = next(i for i, line in enumerate(g.log) if "cast Herald" in line)
+    self_cast = next(i for i, line in enumerate(g.log)
+                     if "Herald trigger — treasure" in line)
+    self_etb = next(i for i, line in enumerate(g.log)
+                    if "Herald trigger — gain_life" in line)
+    global_etb = next(i for i, line in enumerate(g.log)
+                      if "Watcher trigger — draw" in line)
+    assert cast_i < self_cast < self_etb < global_etb
+
+
+def test_cast_equipment_fires_equipment_etb():
+    cards = mini_cards()
+    cards["Smith"] = SimCard(data=make_data("Smith", cost=parse_cost("{2}"),
+                             types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Smith", {"name": "Smith", "triggers": [
+        {"on": "equipment_etb", "do": "gain_life", "count": 1}]})
+    g = started(cards, ["Plains"] * 40, hand=["Hammer"])
+    g.new_perm("Smith")
+    g.new_perm("Plains")
+    step(g, {"type": "cast", "card": "Hammer"})
+    assert g.life_gained == 1
+    hammer = next(p for p in g.battlefield if p.name == "Hammer")
+    assert hammer.tapped is False               # permanents enter untapped
+
+
+def test_illegal_actions_leave_game_unmutated():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=["Bear", "Plains"])
+    snap = g.to_dict()
+    for bad in (
+        {"type": "cast", "card": "Bear"},           # {1}{G} with no producers
+        {"type": "play_land", "card": "Mountain"},  # not in hand
+        {"type": "cast", "card": "Plains"},         # lands aren't cast
+        {"type": "cast", "card": "Missing"},        # not in hand or command
+        {"type": "attack", "attackers": []},        # Task 9 — not implemented yet
+        {"type": "attach", "card": "x", "target": "y"},   # Task 8
+        {"type": "mulligan"},                       # Task 10
+        {"type": "frobnicate"},                     # unknown type
+    ):
+        with pytest.raises(IllegalAction):
+            step(g, bad)
+    assert g.to_dict() == snap                      # byte-identical state
+    g.phase = "combat"
+    snap2 = g.to_dict()
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "play_land", "card": "Plains"})   # wrong phase
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "cast", "card": "Bear"})          # casts are main-phase
+    assert g.to_dict() == snap2
+
+
+def test_cost_reduction_color_filter_shaves_generic_never_pips():
+    cards = mini_cards()
+    cards["Medallion"] = SimCard(data=make_data("Medallion", cost=parse_cost("{2}"),
+                                 types=frozenset({"artifact"})), ann=None, scope_class=None)
+    cards["Ember"] = SimCard(data=make_data("Ember", cost=parse_cost("{2}{R}"),
+                             types=frozenset({"creature"}), power=2, toughness=2),
+                             ann=None, scope_class=None)
+    cards["Forest"] = SimCard(data=make_data("Forest", types=frozenset({"land"}),
+                              produces={"G": 1}), ann=None, scope_class=None)
+    annotated(cards, "Medallion", {"name": "Medallion", "statics": [
+        {"kind": "cost_reduction", "filter": "color:R", "amount": 1}]})
+    # {2}{R} -> {1}{R}: Mountain + Plains is exactly enough
+    g = started(cards, ["Plains"] * 40, hand=["Ember"])
+    g.new_perm("Medallion")
+    g.new_perm("Mountain"); g.new_perm("Plains")
+    step(g, {"type": "cast", "card": "Ember"})
+    assert all(p.tapped for p in g.battlefield if g.card(p.name).is_land)
+    # never touches pips: a {R} spell still needs a real R source
+    g2 = started(cards, ["Plains"] * 40, hand=["Runner"])
+    g2.new_perm("Medallion")
+    g2.new_perm("Plains")
+    with pytest.raises(IllegalAction):
+        step(g2, {"type": "cast", "card": "Runner"})
+    # color filter keys off the card's pips: {1}{G} has no R pip, no discount
+    g3 = started(cards, ["Plains"] * 40, hand=["Bear"])
+    g3.new_perm("Medallion")
+    g3.new_perm("Forest")
+    with pytest.raises(IllegalAction):
+        step(g3, {"type": "cast", "card": "Bear"})
+
+
+def test_cost_reduction_equipment_filter_and_floor_at_zero():
+    cards = mini_cards()
+    cards["Forge"] = SimCard(data=make_data("Forge", cost=parse_cost("{2}"),
+                             types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    cards["Sword"] = SimCard(data=make_data("Sword", cost=parse_cost("{3}"),
+                             types=frozenset({"artifact", "equipment"}),
+                             equip_cost=parse_cost("{1}")), ann=None, scope_class=None)
+    cards["Golem"] = SimCard(data=make_data("Golem", cost=parse_cost("{3}"),
+                             types=frozenset({"artifact", "creature"}),
+                             power=3, toughness=3), ann=None, scope_class=None)
+    annotated(cards, "Forge", {"name": "Forge", "statics": [
+        {"kind": "cost_reduction", "filter": "equipment", "amount": 2}]})
+    g = started(cards, ["Plains"] * 40, hand=["Sword", "Golem", "Hammer"])
+    g.new_perm("Forge")
+    g.new_perm("Plains")
+    casts = [a["card"] for a in legal_actions(g) if a["type"] == "cast"]
+    assert "Sword" in casts and "Golem" not in casts    # filter: equipment only
+    # floor at 0 generic: Hammer {1} - 2 is {0} — castable with no mana at all
+    g.battlefield = [p for p in g.battlefield if p.name == "Forge"]
+    step(g, {"type": "cast", "card": "Hammer"})
+    assert any(p.name == "Hammer" for p in g.battlefield)
+    assert g.mana_pool == {c: 0 for c in "WUBRG"} | {"C": 0, "any": 0}
+
+
+def test_cost_reduction_applies_to_commander_tax():
+    cards = mini_cards()
+    cards["Helm"] = SimCard(data=make_data("Helm", cost=parse_cost("{1}"),
+                            types=frozenset({"artifact"})), ann=None, scope_class=None)
+    annotated(cards, "Helm", {"name": "Helm", "statics": [
+        {"kind": "cost_reduction", "filter": "creature", "amount": 2}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.commander_casts = 1                       # tax {2}: total {4}{R} before reduction
+    g.new_perm("Helm")
+    for _ in range(3):
+        g.new_perm("Mountain")
+    step(g, {"type": "cast", "card": "Boss"})   # ({2}+{2}-{2}){R} = {2}{R}: 3 lands pay
+    assert g.commander_casts == 2 and g.command == []
+
+
+def test_legal_actions_factored_and_deterministic():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40,
+                hand=["Plains", "Plains", "Mountain", "Runner", "Bear", "Hammer"])
+    for _ in range(2):
+        g.new_perm("Mountain")
+    g.new_perm("Plains")
+    acts = legal_actions(g)
+    assert acts == [
+        {"type": "play_land", "card": "Mountain"},     # lands deduped, name-sorted
+        {"type": "play_land", "card": "Plains"},
+        {"type": "cast", "card": "Hammer"},            # casts by (mv, name)
+        {"type": "cast", "card": "Runner"},
+        {"type": "cast", "card": "Boss"},              # commander, tax 0, payable
+        {"type": "pass"},
+    ]                                                  # Bear {1}{G}: no G source
+    assert legal_actions(g) == acts                    # deterministic
+    g._land_drops_used = 1
+    assert not any(a["type"] == "play_land" for a in legal_actions(g))
+    g.phase = "combat"
+    assert legal_actions(g) == [{"type": "pass"}]      # main-phase actions gone
+
+
+def test_static_active_turn_records_first_activation():
+    cards = mini_cards()
+    cards["Doubler"] = SimCard(data=make_data("Doubler", cost=parse_cost("{2}"),
+                               types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Doubler", {"name": "Doubler",
+                                 "statics": [{"kind": "token_doubling"}]})
+    g = started(cards, ["Plains"] * 40, hand=["Doubler"])
+    g.new_perm("Plains"); g.new_perm("Plains")
+    step(g, {"type": "cast", "card": "Doubler"})
+    assert g.static_active_turn == {"Doubler|token_doubling": 1}
+    for _ in range(3):
+        g.new_perm("Hammer")                    # metalcraft flips on mid-turn
+    step(g, {"type": "pass"})                   # recorded after the next mutation
+    assert g.static_active_turn["condition|metalcraft"] == 1
+    step(g, {"type": "pass"}); step(g, {"type": "pass"})       # into turn 2
+    assert g.turn == 2
+    assert g.static_active_turn["Doubler|token_doubling"] == 1  # first turn sticks
+
+
+def test_check_combos_stub_returns_none():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    assert check_combos(g) is None

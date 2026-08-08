@@ -20,10 +20,6 @@ class Cost:
     def mv(self) -> int:
         return sum(self.pips.values())
 
-    def colored(self) -> dict:
-        return {k: v for k, v in self.pips.items()
-                if k not in ("generic",) and v}
-
 
 def parse_cost(cost_str: str | None) -> Cost:
     pips = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0, "C": 0, "generic": 0}
