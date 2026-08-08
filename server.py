@@ -3679,6 +3679,7 @@ async def goldfish_start(params: GoldfishStartInput) -> str:
                 "annotations": list(resume["annotations"]),
                 "combos": list(resume["combos"])}
     else:
+        assert params.deck is not None  # _exactly_one_source guarantees this
         try:
             (cards_pool, library, commander, _cmdr_note, _scopes, _approx,
              not_found, unmatched_anns) = await _goldfish_prepare(
