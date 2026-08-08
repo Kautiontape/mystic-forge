@@ -108,7 +108,8 @@ h1 .rune{color:var(--mauve)}
   font-family:var(--font-data);font-size:.8rem}
 .pager a{color:var(--blue);text-decoration:none}.pager span{color:var(--sub)}
 dialog{border:1px solid var(--surface1);border-radius:1rem;background:var(--base);
-  color:var(--text);max-width:44rem;width:92vw;padding:1.3rem;box-shadow:0 20px 60px var(--shadow)}
+  color:var(--text);max-width:44rem;width:92vw;padding:1.3rem;margin:auto;
+  max-height:90vh;overflow:auto;box-shadow:0 20px 60px var(--shadow)}
 dialog::backdrop{background:#0006;backdrop-filter:blur(3px)}
 dialog h3{font-size:1.2rem;margin-bottom:.2rem}
 dialog .sub{color:var(--sub);font-size:.8rem;margin-bottom:.8rem}
@@ -143,7 +144,7 @@ document.getElementById('theme').onclick=()=>{
 };
 function setThemeLabel(){
   document.getElementById('theme').textContent=
-    document.documentElement.dataset.theme==='latte'?'☾ macchiato':'☀ latte';
+    document.documentElement.dataset.theme==='latte'?'\\u{1F319} macchiato':'\\u2600\\uFE0F latte';
 }
 setThemeLabel();
 document.querySelectorAll('.chip[data-copy]').forEach(c=>c.onclick=e=>{
@@ -406,6 +407,7 @@ def render_page(db, row, editable: bool, hp: int = 1, cp: int = 1) -> str:
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext x='8' y='13' font-size='14' text-anchor='middle' fill='%238839ef'%3E✦%3C/text%3E%3C/svg%3E">
 <title>{title} · Mystic Forge</title>
 <script>document.documentElement.dataset.theme=
   localStorage.getItem('mf-theme')||
