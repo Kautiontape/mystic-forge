@@ -384,3 +384,23 @@ def entry_price_summary(db, entry: dict, provider: str = "tcgplayer",
             s["finish"] = finish
             return s
     return None
+
+
+def set_entry_target(db, list_id: int, entry_id: int, target_price):
+    """Set (or clear, with None) an entry's target; appends a set_target event."""
+    row = _find_entry(db, list_id, entry_id=entry_id)
+    if row is None:
+        raise NotFound(f"No entry #{entry_id}")
+    append_event(db, list_id, "set_target",
+                 {"entry_id": entry_id, "target_price": target_price})
+    db.execute("UPDATE watchlist_current SET target_price=?"
+               " WHERE list_id=? AND entry_id=?", (target_price, list_id, entry_id))
+    db.commit()
+    return dict(_find_entry(db, list_id, entry_id=entry_id))
+
+
+def set_label(db, list_id: int, label):
+    """Rename a list; recorded as a set_label event (ignored by entry replay)."""
+    append_event(db, list_id, "set_label", {"label": label})
+    db.execute("UPDATE lists SET label=? WHERE id=?", (label, list_id))
+    db.commit()

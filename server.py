@@ -2813,19 +2813,40 @@ def _resolve_page_key(db, key: str):
     return None, False
 
 
+def _page_row(db, request, param, by_share: bool):
+    key = request.path_params[param]
+    row = (watchlist_db.get_list_by_share(db, key) if by_share
+           else watchlist_db.get_list_by_passphrase(db, key))
+    if row is None:
+        return None
+    row = dict(row)
+    row["_key"] = row["share_code"] if by_share else key
+    return row
+
+
 @mcp.custom_route("/w/{passphrase}", methods=["GET"])
 async def watch_page(request: Request):
     db = _wl_db()
     try:
-        key = request.path_params["passphrase"]
-        row = watchlist_db.get_list_by_passphrase(db, key)
+        row = _page_row(db, request, "passphrase", by_share=False)
         if row is None:
             return HTMLResponse("unknown passphrase", status_code=404)
-        row = dict(row)
-        row["_key"] = key
-        return HTMLResponse(watchlist_pages.render_page(
-            db, row, editable=True,
-            hp=_page_int(request, "hp"), cp=_page_int(request, "cp")))
+        return HTMLResponse(watchlist_pages.render_main(
+            db, row, editable=True, cp=_page_int(request, "cp"),
+            shop=request.query_params.get("shop", "tcgplayer")))
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/w/{passphrase}/history", methods=["GET"])
+async def watch_history_page(request: Request):
+    db = _wl_db()
+    try:
+        row = _page_row(db, request, "passphrase", by_share=False)
+        if row is None:
+            return HTMLResponse("unknown passphrase", status_code=404)
+        return HTMLResponse(watchlist_pages.render_history(
+            db, row, editable=True, hp=_page_int(request, "hp")))
     finally:
         db.close()
 
@@ -2834,15 +2855,76 @@ async def watch_page(request: Request):
 async def share_page(request: Request):
     db = _wl_db()
     try:
-        key = request.path_params["share_code"]
-        row = watchlist_db.get_list_by_share(db, key)
+        row = _page_row(db, request, "share_code", by_share=True)
         if row is None:
             return HTMLResponse("unknown share code", status_code=404)
-        row = dict(row)
-        row["_key"] = row["share_code"]
-        return HTMLResponse(watchlist_pages.render_page(
-            db, row, editable=False,
-            hp=_page_int(request, "hp"), cp=_page_int(request, "cp")))
+        return HTMLResponse(watchlist_pages.render_main(
+            db, row, editable=False, cp=_page_int(request, "cp"),
+            shop=request.query_params.get("shop", "tcgplayer")))
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/s/{share_code}/history", methods=["GET"])
+async def share_history_page(request: Request):
+    db = _wl_db()
+    try:
+        row = _page_row(db, request, "share_code", by_share=True)
+        if row is None:
+            return HTMLResponse("unknown share code", status_code=404)
+        return HTMLResponse(watchlist_pages.render_history(
+            db, row, editable=False, hp=_page_int(request, "hp")))
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/target", methods=["POST"])
+async def api_target(request: Request):
+    """Set or clear an entry's target from the page. Passphrase key only."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        tp = body.get("target_price")
+        if tp is not None and (not isinstance(tp, (int, float)) or tp < 0):
+            return JSONResponse({"error": "bad target_price"}, status_code=400)
+        try:
+            entry = watchlist_db.set_entry_target(
+                db, row["id"], int(body.get("entry_id", -1)), tp)
+        except watchlist_db.NotFound as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        return JSONResponse({"entry_id": entry["entry_id"],
+                             "target_price": entry["target_price"]})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/rename", methods=["POST"])
+async def api_rename(request: Request):
+    """Rename a list from the page. Passphrase key only."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        label = str(body.get("label", "")).strip()[:80] or None
+        watchlist_db.set_label(db, row["id"], label)
+        return JSONResponse({"label": label})
     finally:
         db.close()
 
