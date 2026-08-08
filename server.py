@@ -1467,11 +1467,45 @@ async def archidekt_export(params: ArchidektDeckInput) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _archidekt_line(
+    quantity: int,
+    name: str,
+    set_code: str,
+    collector: str,
+    finish: Optional[str],
+    category: str,
+    labels: str,
+) -> str:
+    """Build one Archidekt import line.
+
+    Grammar, verified against Archidekt's own text export 2026-08-08:
+      {qty}x {name} ({set}) {collector} *F* [{Category}{flags}] ^{Label},{#hex}^
+
+    `category` and `labels` arrive already formatted with their leading space.
+    """
+    line = f"{quantity}x {name}"
+    if set_code:
+        line += f" ({set_code})"
+    if collector:
+        line += f" {collector}"
+    marker = _finish_marker(finish)
+    if marker:
+        line += f" {marker}"
+    return line + category + labels
+
+
 class DeckCardEntry(BaseModel):
     """A single card entry for deck formatting."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     name: str = Field(..., description="Card name.")
     quantity: int = Field(default=1, ge=1, le=99)
+    finish: Optional[CardFinish] = Field(
+        default=None,
+        description=(
+            "Card finish. 'foil' emits *F* and 'etched' emits *E* on the line, "
+            "which Archidekt imports as that finish. Omit for a normal card."
+        ),
+    )
     category: Optional[str] = Field(default=None, description="Category name (e.g., 'Ramp', 'Draw', 'Removal', 'Lands').")
     commander: bool = Field(default=False, description="True if this is the commander (or partner).")
     maybeboard: bool = Field(default=False, description="True if this should go in the maybeboard.")
@@ -1507,6 +1541,10 @@ async def format_archidekt(params: FormatDeckInput) -> str:
       1x Commander Name [Commander{top}]
       1x Maybe Card [Maybeboard{noDeck}{noPrice}]
       1x Labeled Card [Draw] ^To Buy,#2ccce4^
+      1x Foil Card (dmr) 281 *F* [Ramp]
+
+    Set finish='foil' or finish='etched' on a card to mark it as such (*F* / *E*).
+    Pair it with include_set_codes so the marked line names a printing.
 
     Category examples: Ramp, Draw, Removal, Counters, Evasion, Finisher,
     Sacrifice, Recursion, Lands, Protection, Combo, Tokens, Tribal, etc.
@@ -1542,31 +1580,38 @@ async def format_archidekt(params: FormatDeckInput) -> str:
             card_name = entry.name
             warnings.append(f"# WARNING: '{entry.name}' not found on Scryfall")
 
-        line = f"{entry.quantity}x {card_name}"
-
-        # Set code (only if requested and card was found)
+        set_code = ""
+        collector = ""
         if params.include_set_codes and scryfall_card:
             set_code = scryfall_card.get("set", "")
             collector = scryfall_card.get("collector_number", "")
-            if set_code:
-                line += f" ({set_code})"
-            if collector:
-                line += f" {collector}"
 
         # Category annotation
+        cat_annotation = ""
         if entry.commander:
-            line += " [Commander{top}]"
+            cat_annotation = " [Commander{top}]"
         elif entry.maybeboard:
-            line += " [Maybeboard{noDeck}{noPrice}]"
+            cat_annotation = " [Maybeboard{noDeck}{noPrice}]"
         elif entry.category:
-            line += f" [{entry.category}]"
+            cat_annotation = f" [{entry.category}]"
 
         # Labels
+        label_text = ""
         if entry.label:
             if entry.label_color:
-                line += f" ^{entry.label},{entry.label_color}^"
+                label_text = f" ^{entry.label},{entry.label_color}^"
             else:
-                line += f" ^{entry.label}^"
+                label_text = f" ^{entry.label}^"
+
+        line = _archidekt_line(
+            quantity=entry.quantity,
+            name=card_name,
+            set_code=set_code,
+            collector=collector,
+            finish=entry.finish.value if entry.finish else None,
+            category=cat_annotation,
+            labels=label_text,
+        )
 
         lines.append(line)
 
