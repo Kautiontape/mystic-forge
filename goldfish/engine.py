@@ -107,7 +107,10 @@ class Game:
         return _land_drops_allowed(self) - self._land_drops_used
 
     def card(self, name: str) -> SimCard:
-        return self.cards[name]
+        try:
+            return self.cards[name]
+        except KeyError:
+            raise IllegalAction(f"unknown card {name!r}")
 
     def perm(self, pid: str) -> Permanent:
         for p in self.battlefield:
@@ -127,6 +130,8 @@ class Game:
 
     # -- serialization (D3) ------------------------------------------------
     def to_dict(self) -> dict:
+        """"land_drops_remaining" is display-only; from_dict reads only
+        "land_drops_used"."""
         return {
             "turn": self.turn, "phase": self.phase,
             "mana_pool": dict(self.mana_pool),
@@ -758,11 +763,15 @@ def step(g: Game, action: dict) -> None:
         # attach/activate arrive in Task 8, attack in Task 9,
         # mulligan/keep in Task 10.
         raise IllegalAction(f"unknown or unsupported action type {kind!r}")
+    # A turn-advancing pass already recorded inside _begin_new_turn; this
+    # second call is deliberate and idempotent (setdefault) — do not "fix" it.
     _record_activations(g)
 
 
 def _step_play_land(g: Game, action: dict):
     name = action.get("card")
+    if not isinstance(name, str):
+        raise IllegalAction(f"action needs a card name, got {name!r}")
     if g.phase not in ("main1", "main2"):
         raise IllegalAction(f"cannot play a land during {g.phase}")
     if name not in g.hand:
@@ -782,6 +791,8 @@ def _step_play_land(g: Game, action: dict):
 
 def _step_cast(g: Game, action: dict):
     name = action.get("card")
+    if not isinstance(name, str):
+        raise IllegalAction(f"action needs a card name, got {name!r}")
     if g.phase not in ("main1", "main2"):
         raise IllegalAction(f"cannot cast during {g.phase}")
     in_hand = name in g.hand
@@ -802,6 +813,12 @@ def _step_cast(g: Game, action: dict):
     pay(g, cost)
     if in_hand:
         g.hand.remove(name)
+    else:
+        # Commander bookkeeping happens with zone departure so the commander
+        # never exists in two zones during the trigger cascade (Task 11's
+        # check_combos inspects zones mid-cascade).
+        g.command.remove(name)
+        g.commander_casts += 1
     g.spells_cast_this_turn += 1      # BEFORE the spell's own cast triggers:
                                       # Grapeshot-style counts include the spell
     if from_command and tax > 0:
@@ -827,9 +844,6 @@ def _step_cast(g: Game, action: dict):
             fire(g, "creature_etb", entering=perm)
         if card.is_equipment:
             fire(g, "equipment_etb", entering=perm)
-    if from_command:
-        g.command.remove(name)
-        g.commander_casts += 1
 
 
 def _step_pass(g: Game):
@@ -871,7 +885,8 @@ def _begin_new_turn(g: Game):
     # acceptance tests count 7 + N cards seen by turn N.
     execute_verb(g, None, "draw", count=1)
     _record_activations(g)            # turn start, after upkeep/draw (Task 10's
-                                      # turn-one entry reuses this path)
+                                      # turn-one entry reuses this path); step()
+                                      # records again post-action — idempotent
 
 
 def legal_actions(g: Game) -> list:

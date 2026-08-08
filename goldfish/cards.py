@@ -180,6 +180,14 @@ def _check_verb_params(card, do, t: Trigger | Activated):
     if do == "add_mana" and not (t.pips or t.any_mana):
         raise AnnotationError(card, "add_mana", "missing pips",
                               {'pips:"{R}{R}"', "colors:any + count"})
+    if t.pips is not None:
+        # Validate here: a malformed pip string that survived to the engine
+        # would raise CostParseError mid-cast, AFTER pay() — corrupting state.
+        try:
+            parse_cost(t.pips)
+        except CostParseError:
+            raise AnnotationError(card, "pips", t.pips,
+                                  {"a mana pip string like {R}{R}"})
     if do == "pump" and (t.power is None or t.toughness is None):
         raise AnnotationError(card, "pump", "missing power/toughness",
                               {"power:<int>", "toughness:<int>"})

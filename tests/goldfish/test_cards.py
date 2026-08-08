@@ -197,6 +197,17 @@ def test_add_mana_missing_pips_rejected():
             {"on": "etb", "do": "add_mana"}]}])
 
 
+def test_add_mana_malformed_pips_rejected_on_trigger_and_activated():
+    # A malformed pip string that survived validation would raise
+    # CostParseError mid-cast, AFTER pay() — corrupting engine state.
+    with pytest.raises(AnnotationError):
+        validate_annotations([{"name": "X", "triggers": [
+            {"on": "cast", "do": "add_mana", "pips": "{Q}"}]}])
+    with pytest.raises(AnnotationError):
+        validate_annotations([{"name": "X", "activated": [
+            {"cost": "{T}", "do": "add_mana", "pips": "{W/U}"}]}])
+
+
 def test_pump_missing_power_rejected():
     with pytest.raises(AnnotationError):
         validate_annotations([{"name": "X", "triggers": [

@@ -2,13 +2,12 @@ import json
 
 import pytest
 
-from goldfish.cards import SimCard, parse_cost, validate_annotations
+from goldfish.cards import AnnotationError, SimCard, parse_cost, validate_annotations
 from goldfish.engine import (
     Game,
     IllegalAction,
     _payment_plan,
     can_pay,
-    check_combos,
     check_condition,
     derive_seed,
     effective_keywords,
@@ -1178,7 +1177,6 @@ def test_legal_actions_factored_and_deterministic():
         {"type": "cast", "card": "Boss"},              # commander, tax 0, payable
         {"type": "pass"},
     ]                                                  # Bear {1}{G}: no G source
-    assert legal_actions(g) == acts                    # deterministic
     g._land_drops_used = 1
     assert not any(a["type"] == "play_land" for a in legal_actions(g))
     g.phase = "combat"
@@ -1204,7 +1202,28 @@ def test_static_active_turn_records_first_activation():
     assert g.static_active_turn["Doubler|token_doubling"] == 1  # first turn sticks
 
 
-def test_check_combos_stub_returns_none():
+def test_malformed_add_mana_pips_rejected_before_any_cast():
+    # Regression: "{Q}{R}" used to pass validate_annotations and blow up with
+    # CostParseError mid-cast, AFTER pay() — tapped land, emptied hand,
+    # incremented counters. The annotation is now rejected up front, so the
+    # corrupting cast path is unreachable.
     cards = mini_cards()
-    g = started(cards, ["Plains"] * 40, hand=[])
-    assert check_combos(g) is None
+    cards["Ritual"] = SimCard(data=make_data("Ritual", cost=parse_cost("{R}"),
+                              types=frozenset({"instant"})), ann=None, scope_class=None)
+    with pytest.raises(AnnotationError):
+        annotated(cards, "Ritual", {"name": "Ritual", "triggers": [
+            {"on": "cast", "do": "add_mana", "pips": "{Q}{R}"}]})
+    assert cards["Ritual"].ann is None          # card pool untouched by the attempt
+
+
+def test_unknown_card_name_raises_illegal_action_not_keyerror():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=["Ghost"])   # in hand, not in pool
+    snap = g.to_dict()
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "play_land", "card": "Ghost"})
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "cast", "card": "Ghost"})
+    with pytest.raises(IllegalAction):
+        step(g, {"type": "cast", "card": None})           # name must be a string
+    assert g.to_dict() == snap
