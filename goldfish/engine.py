@@ -459,13 +459,22 @@ def _damage_opponent(g: Game, idx: int, amount: int):
     g.opponents[idx] = max(0, g.opponents[idx] - amount)
 
 
-def _check_table_win(g: Game):
-    """Table kill: every opponent at 0 sets won_turn exactly once. Called
-    from combat damage AND the damage verb — a cast-trigger burn kill must
-    not leave a dead table simulating on to the turn cap."""
-    if g.won_turn is None and all(life <= 0 for life in g.opponents):
+def _declare_win(g: Game, reason: str):
+    """Single-sourced win declaration (table kill and combo wins): sets
+    won_turn exactly once — an earlier win is never overwritten and the
+    pinned "<reason> — won turn N" line is emitted once. After this, step()
+    accepts only "pass" (post-win gating)."""
+    if g.won_turn is None:
         g.won_turn = g.turn
-        g.emit(f"all opponents defeated — won turn {g.turn}")
+        g.emit(f"{reason} — won turn {g.turn}")
+
+
+def _check_table_win(g: Game):
+    """Table kill: every opponent at 0 wins. Called from combat damage AND
+    the damage verb — a cast-trigger burn kill must not leave a dead table
+    simulating on to the turn cap."""
+    if all(life <= 0 for life in g.opponents):
+        _declare_win(g, "all opponents defeated")
 
 
 def _tutor_match(g: Game, f: str, name: str) -> bool:
@@ -771,7 +780,11 @@ def bottom_order(hand: list, cards: dict, rules: MulliganRules, n_bottom: int) -
     golden logs): bottom excess mana sources above max_sources first (lands
     before rocks — rocks are kept preferentially since they're colorless-
     agnostic value), then highest-MV spells, then any remaining lands as a
-    last resort. Ties are broken by name throughout."""
+    last resort. Ties are broken by name throughout. Rock-heavy corner,
+    acknowledged: on a forced keep (the keep rule never approved this hand)
+    the lands-first excess rule can bottom every real land while rocks stay —
+    the order is spec-pinned, so that hand is kept as ordered rather than
+    special-cased."""
     hand = list(hand)
     to_bottom: list = []
     sources, _ = _count_sources(hand, cards, rules)
@@ -794,11 +807,23 @@ def bottom_order(hand: list, cards: dict, rules: MulliganRules, n_bottom: int) -
     return to_bottom
 
 
+_KEEP_FLOOR = 4    # forced-keep floor: hands kept at or below this size can't
+                   # mulligan further (the London "hands of <= 5 are always
+                   # kept" rule means a mull below 5 is never offered)
+
+
 def _effective_mulls(g: Game, rules: MulliganRules) -> int:
     """Mulligans that count toward the London bottom count: the first
     mulligan is free (EDH) when `rules.free_first` and it has been used."""
     used_free = rules.free_first and g.free_mulligan_used
     return g.mulligans_taken - (1 if used_free else 0)
+
+
+def _target_hand_size(g: Game, rules: MulliganRules) -> int:
+    """The hand size a keep right now would produce: 7 minus effective
+    (non-free) mulligans taken — the single source for every keep/mulligan
+    site that needs it."""
+    return 7 - _effective_mulls(g, rules)
 
 
 def _apply_mulligan(g: Game, rules: MulliganRules) -> None:
@@ -811,7 +836,7 @@ def _apply_mulligan(g: Game, rules: MulliganRules) -> None:
     if rules.free_first and g.mulligans_taken == 1:
         g.free_mulligan_used = True
     execute_verb(g, None, "draw", count=7)
-    g.emit(f"mulligan to {7 - _effective_mulls(g, rules)}")
+    g.emit(f"mulligan to {_target_hand_size(g, rules)}")
 
 
 def _apply_keep(g: Game, bottoms: list, hand_size: int, rules: MulliganRules) -> None:
@@ -838,9 +863,9 @@ def auto_mulligan(g: Game, rules: MulliganRules, max_mulls: int = 3) -> None:
     default rules, so this floor is normally not the reason the loop exits."""
     while True:
         eff = _effective_mulls(g, rules)
-        hand_size = 7 - eff
+        hand_size = _target_hand_size(g, rules)
         if (keep_decision(g.hand, g.cards, rules, hand_size)
-                or hand_size <= 4 or eff >= max_mulls):
+                or hand_size <= _KEEP_FLOOR or eff >= max_mulls):
             bottoms = bottom_order(g.hand, g.cards, rules, len(g.hand) - hand_size)
             _apply_keep(g, bottoms, hand_size, rules)
             break
@@ -851,7 +876,50 @@ def auto_mulligan(g: Game, rules: MulliganRules, max_mulls: int = 3) -> None:
 # -- Actions: play_land / cast / pass + turn engine --------------------------
 
 def check_combos(g: Game) -> None:
-    """Combo detection stub — Task 11 fills it. Called when a main phase ends."""
+    """Passive combo detection (spec §Engine (Combo detection)). Called when a
+    main phase ends AND after every successful main-phase step mutation, so
+    the empty-combos early return below is a real perf guard.
+
+    Per combo: **assembled** — every piece in hand, command zone, or on the
+    battlefield — then **assembled+castable** — the joint cost of the pieces
+    not yet on the battlefield (battlefield pieces cost zero; a piece both in
+    hand and on the battlefield counts as deployed), each priced through the
+    same _cast_cost pipeline a real cast would be charged (commander tax for
+    a command-zone commander piece, cost_reduction statics), summed pip-wise
+    into one Cost and payable with currently available producers. The joint
+    same-turn payment is a flagged simplification (ignores casting a piece
+    the turn before). A `wins` combo ends the game at first
+    assembled+castable: each undeployed piece is logged as cast (feeding
+    spells_cast_this_turn and the cast metrics) and the win goes through
+    _declare_win — the kill-turn histogram reads won_turn, and an earlier win
+    is never overwritten."""
+    if not g.combos:
+        return
+    fielded = {p.name for p in g.battlefield}
+    accessible = set(g.hand) | set(g.command) | fielded
+    for i, pieces in enumerate(g.combos):
+        if (g.combo_assembled_turn[i] is None
+                and all(name in accessible for name in pieces)):
+            g.combo_assembled_turn[i] = g.turn
+            g.emit(f"combo {i + 1} assembled: {', '.join(pieces)}")
+        if g.combo_assembled_turn[i] is None or g.combo_castable_turn[i] is not None:
+            continue
+        undeployed = [name for name in pieces if name not in fielded]
+        joint = dict(parse_cost(None).pips)
+        for name in undeployed:
+            tax = (2 * g.commander_casts
+                   if name == g.commander_name and name in g.command else 0)
+            for pip, qty in _cast_cost(g, g.card(name), tax).pips.items():
+                joint[pip] = joint.get(pip, 0) + qty
+        if not can_pay(g, Cost(joint)):
+            continue
+        g.combo_castable_turn[i] = g.turn
+        g.emit(f"combo {i + 1} castable")
+        if g.combo_wins[i]:
+            for name in undeployed:
+                g.spells_cast_this_turn += 1
+                g.emit(f"cast {name} (combo)")
+            _declare_win(g, f"combo {i + 1} wins")
 
 
 def _land_drops_allowed(g: Game) -> int:
@@ -987,8 +1055,12 @@ def _ability_payable(g: Game, perm: Permanent, ability) -> bool:
 
 def step(g: Game, action: dict) -> None:
     """Apply one atomic action (D10). Validates completely first; on
-    IllegalAction the game is guaranteed unmutated."""
+    IllegalAction the game is guaranteed unmutated. Once the game is won
+    (won_turn set — table kill or a wins combo), only "pass" is accepted:
+    batch loops stop, and an interactive driver can only advance phases."""
     kind = action.get("type") if isinstance(action, dict) else None
+    if g.won_turn is not None and kind != "pass":
+        raise IllegalAction(f"game already won on turn {g.won_turn}")
     if kind == "play_land":
         _step_play_land(g, action)
     elif kind == "cast":
@@ -1031,6 +1103,7 @@ def _step_play_land(g: Game, action: dict):
     g._land_drops_used += 1
     g.emit(f"played {name}")                    # cause precedes the ETB effects
     fire(g, "land_etb", entering=perm)
+    check_combos(g)                   # a new producer can flip castable (Task 11)
 
 
 def _step_cast(g: Game, action: dict):
@@ -1088,6 +1161,8 @@ def _step_cast(g: Game, action: dict):
             fire(g, "creature_etb", entering=perm)
         if card.is_equipment:
             fire(g, "equipment_etb", entering=perm)
+    check_combos(g)                   # the cast (or its triggers) may have
+                                      # deployed/tutored the last piece (Task 11)
 
 
 def _step_attach(g: Game, action: dict):
@@ -1117,6 +1192,7 @@ def _step_attach(g: Game, action: dict):
         # validation is the real fix for that corrupted-input case, not this.
         g.perm(eq.attached_to).attached.remove(eq.id)
     _do_attach(g, eq, tgt)
+    check_combos(g)                   # main-phase mutation (Task 11)
 
 
 def _step_activate(g: Game, action: dict):
@@ -1163,6 +1239,8 @@ def _step_activate(g: Game, action: dict):
                 power=ability.power, toughness=ability.toughness,
                 keywords=ability.keywords, tutor_filter=ability.tutor_filter,
                 pips=ability.pips, any_mana=ability.any_mana, duration=ability.duration)
+    check_combos(g)                   # a tutor/token/mana verb can assemble or
+                                      # flip castable mid-main (Task 11)
 
 
 def _attacker_eligible(g: Game, p: Permanent) -> bool:
@@ -1254,8 +1332,7 @@ def _step_mulligan(g: Game) -> None:
     if g.phase != "mulligan":
         raise IllegalAction(f"cannot mulligan during {g.phase}")
     rules = MulliganRules()
-    hand_size = 7 - _effective_mulls(g, rules)
-    if hand_size <= 4:
+    if _target_hand_size(g, rules) <= _KEEP_FLOOR:
         raise IllegalAction("mulligan floor reached — keep is the only legal action")
     # --- all checks passed; mutation begins ---
     _apply_mulligan(g, rules)
@@ -1273,9 +1350,9 @@ def _step_keep(g: Game, action: dict) -> None:
     if not isinstance(bottom, list) or not all(isinstance(n, str) for n in bottom):
         raise IllegalAction(f"keep needs a list of card names to bottom, got {bottom!r}")
     rules = MulliganRules()
-    hand_size = 7 - _effective_mulls(g, rules)
-    required = len(g.hand) - hand_size
-    if len(bottom) != required:
+    hand_size = _target_hand_size(g, rules)
+    required = max(0, len(g.hand) - hand_size)   # a short resumed hand never
+    if len(bottom) != required:                  # demands a negative bottom
         raise IllegalAction(
             f"keep requires bottoming exactly {required} card(s), got {len(bottom)}")
     remaining = list(g.hand)
@@ -1363,13 +1440,15 @@ def legal_actions(g: Game) -> list:
     (offered only while the effective hand size is still above the
     forced-keep floor) and `keep` with the informational bottom count London
     + EDH free-first fixes for a keep right now (default MulliganRules — the
-    action schema carries no rules override)."""
+    action schema carries no rules override). Once the game is won, pass is
+    the only legal action (mirrors step()'s post-win gate)."""
+    if g.won_turn is not None:
+        return [{"type": "pass"}]
     if g.phase == "mulligan":
         rules = MulliganRules()
-        eff = _effective_mulls(g, rules)
-        hand_size = 7 - eff
+        hand_size = _target_hand_size(g, rules)
         actions = []
-        if hand_size > 4:
+        if hand_size > _KEEP_FLOOR:
             actions.append({"type": "mulligan"})
         actions.append({"type": "keep", "bottom_count": len(g.hand) - hand_size})
         return actions

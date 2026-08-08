@@ -1661,15 +1661,19 @@ def test_table_kill_sets_won_turn_once():
     assert g.won_turn == 5
     assert "T5: all opponents defeated — won turn 5" in g.log
 
-    # an earlier win (e.g. a combo) is never overwritten, and no second win line
+    # post-win gating (Task 11): an earlier win (e.g. a combo) locks the game —
+    # the attack is rejected outright, so the win is never overwritten and no
+    # second win line can appear
     g2 = started(cards, ["Plains"] * 40, hand=[])
     g2.turn = 6
     bear2 = g2.new_perm("Bear"); bear2.arrived_turn = 5
     g2.phase = "combat"
     g2.opponents = [1]
     g2.won_turn = 2
-    step(g2, {"type": "attack", "attackers": [bear2.id]})
+    with pytest.raises(IllegalAction, match="game already won on turn 2"):
+        step(g2, {"type": "attack", "attackers": [bear2.id]})
     assert g2.won_turn == 2
+    assert g2.opponents == [1]                    # rejected pre-mutation
     assert not any("won turn" in line for line in g2.log)
 
 
@@ -1961,3 +1965,229 @@ def test_attack_log_pins_committed_power_when_no_living_target():
     assert g.opponents == [0] and g.won_turn == 2
     assert "T2: attacked with 1 (total 2) — no living target" in g.log
     assert sum("won turn" in line for line in g.log) == 1     # no duplicate win
+
+
+# -- Task 11: combo detection + wins -----------------------------------------
+
+def combo_setup(wins=False):
+    cards = mini_cards()
+    cards["PieceA"] = SimCard(data=make_data("PieceA", cost=parse_cost("{2}{R}"),
+                              types=frozenset({"creature"}), power=2, toughness=2),
+                              ann=None, scope_class=None)
+    cards["PieceB"] = SimCard(data=make_data("PieceB", cost=parse_cost("{3}{R}"),
+                              types=frozenset({"creature"}), power=3, toughness=3),
+                              ann=None, scope_class=None)
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1,
+                 combos=[{"cards": ["PieceA", "PieceB"], "wins": wins}])
+    g.phase = "main1"; g.turn = 3
+    return cards, g
+
+
+def test_assembled_counts_battlefield():
+    _cards, g = combo_setup()
+    g.hand[:] = ["PieceB"]
+    g.new_perm("PieceA")                          # A already deployed
+    for _ in range(4):
+        g.new_perm("Mountain")
+    from goldfish.engine import check_combos
+    check_combos(g)
+    assert g.combo_assembled_turn[0] == 3
+    assert g.combo_castable_turn[0] == 3          # B's {3}{R} payable, A costs 0
+    assert "T3: combo 1 assembled: PieceA, PieceB" in g.log
+    assert "T3: combo 1 castable" in g.log
+
+
+def test_castable_includes_commander_tax():
+    _cards, g = combo_setup()
+    g.combos = [["PieceA", "Boss"]]
+    g.combo_assembled_turn = [None]; g.combo_castable_turn = [None]; g.combo_wins = [False]
+    g.commander_casts = 2                          # tax {4}
+    g.hand[:] = ["PieceA"]                         # Boss in command zone
+    for _ in range(6):
+        g.new_perm("Mountain")
+    from goldfish.engine import check_combos
+    check_combos(g)
+    assert g.combo_assembled_turn[0] == 3
+    # need {2}{R} + {2}{R}+{4} tax = 10 mv total vs 6 mountains:
+    assert g.combo_castable_turn[0] is None
+    # the tax flows through the _cast_cost pipeline: at exactly 10 producers
+    # the same joint cost becomes payable
+    for _ in range(4):
+        g.new_perm("Mountain")
+    check_combos(g)
+    assert g.combo_castable_turn[0] == 3
+
+
+def test_wins_ends_game_and_counts_casts():
+    _cards, g = combo_setup(wins=True)
+    g.hand[:] = ["PieceA", "PieceB"]
+    for _ in range(7):                             # joint {2}{R}+{3}{R} = 7 mv
+        g.new_perm("Mountain")
+    from goldfish.engine import check_combos
+    check_combos(g)
+    assert g.won_turn == 3
+    assert g.spells_cast_this_turn == 2            # pieces logged as cast
+    assert "T3: cast PieceA (combo)" in g.log
+    assert "T3: cast PieceB (combo)" in g.log
+
+
+def test_combo_wins_only_at_castable():
+    # assembled but unpayable: no win, no synthetic casts
+    _cards, g = combo_setup(wins=True)
+    g.hand[:] = ["PieceA", "PieceB"]              # zero producers on battlefield
+    from goldfish.engine import check_combos
+    check_combos(g)
+    assert g.combo_assembled_turn[0] == 3
+    assert g.combo_castable_turn[0] is None
+    assert g.won_turn is None
+    assert g.spells_cast_this_turn == 0
+    assert not any("(combo)" in line for line in g.log)
+
+
+def test_combo_castable_applies_cost_reduction_statics():
+    # CONTROLLER PIN: castable prices each piece through _cast_cost, so a
+    # cost_reduction static counts — joint {2}{R}+{3}{R} is 7 mv raw, but a
+    # creature-filter reducer of 2 shaves each piece to {0}{R}+{1}{R} = 3 mv.
+    cards, g = combo_setup()
+    cards["Helm"] = SimCard(data=make_data("Helm", cost=parse_cost("{1}"),
+                            types=frozenset({"artifact"})), ann=None, scope_class=None)
+    annotated(cards, "Helm", {"name": "Helm", "statics": [
+        {"kind": "cost_reduction", "filter": "creature", "amount": 2}]})
+    g.hand[:] = ["PieceA", "PieceB"]
+    for _ in range(3):
+        g.new_perm("Mountain")
+    from goldfish.engine import check_combos
+    check_combos(g)
+    assert g.combo_assembled_turn[0] == 3
+    assert g.combo_castable_turn[0] is None       # 7 mv vs 3 mountains
+    g.new_perm("Helm")
+    check_combos(g)
+    assert g.combo_castable_turn[0] == 3          # 3 mv vs 3 mountains
+
+
+def test_win_line_single_sourced_for_combo_and_table_kill():
+    # both win paths go through _declare_win: one pinned "— won turn N" format
+    _cards, g = combo_setup(wins=True)
+    g.hand[:] = ["PieceA", "PieceB"]
+    for _ in range(7):
+        g.new_perm("Mountain")
+    from goldfish.engine import check_combos
+    check_combos(g)
+    assert "T3: combo 1 wins — won turn 3" in g.log
+
+    cards2 = mini_cards()
+    g2 = started(cards2, ["Plains"] * 40, hand=[])
+    g2.turn = 5
+    bear = g2.new_perm("Bear"); bear.arrived_turn = 4
+    g2.phase = "combat"
+    g2.opponents = [1]
+    step(g2, {"type": "attack", "attackers": [bear.id]})
+    assert "T5: all opponents defeated — won turn 5" in g2.log
+
+    combo_line = next(line for line in g.log if "won turn" in line)
+    kill_line = next(line for line in g2.log if "won turn" in line)
+    assert combo_line.endswith("— won turn 3")
+    assert kill_line.endswith("— won turn 5")
+
+
+def test_post_win_step_accepts_only_pass():
+    _cards, g = combo_setup(wins=True)
+    g.hand[:] = ["PieceA", "PieceB", "Mountain"]
+    for _ in range(7):
+        g.new_perm("Mountain")
+    from goldfish.engine import check_combos
+    check_combos(g)
+    assert g.won_turn == 3
+    assert legal_actions(g) == [{"type": "pass"}]
+    snap = g.to_dict()
+    for bad in (
+        {"type": "play_land", "card": "Mountain"},
+        {"type": "cast", "card": "PieceA"},
+        {"type": "attack", "attackers": []},
+        {"type": "activate", "card": "b1", "ability": 0},
+        {"type": "attach", "card": "b1", "target": "b2"},
+        {"type": "mulligan"},
+        {"type": "keep", "bottom": []},
+    ):
+        with pytest.raises(IllegalAction, match="game already won on turn 3"):
+            step(g, bad)
+    assert g.to_dict() == snap                    # rejected pre-mutation
+    step(g, {"type": "pass"})                     # pass still advances phases
+    assert g.phase == "combat"
+    assert legal_actions(g) == [{"type": "pass"}] # even with a legal attacker set
+
+
+def test_check_combos_fires_mid_main_on_cast():
+    # casting the last piece detects same-turn, without waiting for the pass
+    _cards, g = combo_setup()
+    g.hand[:] = ["PieceB"]
+    g.new_perm("PieceA")
+    for _ in range(4):
+        g.new_perm("Mountain")
+    step(g, {"type": "cast", "card": "PieceB"})
+    assert g.phase == "main1"                     # no pass happened
+    assert g.combo_assembled_turn[0] == 3
+    assert g.combo_castable_turn[0] == 3          # both deployed: joint cost zero
+
+
+def test_cast_of_last_piece_wins_immediately():
+    _cards, g = combo_setup(wins=True)
+    g.hand[:] = ["PieceB", "Mountain"]
+    g.new_perm("PieceA")
+    for _ in range(4):
+        g.new_perm("Mountain")
+    step(g, {"type": "cast", "card": "PieceB"})
+    assert g.won_turn == 3
+    assert g.spells_cast_this_turn == 1           # the real cast; nothing undeployed
+    assert not any("(combo)" in line for line in g.log)
+    with pytest.raises(IllegalAction, match="game already won on turn 3"):
+        step(g, {"type": "play_land", "card": "Mountain"})
+
+
+def test_check_combos_fires_mid_main_on_land_drop():
+    _cards, g = combo_setup()
+    g.hand[:] = ["PieceB", "Mountain"]
+    g.new_perm("PieceA")
+    for _ in range(3):
+        g.new_perm("Mountain")
+    from goldfish.engine import check_combos
+    check_combos(g)
+    assert g.combo_assembled_turn[0] == 3
+    assert g.combo_castable_turn[0] is None       # {3}{R} vs 3 mountains
+    step(g, {"type": "play_land", "card": "Mountain"})
+    assert g.combo_castable_turn[0] == 3          # 4th producer flipped it
+
+
+def test_check_combos_fires_mid_main_on_activate():
+    # a {T}: tutor activation fetching the missing piece assembles mid-main
+    cards, g = combo_setup()
+    cards["Seeker"] = SimCard(data=make_data("Seeker", cost=parse_cost("{1}"),
+                              types=frozenset({"artifact"})), ann=None, scope_class=None)
+    annotated(cards, "Seeker", {"name": "Seeker", "activated": [
+        {"cost": "{T}", "do": "tutor", "filter": "name:PieceB"}]})
+    g.hand[:] = []
+    g.library[:5] = ["Plains", "Plains", "PieceB", "Plains", "Plains"]
+    g.new_perm("PieceA")
+    seeker = g.new_perm("Seeker")
+    for _ in range(4):
+        g.new_perm("Mountain")
+    step(g, {"type": "activate", "card": seeker.id, "ability": 0})
+    assert g.hand == ["PieceB"]
+    assert g.combo_assembled_turn[0] == 3         # detected on the activation
+    assert g.combo_castable_turn[0] == 3          # 4 mountains still untapped
+
+
+def test_check_combos_empty_fast_path():
+    # no combos declared: check_combos must return before touching any zone —
+    # it runs after every main-phase mutation, so this is a perf guard
+    class _Boom(list):
+        def __iter__(self):
+            raise AssertionError("empty-combos fast path must not touch zones")
+
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    assert g.combos == []
+    g.hand = _Boom()
+    g.battlefield = _Boom()
+    from goldfish.engine import check_combos
+    check_combos(g)                               # no zone access, no raise
