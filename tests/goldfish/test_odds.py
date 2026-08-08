@@ -12,18 +12,20 @@ def test_single_group_matches_closed_form():
 
 
 def test_groups_joint_probability():
-    # P(>=1 A and >=1 B), 3 As and 2 Bs in 40, draw 7 -- brute-force cross-check
+    # P(>=1 A and >=1 B), 3 As and 2 Bs in 15, draw 5 -- brute-force cross-check.
+    # Small enough (C(15,5)=3003) to run in milliseconds while exercising the
+    # same code paths as a full-deck query.
     from itertools import combinations
 
-    deck = ["A"] * 3 + ["B"] * 2 + ["x"] * 35
+    deck = ["A"] * 3 + ["B"] * 2 + ["x"] * 10
     hits = sum(
         1
-        for hand in combinations(range(40), 7)
+        for hand in combinations(range(15), 5)
         if any(deck[i] == "A" for i in hand) and any(deck[i] == "B" for i in hand)
     )
-    expected = hits / math.comb(40, 7)
+    expected = hits / math.comb(15, 5)
     got = odds_groups(
-        40, 7, [{"copies": 3, "min_successes": 1}, {"copies": 2, "min_successes": 1}]
+        15, 5, [{"copies": 3, "min_successes": 1}, {"copies": 2, "min_successes": 1}]
     )
     assert abs(got - expected) < 1e-12
 
@@ -44,6 +46,37 @@ def test_groups_copies_exceeding_deck_size_raises():
 
 def test_empty_groups_is_vacuously_certain():
     assert odds_groups(40, 7, []) == 1.0
+
+
+def test_odds_at_least_copies_exceeding_deck_size_raises():
+    with pytest.raises(ValueError, match="copies exceed deck size"):
+        odds_at_least(10, 5, copies=11, min_successes=1)
+
+
+def test_odds_groups_too_many_groups_raises():
+    # 9 groups exceeds the _MAX_GROUPS=8 cap, regardless of how small each
+    # group's own search range is.
+    groups = [{"copies": 1, "min_successes": 1}] * 9
+    with pytest.raises(ValueError, match="too large"):
+        odds_groups(99, 7, groups)
+
+
+def test_odds_groups_over_combination_cap_raises():
+    # 5 groups (within the group-count cap) whose per-group ranges multiply
+    # past the 200k combination cap: this is the shape of the reviewer's
+    # 15-group/copies-6 case that hung the event loop for 20+ seconds --
+    # the guard must reject it before itertools.product ever runs.
+    groups = [{"copies": 12, "min_successes": 1}] * 5
+    with pytest.raises(ValueError, match="too large"):
+        odds_groups(100, 15, groups)
+
+
+def test_odds_groups_eight_groups_small_case_still_computes():
+    # At the group-count cap but with a tiny search space -- must not be
+    # rejected, and must still return a valid probability.
+    groups = [{"copies": 1, "min_successes": 1}] * 8
+    got = odds_groups(99, 10, groups)
+    assert 0.0 <= got <= 1.0
 
 
 def test_single_group_via_odds_groups_matches_odds_at_least():
