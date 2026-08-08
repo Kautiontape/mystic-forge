@@ -365,12 +365,27 @@ def test_goldfish_run_n_capped():
         srv.GoldfishRunInput(deck=MINI_DECK_TEXT, n=50_000)
 
 
-def test_goldfish_run_mulligan_field_names_validated():
+def test_goldfish_run_mulligan_input_validated():
     with pytest.raises(pydantic.ValidationError, match="mulligan"):
-        srv.GoldfishRunInput(deck=MINI_DECK_TEXT, mulligan={"bad_field": 1})
-    ok = srv.GoldfishRunInput(
-        deck=MINI_DECK_TEXT, mulligan={"min_sources": 2, "free_first": False})
-    assert ok.mulligan == {"min_sources": 2, "free_first": False}
+        srv.GoldfishRunInput.model_validate(
+            {"deck": MINI_DECK_TEXT, "mulligan": {"bad_field": 1}})
+    with pytest.raises(pydantic.ValidationError):        # typed, not name-only
+        srv.GoldfishRunInput.model_validate(
+            {"deck": MINI_DECK_TEXT, "mulligan": {"min_sources": "three"}})
+    ok = srv.GoldfishRunInput.model_validate(
+        {"deck": MINI_DECK_TEXT,
+         "mulligan": {"min_sources": 2, "free_first": False}})
+    assert ok.mulligan.min_sources == 2
+    assert ok.mulligan.free_first is False
+    assert ok.mulligan.lands_only is None      # unset fields keep engine defaults
+
+
+def test_goldfish_mulligan_model_mirrors_rules_fields():
+    from dataclasses import fields as dc_fields
+
+    from goldfish.engine import MulliganRules
+    assert (set(srv.GoldfishMulliganInput.model_fields)
+            == {f.name for f in dc_fields(MulliganRules)})
 
 
 async def test_goldfish_run_combo_typo_rejected(monkeypatch):
@@ -391,6 +406,42 @@ async def test_goldfish_run_annotation_error_verbatim(monkeypatch):
     out = await srv.goldfish_run(srv.GoldfishRunInput(
         deck=MINI_DECK_TEXT, n=5, annotations=ann))
     assert out == str(ei.value)            # the self-correction contract
+
+
+async def test_goldfish_run_annotation_validation_precedes_network(monkeypatch):
+    async def no_net(*args, **kw):
+        raise AssertionError("network touched before annotation validation")
+
+    monkeypatch.setattr(srv, "_goldfish_load_deck", no_net)
+    monkeypatch.setattr(srv, "_goldfish_fetch_cards", no_net)
+    out = await srv.goldfish_run(srv.GoldfishRunInput(
+        deck=MINI_DECK_TEXT, n=5,
+        annotations=[{"name": "Bear", "triggers": [{"on": "bogus", "do": "draw"}]}]))
+    assert "invalid on 'bogus'" in out
+
+
+async def test_goldfish_run_warns_on_unmatched_annotation(monkeypatch):
+    _patch_fetch_minideck(monkeypatch)
+    ann = [{"name": "Puresteel Palladin",          # typo: not a deck card
+            "triggers": [{"on": "etb", "do": "draw", "count": 1}]}]
+    out = await srv.goldfish_run(srv.GoldfishRunInput(
+        deck=MINI_DECK_TEXT, n=5, until_turn=4, annotations=ann))
+    assert "not in deck (check spelling)" in out
+    assert "Puresteel Palladin" in out
+    assert "```json" in out                        # warned, still simulated
+
+
+async def test_goldfish_run_internal_error_caught(monkeypatch):
+    _patch_fetch_minideck(monkeypatch)
+
+    def boom(*args, **kw):
+        raise RuntimeError("policy livelock — bug")
+
+    monkeypatch.setattr(srv, "run_batch", boom)
+    out = await srv.goldfish_run(srv.GoldfishRunInput(
+        deck=MINI_DECK_TEXT, n=5, seed=9, until_turn=4))
+    assert "internal simulator error" in out
+    assert "seed=9" in out and "n=5" in out and "until_turn=4" in out
 
 
 PURESTEEL_DECK = ("1 Boss\n20 Plains\n17 Mountain\n26 Bear\n20 Runner\n"
@@ -456,6 +507,41 @@ async def test_goldfish_ab_identical_decks_zero_deltas(monkeypatch):
     assert "Changed: 0 cards" in out
     # Both honesty reports, labeled.
     assert "Deck A" in out and "Deck B" in out
+
+
+async def test_goldfish_ab_banner_accounts_real_one_swap(monkeypatch):
+    # One Bear (simulated) swapped for one Swords (interaction_removal):
+    # the Counter-diff must classify both sides of the swap.
+    monkeypatch.setattr(srv, "_goldfish_fetch_cards",
+                        _fake_fetch_for(MINI_SCRYFALL + [SWORDS]))
+    deck_b = MINI_DECK_TEXT.replace(
+        "30 Bear", "29 Bear\n1 Swords to Plowshares")
+    out = await srv.goldfish_ab(srv.GoldfishAbInput(
+        deck_a=MINI_DECK_TEXT, deck_b=deck_b, n=5, until_turn=4))
+    first_paragraph = out.split("\n\n")[0]
+    assert ("Changed: 2 cards — 1 simulated, 1 out of scope "
+            "(1 interaction_removal)") in first_paragraph
+    assert "Deck A: 0/99 out of scope; Deck B: 1/99" in first_paragraph
+
+
+async def test_goldfish_ab_errors_name_the_deck(monkeypatch):
+    _patch_fetch_minideck(monkeypatch)
+    out = await srv.goldfish_ab(srv.GoldfishAbInput(
+        deck_a=MINI_DECK_TEXT, deck_b="0 Plains", n=5))
+    assert out.startswith("Deck B:")
+
+
+def test_goldfish_runs_lru_evicts_at_cap():
+    srv._GOLDFISH_RUNS.clear()
+    try:
+        for i in range(srv.GOLDFISH_MAX_RUNS + 3):
+            srv._goldfish_store_run(f"id{i}", {"i": i}, {"r": i}, "run")
+        assert len(srv._GOLDFISH_RUNS) == srv.GOLDFISH_MAX_RUNS
+        assert "id0" not in srv._GOLDFISH_RUNS      # oldest evicted first
+        assert "id2" not in srv._GOLDFISH_RUNS
+        assert f"id{srv.GOLDFISH_MAX_RUNS + 2}" in srv._GOLDFISH_RUNS
+    finally:
+        srv._GOLDFISH_RUNS.clear()
 
 
 # ── concurrency (spec §Concurrency) ──────────────────────────────────────────

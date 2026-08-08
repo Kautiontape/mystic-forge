@@ -16,11 +16,10 @@ import time
 from typing import Optional, Dict, Any
 from enum import Enum
 from collections import Counter, OrderedDict
-from dataclasses import fields as dataclass_fields
 from difflib import SequenceMatcher
 
 import httpx
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP
 
 from goldfish import ENGINE_VERSION, autoderive, metrics, report
@@ -2679,9 +2678,6 @@ _GOLDFISH_SEMAPHORE = asyncio.Semaphore(2)
 #: goldfish_report (Task 21).
 _GOLDFISH_RUNS: "OrderedDict[str, dict]" = OrderedDict()
 
-_GOLDFISH_MULLIGAN_FIELDS = frozenset(
-    f.name for f in dataclass_fields(MulliganRules))
-
 #: Spec §Statistics scope-banner sentence, verbatim.
 _GOLDFISH_AB_BANNER_SENTENCE = (
     "Deltas measure speed and consistency only; the sim cannot value "
@@ -2707,19 +2703,24 @@ def _goldfish_store_run(run_id: str, inputs: dict, result: dict,
 async def _goldfish_prepare(
     deck_str: str, annotations: list[dict],
 ) -> tuple[dict[str, SimCard], list[str], str, str | None,
-           dict[str, str | None], dict[str, list[str]], list[str]]:
-    """Shared goldfish_run/goldfish_ab prep: load deck -> fetch -> derive ->
-    validate client annotations -> merge.
+           dict[str, str | None], dict[str, list[str]], list[str], list[str]]:
+    """Shared goldfish_run/goldfish_ab prep: validate client annotations
+    (pure, fails fast before any network) -> load deck -> fetch -> derive ->
+    merge.
 
     Returns (cards_pool, deck_names, commander, commander_note, card_scopes,
-    approx_by_card, not_found). ``deck_names`` is the LIBRARY: one commander
-    copy removed (it starts in the command zone) and Scryfall-unrecognized
-    names dropped (reported via ``not_found``). ``card_scopes`` feeds
-    metrics.aggregate's honesty split: name -> D9 scope class,
-    "unrecognized" (needs annotation, none supplied), or None (modeled).
-    Raises ValueError for every user-fixable problem — AnnotationError
-    messages propagate verbatim (the self-correction contract) and HTTP
-    failures are pre-formatted through the existing error helpers."""
+    approx_by_card, not_found, unmatched_anns). ``deck_names`` is the
+    LIBRARY: one commander copy removed (it starts in the command zone) and
+    Scryfall-unrecognized names dropped (reported via ``not_found``).
+    ``card_scopes`` feeds metrics.aggregate's honesty split: name -> D9
+    scope class, "unrecognized" (needs annotation, none supplied), or None
+    (modeled). ``unmatched_anns`` names client annotations that matched no
+    deck card (likely typos — the tools warn instead of silently no-oping
+    the self-correction loop). Raises ValueError for every user-fixable
+    problem — AnnotationError messages propagate verbatim (the
+    self-correction contract) and HTTP failures are pre-formatted through
+    the existing error helpers."""
+    client_anns = validate_annotations(annotations)   # AnnotationError -> up
     try:
         names, commander, cmdr_note = await _goldfish_load_deck(deck_str)
     except httpx.HTTPError as e:
@@ -2733,7 +2734,6 @@ async def _goldfish_prepare(
         raise ValueError(_scryfall_error(e)) from e
 
     derived = autoderive.derive(cards_raw)
-    client_anns = validate_annotations(annotations)   # AnnotationError -> up
 
     # Pool cards under the REQUESTED (deck) name — _goldfish_fetch_cards
     # returns found cards in requested order, so zip recovers the mapping
@@ -2743,12 +2743,15 @@ async def _goldfish_prepare(
     cards_pool: dict[str, SimCard] = {}
     card_scopes: dict[str, str | None] = {}
     approx_by_card: dict[str, list[str]] = {}
+    matched_anns: set[str] = set()
     for req_name, raw in zip(found_names, cards_raw):
         d = derived.get(raw.get("name") or req_name)
         if d is None:
             continue
-        ann = client_anns.get(req_name) or client_anns.get(d.card.name)
+        ann_key = req_name if req_name in client_anns else d.card.name
+        ann = client_anns.get(ann_key)
         if ann is not None:
+            matched_anns.add(ann_key)
             # A client annotation replaces/extends the derived model; an
             # annotated card is MODELED regardless of its prior class (D1).
             cards_pool[req_name] = merge_card(d.card.data, ann,
@@ -2760,6 +2763,7 @@ async def _goldfish_prepare(
                                      else d.card.scope_class)
         if d.approx_notes:
             approx_by_card[req_name] = list(d.approx_notes)
+    unmatched_anns = sorted(set(client_anns) - matched_anns)
 
     if commander not in cards_pool:
         raise ValueError(
@@ -2772,7 +2776,7 @@ async def _goldfish_prepare(
         raise ValueError(
             "No recognized cards besides the commander; nothing to simulate.")
     return (cards_pool, library, commander, cmdr_note, card_scopes,
-            approx_by_card, not_found)
+            approx_by_card, not_found, unmatched_anns)
 
 
 def _goldfish_check_combos(combos: list, valid_names: set[str]) -> str | None:
@@ -2909,6 +2913,29 @@ def _goldfish_scope_banner(
             + _GOLDFISH_AB_BANNER_SENTENCE)
 
 
+class GoldfishMulliganInput(BaseModel):
+    """MulliganRules overrides; unset (None) fields keep the engine
+    defaults. Field names mirror goldfish.engine.MulliganRules exactly — a
+    test pins the correspondence — and pydantic types/bounds reject bad
+    values here instead of letting them escape mid-sim as TypeErrors."""
+    model_config = ConfigDict(extra="forbid")
+    min_sources: int | None = Field(
+        default=None, ge=0, le=7,
+        description="Keep a 7-card hand only with at least this many mana "
+                    "sources (default 3).")
+    max_sources: int | None = Field(
+        default=None, ge=0, le=7,
+        description="...and at most this many (default 5).")
+    lands_only: bool | None = Field(
+        default=None,
+        description="Count only true lands as sources, not mana rocks.")
+    free_first: bool | None = Field(
+        default=None, description="EDH free first mulligan (default true).")
+    min_real_lands: int | None = Field(
+        default=None, ge=0, le=7,
+        description="Minimum actual lands in a kept 7-card hand (default 2).")
+
+
 class GoldfishRunInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     deck: str = Field(
@@ -2930,23 +2957,16 @@ class GoldfishRunInput(BaseModel):
                             description="Simulate through this turn.")
     opponents: int = Field(default=1, ge=1, le=5,
                            description="Goldfish opponents (life totals).")
-    mulligan: dict = Field(
-        default_factory=dict,
+    mulligan: GoldfishMulliganInput = Field(
+        default_factory=GoldfishMulliganInput,
         description="MulliganRules overrides: min_sources, max_sources, "
                     "lands_only, free_first, min_real_lands.")
 
-    @field_validator("mulligan")
-    @classmethod
-    def _known_mulligan_fields(cls, v: dict) -> dict:
-        bad = sorted(set(v) - _GOLDFISH_MULLIGAN_FIELDS)
-        if bad:
-            raise ValueError(
-                f"unknown mulligan field(s): {', '.join(bad)}; allowed: "
-                + ", ".join(sorted(_GOLDFISH_MULLIGAN_FIELDS)))
-        return v
-
 
 class GoldfishAbInput(BaseModel):
+    # Deliberate v1 pin: no mulligan/opponents knobs here — A/B compares
+    # decks under the engine-default rules, and per-arm knobs would confound
+    # the paired deltas. Revisit only with a spec change.
     model_config = ConfigDict(extra="forbid")
     deck_a: str = Field(..., min_length=1,
                         description="Deck A: Archidekt ID/URL or decklist text.")
@@ -2987,7 +3007,7 @@ async def goldfish_run(params: GoldfishRunInput) -> str:
     """
     try:
         (cards_pool, library, commander, cmdr_note, card_scopes,
-         approx_by_card, not_found) = await _goldfish_prepare(
+         approx_by_card, not_found, unmatched_anns) = await _goldfish_prepare(
             params.deck, params.annotations)
     except ValueError as e:
         return str(e)      # AnnotationError message verbatim: self-correction
@@ -2995,7 +3015,8 @@ async def goldfish_run(params: GoldfishRunInput) -> str:
         params.combos, set(library) | {commander})
     if combo_err:
         return combo_err
-    rules = MulliganRules(**params.mulligan)
+    mull_overrides = params.mulligan.model_dump(exclude_none=True)
+    rules = MulliganRules(**mull_overrides)
     until_turn = params.until_turn
 
     def _run() -> dict:
@@ -3009,11 +3030,18 @@ async def goldfish_run(params: GoldfishRunInput) -> str:
             result["records"], until_turn, card_scopes)
         return result
 
-    result = await _run_sim_offloop(_run)
+    try:
+        result = await _run_sim_offloop(_run)
+    # Deliberate catch-all: engine backstops (e.g. the runner's livelock
+    # guard RuntimeError) must not surface as raw tracebacks to the client.
+    except Exception:  # noqa: BLE001
+        return ("internal simulator error — please report with these "
+                f"inputs: seed={params.seed}, n={params.n}, "
+                f"until_turn={until_turn}")
     inputs = {"deck": params.deck, "annotations": params.annotations,
               "combos": params.combos, "n": params.n, "seed": params.seed,
               "until_turn": until_turn, "opponents": params.opponents,
-              "mulligan": params.mulligan, "engine_version": ENGINE_VERSION}
+              "mulligan": mull_overrides, "engine_version": ENGINE_VERSION}
     run_id = report.run_code(inputs)
     _goldfish_store_run(run_id, inputs, result, "run")
 
@@ -3025,6 +3053,9 @@ async def goldfish_run(params: GoldfishRunInput) -> str:
          f"Commander: {cmdr_display} | {params.n} games, seed {params.seed}, "
          f"through turn {until_turn} | run_id: {run_id}"),
     ]
+    if unmatched_anns:
+        parts += ["", "Annotations for cards not in deck (check spelling): "
+                  + ", ".join(unmatched_anns)]
     if not_found:
         parts += ["", "Warning — not recognized by Scryfall, skipped: "
                   + ", ".join(not_found)]
@@ -3051,13 +3082,16 @@ async def goldfish_ab(params: GoldfishAbInput) -> str:
     """
     try:
         (cards_a, lib_a, cmdr_a, _note_a, scopes_a, approx_a,
-         nf_a) = await _goldfish_prepare(
+         nf_a, unmatched_a) = await _goldfish_prepare(
             params.deck_a, params.annotations + params.annotations_a)
+    except ValueError as e:
+        return f"Deck A: {e}"
+    try:
         (cards_b, lib_b, cmdr_b, _note_b, scopes_b, approx_b,
-         nf_b) = await _goldfish_prepare(
+         nf_b, unmatched_b) = await _goldfish_prepare(
             params.deck_b, params.annotations + params.annotations_b)
     except ValueError as e:
-        return str(e)
+        return f"Deck B: {e}"
     if len(lib_a) != len(lib_b):
         return (f"A/B decks must be the same size for position-stable "
                 f"pairing: deck A has {_goldfish_n_cards(len(lib_a))}, "
@@ -3086,6 +3120,11 @@ async def goldfish_ab(params: GoldfishAbInput) -> str:
         result = await _run_sim_offloop(_run)
     except ValueError as e:
         return str(e)                      # different-commander guard
+    # Deliberate catch-all — same rationale as goldfish_run's.
+    except Exception:  # noqa: BLE001
+        return ("internal simulator error — please report with these "
+                f"inputs: seed={params.seed}, n={params.n}, "
+                f"until_turn={until_turn}")
     inputs = {"deck_a": params.deck_a, "deck_b": params.deck_b,
               "annotations": params.annotations,
               "annotations_a": params.annotations_a,
@@ -3104,7 +3143,11 @@ async def goldfish_ab(params: GoldfishAbInput) -> str:
     parts.append(f"# Goldfish A/B\n{cmdrs} | {params.n} paired games, "
                  f"seed {params.seed}, through turn {until_turn} | "
                  f"run_id: {run_id}")
-    for label, nf in (("A", nf_a), ("B", nf_b)):
+    for label, nf, unmatched in (("A", nf_a, unmatched_a),
+                                 ("B", nf_b, unmatched_b)):
+        if unmatched:
+            parts += ["", f"Deck {label} annotations for cards not in deck "
+                      f"(check spelling): " + ", ".join(unmatched)]
         if nf:
             parts += ["", f"Warning — deck {label} names not recognized by "
                       f"Scryfall, skipped: " + ", ".join(nf)]
