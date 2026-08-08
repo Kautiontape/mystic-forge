@@ -110,21 +110,22 @@ def _y_grid(ticks: list[tuple[float, str]]) -> str:
     return "".join(out)
 
 
-def _svg_hist(histogram: dict, title: str,
-              x_title: str = "Turn", y_title: str = "Games") -> str:
-    """Bar chart of an integer-keyed count histogram: thin bars (≤24px),
-    4px rounded data-end, square baseline, 2px surface gaps by slot air;
-    single series (no legend — the title names it); the tallest bar carries
-    the one direct label."""
-    counts = {int(k): int(v) for k, v in histogram.items()}
-    parts = [_svg_frame("hist", title)]
-    if not counts:
+def _svg_bars(cls: str, labels: list, values: list, title: str,
+              x_title: str, y_title: str, value_fmt: str = "{:g}",
+              empty: str = "no data") -> str:
+    """Shared bar-series core (dataviz mark specs): thin bars (≤24px), 4px
+    rounded data-end, square baseline, 2px surface gaps by slot air; single
+    series (no legend — the title names it); the tallest bar carries the
+    one direct label. ``None`` values (e.g. trailing turns no game
+    reached) are simply not drawn."""
+    parts = [_svg_frame(cls, title)]
+    present = [(i, v) for i, v in enumerate(values)
+               if v is not None and v > 0]
+    if not present:
         parts.append(f'<text class="ax" x="{_W / 2:.0f}" y="{_H / 2:.0f}" '
-                     f'text-anchor="middle">no games reached this event'
-                     f'</text></svg>')
+                     f'text-anchor="middle">{_esc(empty)}</text></svg>')
         return "".join(parts)
-    cats = list(range(min(counts), max(counts) + 1))
-    ymax = _nice_max(max(counts.values()))
+    ymax = _nice_max(max(v for _, v in present))
     base = _H - _MB
     plot_w = _W - _ML - _MR
     plot_h = base - (_MT + 12)     # headroom keeps cap labels off the title
@@ -135,17 +136,17 @@ def _svg_hist(histogram: dict, title: str,
     parts.append(_y_grid([(sy(0), "0"),
                           (sy(ymax / 2), _fmt_num(ymax / 2)),
                           (sy(ymax), _fmt_num(ymax))]))
-    slot = plot_w / len(cats)
+    slot = plot_w / len(values)
     bar_w = min(24.0, max(2.0, slot - 4.0))
-    tallest = max(counts, key=lambda c: (counts[c], -c))
-    label_step = 1 if len(cats) <= 16 else 2
-    for i, cat in enumerate(cats):
+    tallest = max(present, key=lambda iv: iv[1])[0]   # first max on ties
+    label_step = 1 if len(values) <= 16 else 2
+    for i, label in enumerate(labels):
         cx = _ML + i * slot + slot / 2
         if i % label_step == 0:
             parts.append(f'<text class="ax" x="{cx:.1f}" y="{base + 14}" '
-                         f'text-anchor="middle">{cat}</text>')
-        v = counts.get(cat, 0)
-        if v <= 0:
+                         f'text-anchor="middle">{label}</text>')
+        v = values[i]
+        if v is None or v <= 0:
             continue
         x0, x1 = cx - bar_w / 2, cx + bar_w / 2
         y0 = sy(v)
@@ -155,10 +156,11 @@ def _svg_hist(histogram: dict, title: str,
             f'Q{x0:.1f} {y0:.1f} {x0 + r:.1f} {y0:.1f} '
             f'L{x1 - r:.1f} {y0:.1f} Q{x1:.1f} {y0:.1f} '
             f'{x1:.1f} {y0 + r:.1f} L{x1:.1f} {base} Z">'
-            f'<title>{x_title} {cat}: {v} {y_title.lower()}</title></path>')
-        if cat == tallest:
+            f'<title>{x_title} {label}: {value_fmt.format(v)} '
+            f'{y_title.lower()}</title></path>')
+        if i == tallest:
             parts.append(f'<text class="lbl" x="{cx:.1f}" y="{y0 - 6:.1f}" '
-                         f'text-anchor="middle">{v}</text>')
+                         f'text-anchor="middle">{value_fmt.format(v)}</text>')
     parts.append(f'<text class="ax" x="{_ML + plot_w / 2:.0f}" y="{_H - 6}" '
                  f'text-anchor="middle">{_esc(x_title)}</text>')
     parts.append(f'<text class="ax" x="14" y="{_MT + plot_h / 2:.0f}" '
@@ -166,6 +168,17 @@ def _svg_hist(histogram: dict, title: str,
                  f'{_MT + plot_h / 2:.0f})">{_esc(y_title)}</text>')
     parts.append("</svg>")
     return "".join(parts)
+
+
+def _svg_hist(histogram: dict, title: str,
+              x_title: str = "Turn", y_title: str = "Games") -> str:
+    """Bar chart of an integer-keyed count histogram (contiguous category
+    range, zero-count slots left as air)."""
+    counts = {int(k): int(v) for k, v in histogram.items()}
+    cats = list(range(min(counts), max(counts) + 1)) if counts else []
+    return _svg_bars("hist", cats, [counts.get(c, 0) for c in cats], title,
+                     x_title, y_title,
+                     empty="no games reached this event")
 
 
 def _svg_reached_curve(pct_by_turn: list[float], title: str) -> str:
@@ -487,6 +500,12 @@ def _render_run(result: dict, inputs: dict, code: str) -> str:
         "<figure>" + _svg_reached_curve(
             _cum_pct(m["kill"]["histogram"], n, until_turn),
             "Kill (40 damage) — cumulative % of games") + "</figure>",
+        "<figure>" + _svg_bars(
+            "bars",
+            list(range(1, len(m["on_curve"]["avg_lands_by_turn"]) + 1)),
+            m["on_curve"]["avg_lands_by_turn"],
+            "Average lands in play by turn",
+            "Turn", "Avg lands", value_fmt="{:.2f}") + "</figure>",
         "<figure>" + _svg_hist(
             m["casts"]["distribution"],
             "Casts in a turn — distribution over all simulated turns",

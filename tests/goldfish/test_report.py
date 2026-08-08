@@ -176,12 +176,17 @@ def test_report_numbers_match_metrics(sample_run):
     mull = m["mulligans"]["pct_mulliganed"]
     assert f"{mull['value'] * 100:.1f}%" in html
     assert f"{m['trigger_fires']['Card03|etb|draw']:.2f}" in html
+    # On-curve chart: the tallest bar carries its value as a direct label.
+    lands = [v for v in m["on_curve"]["avg_lands_by_turn"] if v is not None]
+    assert f"{max(lands):.2f}" in html
 
 
 def test_report_charts_tiles_tables_honesty(sample_run):
     _result, _inputs, html = sample_run
     assert html.count('class="hist"') == 2     # cast-turn + casts distribution
     assert html.count('class="curve"') == 2    # commander-cast + kill reached
+    assert html.count('class="bars"') == 1     # on-curve avg lands by turn
+    assert "Average lands in play by turn" in html
     assert html.count('class="tile"') >= 5     # stat tiles with CI ranges
     assert "95% CI" in html
     # Trigger table: top 15 of 17, with the remainder counted.

@@ -3153,7 +3153,9 @@ async def goldfish_run(params: GoldfishRunInput) -> str:
     result["approx_by_card"] = approx_by_card
     result["commander_note"] = cmdr_note
     _goldfish_store_run(run_id, inputs, result, "run")
-    report_url = _goldfish_persist_report(run_id, _GOLDFISH_RUNS[run_id])
+    # Persist (render + disk IO) off the event loop, like the route reads.
+    report_url = await asyncio.to_thread(
+        _goldfish_persist_report, run_id, _GOLDFISH_RUNS[run_id])
 
     m = result["metrics"]
     cmdr_display = f"{commander} {cmdr_note}" if cmdr_note else commander
@@ -3255,7 +3257,9 @@ async def goldfish_ab(params: GoldfishAbInput) -> str:
     result["approx_by_card_a"] = approx_a
     result["approx_by_card_b"] = approx_b
     _goldfish_store_run(run_id, inputs, result, "ab")
-    report_url = _goldfish_persist_report(run_id, _GOLDFISH_RUNS[run_id])
+    # Persist (render + disk IO) off the event loop, like the route reads.
+    report_url = await asyncio.to_thread(
+        _goldfish_persist_report, run_id, _GOLDFISH_RUNS[run_id])
 
     # SCOPE BANNER FIRST (spec §Statistics) — nothing may precede it.
     parts = [banner, ""]
