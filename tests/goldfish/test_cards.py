@@ -1,8 +1,10 @@
 import pytest
-from goldfish.cards import Cost, parse_cost, CostParseError
+
 from goldfish.cards import (
-    validate_annotations, AnnotationError,
-    EVENTS, VERBS, SYMBOLIC_COUNTS, STATIC_KINDS,
+    AnnotationError,
+    CostParseError,
+    parse_cost,
+    validate_annotations,
 )
 
 
@@ -103,3 +105,116 @@ def test_tap_cost_activation():
                        "power": 1, "toughness": 1, "count": "per_creature"}]}])
     act = anns["Krenko, Mob Boss"].activated[0]
     assert act.tap is True and act.mana.mv == 0
+
+
+def test_activated_pump_keeps_duration():
+    anns = validate_annotations([{
+        "name": "Berserk Charge",
+        "activated": [{"cost": "{1}{R}", "do": "pump",
+                       "power": 3, "toughness": 0, "duration": "permanent"}]}])
+    act = anns["Berserk Charge"].activated[0]
+    assert act.duration == "permanent"
+
+
+def test_activated_cost_none_treated_as_empty():
+    anns = validate_annotations([{
+        "name": "Free Ability",
+        "activated": [{"cost": None, "do": "extra_combat"}]}])
+    act = anns["Free Ability"].activated[0]
+    assert act.tap is False and act.mana.mv == 0
+
+
+# -- sad paths ---------------------------------------------------------------
+
+def test_bad_damage_target_rejected():
+    with pytest.raises(AnnotationError) as ei:
+        validate_annotations([{"name": "Zapper", "triggers": [
+            {"on": "etb", "do": "damage", "target": "the_whole_table", "count": 1}]}])
+    msg = str(ei.value)
+    assert "Zapper" in msg and "one_opponent" in msg
+
+
+def test_bad_tutor_filter_rejected():
+    with pytest.raises(AnnotationError) as ei:
+        validate_annotations([{"name": "Digger", "triggers": [
+            {"on": "etb", "do": "tutor", "filter": "not_a_real_filter"}]}])
+    msg = str(ei.value)
+    assert "Digger" in msg and "creature" in msg  # allowed-list hint present
+
+
+def test_bad_duration_rejected_on_trigger():
+    with pytest.raises(AnnotationError):
+        validate_annotations([{"name": "X", "triggers": [
+            {"on": "etb", "do": "pump", "power": 1, "toughness": 1,
+             "duration": "forever"}]}])
+
+
+def test_bad_duration_rejected_on_activated():
+    with pytest.raises(AnnotationError):
+        validate_annotations([{"name": "X", "activated": [
+            {"cost": "{1}", "do": "pump", "power": 1, "toughness": 1,
+             "duration": "forever"}]}])
+
+
+def test_bad_condition_rejected():
+    with pytest.raises(AnnotationError):
+        validate_annotations([{"name": "X", "triggers": [
+            {"on": "etb", "do": "draw", "if": "not_a_condition"}]}])
+
+
+def test_bad_static_kind_rejected():
+    with pytest.raises(AnnotationError):
+        validate_annotations([{"name": "X", "statics": ["not_a_static"]}])
+
+
+def test_bad_cost_reduction_filter_rejected():
+    with pytest.raises(AnnotationError):
+        validate_annotations([{"name": "X", "statics": [
+            {"kind": "cost_reduction", "filter": "color:Z", "amount": 1}]}])
+
+
+def test_create_token_missing_power_rejected():
+    with pytest.raises(AnnotationError):
+        validate_annotations([{"name": "X", "triggers": [
+            {"on": "etb", "do": "create_token", "toughness": 1}]}])
+
+
+def test_add_mana_missing_pips_rejected():
+    with pytest.raises(AnnotationError):
+        validate_annotations([{"name": "X", "triggers": [
+            {"on": "etb", "do": "add_mana"}]}])
+
+
+def test_pump_missing_power_rejected():
+    with pytest.raises(AnnotationError):
+        validate_annotations([{"name": "X", "triggers": [
+            {"on": "etb", "do": "pump", "toughness": 1}]}])
+
+
+def test_unnamed_card_rejected():
+    with pytest.raises(AnnotationError) as ei:
+        validate_annotations([{"triggers": []}])
+    msg = str(ei.value)
+    assert "unnamed" in msg and "a card name" in msg  # allowed-list hint present
+
+
+def test_keywords_as_bare_string_rejected():
+    with pytest.raises(AnnotationError) as ei:
+        validate_annotations([{"name": "X", "statics": [
+            {"kind": "anthem", "power": 1, "toughness": 1, "keywords": "haste"}]}])
+    msg = str(ei.value)
+    assert "X" in msg and "list of keyword strings" in msg
+
+
+def test_keywords_none_accepted_as_empty():
+    anns = validate_annotations([{"name": "X", "statics": [
+        {"kind": "anthem", "power": 1, "toughness": 1, "keywords": None}]}])
+    assert anns["X"].statics[0].keywords == ()
+
+
+def test_activated_bad_cost_reraised_as_annotation_error():
+    with pytest.raises(AnnotationError) as ei:
+        validate_annotations([{"name": "Krenko, Mob Boss", "activated": [
+            {"cost": "{X}", "do": "extra_combat"}]}])
+    msg = str(ei.value)
+    assert "Krenko, Mob Boss" in msg

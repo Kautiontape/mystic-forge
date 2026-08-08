@@ -102,6 +102,7 @@ class Activated:
     target: str | None = None
     power: int | None = None
     toughness: int | None = None
+    duration: str = "eot"                   # pump: eot|permanent
     keywords: tuple = ()
     tutor_filter: str | None = None
     pips: str | None = None
@@ -150,6 +151,23 @@ def _parse_count(card, raw):
     raise AnnotationError(card, "count", raw, SYMBOLIC_COUNTS | {"<int>"})
 
 
+def _parse_keywords(card, d: dict) -> tuple:
+    """Shared keyword-list parsing for triggers, activated abilities, and
+    statics. Accepts a JSON null or missing key as "no keywords"; rejects a
+    bare string (which would silently explode into single-character tuples)
+    and any non-string element."""
+    kw = d.get("keywords") or ()
+    if isinstance(kw, str):
+        raise AnnotationError(card, "keywords", kw, {"a list of keyword strings"})
+    try:
+        items = tuple(kw)
+    except TypeError:
+        raise AnnotationError(card, "keywords", kw, {"a list of keyword strings"})
+    if not all(isinstance(k, str) for k in items):
+        raise AnnotationError(card, "keywords", kw, {"a list of keyword strings"})
+    return items
+
+
 def _check_verb_params(card, do, t: Trigger | Activated):
     if do == "damage" and t.target not in DAMAGE_TARGETS:
         raise AnnotationError(card, "target", t.target, DAMAGE_TARGETS)
@@ -188,7 +206,7 @@ def _parse_trigger(card, raw: dict) -> Trigger:
         target=raw.get("target"),
         power=raw.get("power"), toughness=raw.get("toughness"),
         duration=raw.get("duration", "eot"),
-        keywords=tuple(raw.get("keywords", ())),
+        keywords=_parse_keywords(card, raw),
         tutor_filter=raw.get("filter") if on != "spell_cast" else None,
         pips=raw.get("pips"),
         any_mana=(raw.get("colors") == "any"),
@@ -203,17 +221,26 @@ def _parse_activated(card, raw: dict) -> Activated:
     do = raw.get("do")
     if do not in VERBS:
         raise AnnotationError(card, "do", do, VERBS)
-    cost_str = raw.get("cost", "")
+    cost_str = raw.get("cost") or ""       # lands/free abilities legitimately have none
     tap = "{T}" in cost_str
+    try:
+        mana = parse_cost(cost_str.replace("{T}", ""))
+    except CostParseError:
+        raise AnnotationError(
+            card, "cost", cost_str,
+            {"a mana cost string like {2}{W}, optionally with {T}"})
     a = Activated(
-        do=do, mana=parse_cost(cost_str.replace("{T}", "")), tap=tap,
+        do=do, mana=mana, tap=tap,
         count=_parse_count(card, raw.get("count", 1)),
         target=raw.get("target"),
         power=raw.get("power"), toughness=raw.get("toughness"),
-        keywords=tuple(raw.get("keywords", ())),
+        duration=raw.get("duration", "eot"),
+        keywords=_parse_keywords(card, raw),
         tutor_filter=raw.get("filter"),
         pips=raw.get("pips"), any_mana=(raw.get("colors") == "any"),
     )
+    if a.duration not in ("eot", "permanent"):
+        raise AnnotationError(card, "duration", a.duration, {"eot", "permanent"})
     _check_verb_params(card, do, a)
     return a
 
@@ -227,7 +254,7 @@ def _parse_static(card, raw) -> Static:
         raise AnnotationError(card, "static", kind, STATIC_KINDS)
     s = Static(kind=kind,
                power=obj.get("power", 0), toughness=obj.get("toughness", 0),
-               keywords=tuple(obj.get("keywords", ())),
+               keywords=_parse_keywords(card, obj),
                count=obj.get("count", 1),
                filter=obj.get("filter", "any"), amount=obj.get("amount", 0))
     if kind == "cost_reduction":
