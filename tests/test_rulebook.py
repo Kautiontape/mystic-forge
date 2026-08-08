@@ -57,3 +57,23 @@ def test_toc_is_not_parsed_as_rules(idx):
 def test_missing_markers_raise():
     with pytest.raises(ValueError):
         rulebook.parse("no glossary or credits here")
+
+
+def test_unknown_month_gives_empty_yyyymmdd():
+    weird = FIXTURE.replace("August", "Floopuary")
+    assert rulebook.parse(weird).effective_yyyymmdd == ""
+
+
+def test_real_cr_parses_structurally():
+    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    idx = rulebook.parse(real)
+    assert len(idx.rules) > 3300
+    assert len(idx.glossary) > 730
+    # Every child link resolves; no orphan parents.
+    assert not [n for n, r in idx.rules.items() if r.parent and r.parent not in idx.rules]
+    # Upstream header irregularities that once broke the regexes:
+    for n in ("119.1d", "606.5", "704.5aa"):
+        assert n in idx.rules
+    # Glossary headwords ending in a curly quote must stay separate entries.
+    assert "banding, “bands with other”" in idx.glossary
+    assert any(k.startswith("partner,") for k in idx.glossary)

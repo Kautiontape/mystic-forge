@@ -24,11 +24,11 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 
-_SUBRULE_RE = re.compile(r"^(\d{3}\.\d+)([a-z]) (.*)$")
-_RULE_RE = re.compile(r"^(\d{3}\.\d+)\. (.*)$")
+_SUBRULE_RE = re.compile(r"^(\d{3}\.\d+)([a-z]+)\.? (.*)$")
+_RULE_RE = re.compile(r"^(\d{3}\.\d+)\.? (.*)$")
 _SUBSECTION_RE = re.compile(r"^(\d{3})\. (.*)$")
 _SECTION_RE = re.compile(r"^(\d)\. (.*)$")
-_RULE_REF_RE = re.compile(r"rule (\d{3}(?:\.\d+)?[a-z]?)")
+_RULE_REF_RE = re.compile(r"rule (\d{3}(?:\.\d+)?[a-z]{0,2})")
 _EFFECTIVE_RE = re.compile(r"effective as of (\w+) (\d{1,2}), (\d{4})")
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
 
@@ -70,11 +70,12 @@ def parse(text: str) -> RulesIndex:
     idx = RulesIndex()
     lines = [ln.rstrip() for ln in text.lstrip("﻿").splitlines()]
 
-    m = _EFFECTIVE_RE.search(text[:2000])
+    m = _EFFECTIVE_RE.search(text[:2000])  # date sits on line 3; window is generous
     if m:
         month, day, year = m.group(1), int(m.group(2)), int(m.group(3))
         idx.effective_date = f"{month} {day}, {year}"
-        idx.effective_yyyymmdd = f"{year:04d}{_MONTHS.get(month, 0):02d}{day:02d}"
+        if month in _MONTHS:
+            idx.effective_yyyymmdd = f"{year:04d}{_MONTHS[month]:02d}{day:02d}"
 
     glossary_marks = [i for i, ln in enumerate(lines) if ln.strip() == "Glossary"]
     credits_marks = [i for i, ln in enumerate(lines) if ln.strip() == "Credits"]
@@ -130,7 +131,7 @@ def _parse_glossary(idx: RulesIndex, lines: list[str]) -> None:
         # Term lines are bare headwords; definition paragraphs end with
         # sentence punctuation, so a block opening with one continues the
         # previous entry (multi-paragraph definitions).
-        if block[0].endswith((".", "”", '"')) and term is not None:
+        if len(block) == 1 and block[0].endswith((".", "”", '"')) and term is not None:
             idx.glossary[term] = idx.glossary[term] + " " + " ".join(block)
         else:
             term = block[0].lower()
