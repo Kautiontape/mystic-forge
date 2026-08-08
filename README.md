@@ -91,11 +91,24 @@ cp .env.example .env
 
 **Important:** Never deploy credentials on a shared/public server. Private deck access is for self-hosted instances only.
 
+## Price watchlist
+
+Personal MTG price watchlists with ~90 days of MTGJSON daily history.
+Lists are identified by a passphrase (shown once at `watchlist_create`):
+use it in a personal connector URL (`https://kautiontape.com/mtg/mcp/<passphrase>`)
+or pass it to tools in chat. Share codes (`SC-…`) grant read-only viewing at
+`https://kautiontape.com/mtg/s/<code>`. Every change is an append-only event —
+see the full chain at `https://kautiontape.com/mtg/w/<passphrase>` and recover
+any revision with `watchlist_clone(at_seq=N)` (mints a new passphrase).
+Prices ingest nightly from MTGJSON (tcgplayer/cardkingdom/cardmarket retail).
+Health: `GET /health`.
+
 ## Data Sources
 
 - **[Scryfall](https://scryfall.com)** — Card data and prices (updated daily from TCGPlayer, Cardmarket, Cardhoarder)
 - **[EDHRec](https://edhrec.com)** — Commander metagame data and recommendations
 - **[Archidekt](https://archidekt.com)** — Deck building and storage
+- **[MTGJSON](https://mtgjson.com)** — Daily price history and printing/uuid mapping for the watchlist
 
 ## License
 

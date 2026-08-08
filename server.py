@@ -64,7 +64,11 @@ mcp = FastMCP(
         "Use scryfall_rulings for official card rulings instead of web search or memory. "
         "Use edhrec_commander/edhrec_recommendations for deck recommendations instead of web search. "
         "Use scryfall_search/scryfall_named for card lookups instead of web search. "
-        "These tools return authoritative, up-to-date data directly from the source APIs."
+        "These tools return authoritative, up-to-date data directly from the source APIs. "
+        "Watchlist: price watchlists are identified by a passphrase. When the "
+        "user gives one (or uses a personal connector URL) pass it through; "
+        "after watchlist_create, show the passphrase once and offer to "
+        "remember it for future chats. Share codes (SC-…) are read-only."
     ),
     host="0.0.0.0",
     port=8000,
