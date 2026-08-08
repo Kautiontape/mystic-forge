@@ -102,7 +102,7 @@ def test_history_resolves_entry_names_for_target_events(db_path):
     db.close()
     with client() as c:
         r = c.get(f"/w/{pp}/history").text
-    assert "set target" in r
+    assert "target set" in r
     assert "Sol Ring → $2.50" in r
 
 
@@ -186,6 +186,136 @@ def test_api_rename_and_share_forbidden(db_path):
     # rename is in the event chain but replay of entries is unaffected
     assert watchlist_db.replay_state(db, list_id) == {}
     db.close()
+
+
+def test_target_basis_is_shop_independent(db_path):
+    """Targets are USD/tcgplayer-basis: hit state and the buy-windows tile
+    must not change when the display shop changes (persona: the Optimizer)."""
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Rhystic Study", target_price=70.0)
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES"
+               " ('Rhystic Study','u1')")
+    watchlist_db.upsert_price(db, "u1", "2026-08-08", "tcgplayer", "normal", 65.0)
+    watchlist_db.upsert_price(db, "u1", "2026-08-08", "cardmarket", "normal", 80.0)
+    db.close()
+    with client() as c:
+        tcg = c.get(f"/w/{pp}").text
+        cm = c.get(f"/w/{pp}?shop=cardmarket").text
+    for page in (tcg, cm):
+        assert page.count('class="card hit"') == 1     # hit on USD basis
+        assert "target $70.00" in page                 # never relabeled €
+    assert "€80.00" in cm                              # display price is CM's
+
+
+def test_hits_sort_before_misses(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Miss One", target_price=1.0)
+    watchlist_db.add_card(db, list_id, "Hit One", target_price=10.0)
+    db.executemany("INSERT INTO card_uuids (card_name, uuid) VALUES (?,?)",
+                   [("Miss One", "m1"), ("Hit One", "h1")])
+    watchlist_db.upsert_price(db, "m1", "2026-08-08", "tcgplayer", "normal", 5.0)
+    watchlist_db.upsert_price(db, "h1", "2026-08-08", "tcgplayer", "normal", 5.0)
+    db.close()
+    with client() as c:
+        page = c.get(f"/w/{pp}").text
+    assert page.index("Hit One") < page.index("Miss One")
+    assert 'class="verdict"' in page and "BUY" in page
+
+
+def test_freshness_shows_price_date_not_ingest_date(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Sol Ring','u1')")
+    watchlist_db.upsert_price(db, "u1", "2026-08-07", "tcgplayer", "normal", 7.0)
+    db.execute("INSERT OR REPLACE INTO meta VALUES ('last_ingest','2026-08-08')")
+    db.commit()
+    db.close()
+    with client() as c:
+        page = c.get(f"/w/{pp}").text
+    assert "prices through 2026-08-07" in page
+
+
+def test_share_page_offers_claim_and_owner_page_does_not(db_path):
+    db = watchlist_db.connect(db_path)
+    _, pp, sc = watchlist_db.create_list(db)
+    db.close()
+    with client() as c:
+        share = c.get(f"/s/{sc}").text
+        own = c.get(f"/w/{pp}").text
+    assert "start my own list" in share
+    assert "start my own list" not in own
+    assert 'id="renameDlg"' in own and 'id="renameDlg"' not in share
+    assert "prompt(" not in own                # bespoke dialog, not browser chrome
+
+
+def test_revision_modal_js_escapes_interpolations(db_path):
+    """The revision modal builds innerHTML from API data; every user-supplied
+    field must round-trip through the X() escaper (stored-XSS regression)."""
+    db = watchlist_db.connect(db_path)
+    _, pp, _ = watchlist_db.create_list(db)
+    db.close()
+    with client() as c:
+        page = c.get(f"/w/{pp}/history").text
+    assert "X(e.card_name)" in page and "X(e.note" in page
+    assert "X(e.set_code)" in page
+
+
+def test_shop_survives_history_roundtrip(db_path):
+    db = watchlist_db.connect(db_path)
+    _, pp, _ = watchlist_db.create_list(db)
+    db.close()
+    with client() as c:
+        board = c.get(f"/w/{pp}?shop=cardmarket").text
+        hist = c.get(f"/w/{pp}/history?shop=cardmarket").text
+    assert f"/w/{pp}/history?shop=cardmarket" in board
+    assert f'href="/w/{pp}?shop=cardmarket"' in hist
+
+
+def test_csv_export(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring", target_price=10.0)
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Sol Ring','u1')")
+    watchlist_db.upsert_price(db, "u1", "2026-08-01", "tcgplayer", "normal", 8.0)
+    watchlist_db.upsert_price(db, "u1", "2026-08-08", "tcgplayer", "normal", 7.0)
+    watchlist_db.upsert_price(db, "u1", "2026-08-08", "cardmarket", "normal", 5.0)
+    db.close()
+    with client() as c:
+        r = c.get(f"/w/{pp}/export.csv")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/csv")
+    lines = r.text.strip().splitlines()
+    assert lines[0].startswith("card,set_code")
+    assert lines[1].startswith("Sol Ring,")
+    assert "7.0" in lines[1] and "5.0" in lines[1] and "2026-08-08" in lines[1]
+    with client() as c:
+        assert c.get("/w/bogus-bogus-bogus-bogus-00/export.csv").status_code == 404
+
+
+def test_modal_chart_draws_target_line(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring", target_price=7.5)
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Sol Ring','u1')")
+    watchlist_db.upsert_price(db, "u1", "2026-08-01", "tcgplayer", "normal", 8.0)
+    watchlist_db.upsert_price(db, "u1", "2026-08-08", "tcgplayer", "normal", 7.0)
+    db.close()
+    with client() as c:
+        page = c.get(f"/w/{pp}").text
+    assert "targetline" in page and "target $7.50" in page
+
+
+def test_cards_are_keyboard_accessible(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.close()
+    with client() as c:
+        page = c.get(f"/w/{pp}").text
+    assert "keyable(card)" in page and ":focus-visible" in page
 
 
 def test_card_modal_payload_has_site_links(db_path):

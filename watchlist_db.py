@@ -189,13 +189,15 @@ def add_card(db, list_id: int, card_name: str, set_code: str | None = None,
         eid = existing["entry_id"]
         if target_price is not None and target_price != existing["target_price"]:
             seq = append_event(db, list_id, "set_target",
-                              {"entry_id": eid, "target_price": target_price})
+                              {"entry_id": eid, "card_name": existing["card_name"],
+                               "target_price": target_price})
             db.execute("UPDATE watchlist_current SET target_price=?"
                        " WHERE list_id=? AND entry_id=?",
                        (target_price, list_id, eid))
         if note is not None and note != existing["note"]:
             seq = append_event(db, list_id, "set_note",
-                              {"entry_id": eid, "note": note})
+                              {"entry_id": eid, "card_name": existing["card_name"],
+                               "note": note})
             db.execute("UPDATE watchlist_current SET note=?"
                        " WHERE list_id=? AND entry_id=?", (note, list_id, eid))
         db.commit()
@@ -313,26 +315,42 @@ def _cheapest_latest(db, uuids, provider, finish):
     return (row["uuid"], row["price"], row["date"]) if row else None
 
 
-def _price_at_or_before(db, uuid, provider, finish, date):
-    row = db.execute(
-        "SELECT price FROM prices WHERE uuid=? AND provider=? AND finish=?"
-        " AND date<=? ORDER BY date DESC LIMIT 1",
-        (uuid, provider, finish, date)).fetchone()
-    return row["price"] if row else None
+def _envelope(db, uuids, provider, finish):
+    """Per-date minimum across printings: the price a buyer actually pays.
+
+    Tracking one uuid would silently rewrite history when a reprint changes
+    which printing is cheapest; the envelope keeps deltas honest."""
+    if not uuids:
+        return []
+    marks = ",".join("?" * len(uuids))
+    return db.execute(
+        f"SELECT date, MIN(price) AS price FROM prices"
+        f" WHERE provider=? AND finish=? AND uuid IN ({marks})"
+        f" GROUP BY date ORDER BY date",
+        [provider, finish, *uuids]).fetchall()
 
 
 def price_summary(db, uuids, provider: str = "tcgplayer",
                   finish: str = "normal", today: str | None = None):
-    """Cheapest printing's current price + 7d/30d deltas, or None if no data."""
-    best = _cheapest_latest(db, list(uuids), provider, finish)
-    if best is None:
+    """Cheapest-available price + 7d/30d deltas on the min-across-printings
+    envelope, or None if no data. `uuid` is today's cheapest printing."""
+    uuids = list(uuids)
+    env = _envelope(db, uuids, provider, finish)
+    if not env:
         return None
-    uuid, current, date = best
+    current, date = env[-1]["price"], env[-1]["date"]
+    best = _cheapest_latest(db, uuids, provider, finish)
     today = today or _date.today().isoformat()
-    out = {"uuid": uuid, "current": current, "date": date, "d7": None, "d30": None}
+    out = {"uuid": best[0] if best else None, "current": current,
+           "date": date, "d7": None, "d30": None}
     for key, days in (("d7", 7), ("d30", 30)):
         ref_date = (_date.fromisoformat(today) - timedelta(days=days)).isoformat()
-        ref = _price_at_or_before(db, uuid, provider, finish, ref_date)
+        ref = None
+        for row in env:
+            if row["date"] <= ref_date:
+                ref = row["price"]
+            else:
+                break
         if ref is not None:
             out[key] = round(current - ref, 2)
     return out
@@ -340,17 +358,17 @@ def price_summary(db, uuids, provider: str = "tcgplayer",
 
 def price_series(db, uuids, days: int = 90, provider: str = "tcgplayer",
                  finish: str = "normal", today: str | None = None):
-    best = _cheapest_latest(db, list(uuids), provider, finish)
-    if best is None:
+    uuids = list(uuids)
+    env = _envelope(db, uuids, provider, finish)
+    if not env:
         return None
-    uuid = best[0]
     today = today or _date.today().isoformat()
     start = (_date.fromisoformat(today) - timedelta(days=days)).isoformat()
-    points = [(r["date"], r["price"]) for r in db.execute(
-        "SELECT date, price FROM prices WHERE uuid=? AND provider=? AND"
-        " finish=? AND date>=? ORDER BY date", (uuid, provider, finish, start))]
-    return {"uuid": uuid, "provider": provider, "finish": finish,
-            "points": points}
+    best = _cheapest_latest(db, uuids, provider, finish)
+    return {"uuid": best[0] if best else None, "provider": provider,
+            "finish": finish,
+            "points": [(r["date"], r["price"]) for r in env
+                       if r["date"] >= start]}
 
 
 def uuids_for_entry(db, entry: dict) -> list[str]:
@@ -392,7 +410,8 @@ def set_entry_target(db, list_id: int, entry_id: int, target_price):
     if row is None:
         raise NotFound(f"No entry #{entry_id}")
     append_event(db, list_id, "set_target",
-                 {"entry_id": entry_id, "target_price": target_price})
+                 {"entry_id": entry_id, "card_name": row["card_name"],
+                  "target_price": target_price})
     db.execute("UPDATE watchlist_current SET target_price=?"
                " WHERE list_id=? AND entry_id=?", (target_price, list_id, entry_id))
     db.commit()

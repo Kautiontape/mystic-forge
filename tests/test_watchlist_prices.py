@@ -62,6 +62,20 @@ def test_entry_price_summary_falls_back_to_foil(db):
     assert s["current"] == 42.0 and s["finish"] == "foil"
 
 
+def test_envelope_survives_cheapest_printing_flip(db):
+    """A reprint flipping which printing is cheapest must not rewrite history:
+    deltas come from min-across-printings per date (persona: the Optimizer)."""
+    watchlist_db.upsert_price(db, "A", "2026-08-01", "tcgplayer", "normal", 10.0)
+    watchlist_db.upsert_price(db, "A", "2026-08-08", "tcgplayer", "normal", 10.0)
+    watchlist_db.upsert_price(db, "B", "2026-08-01", "tcgplayer", "normal", 20.0)
+    watchlist_db.upsert_price(db, "B", "2026-08-08", "tcgplayer", "normal", 8.0)
+    s = watchlist_db.price_summary(db, ["A", "B"], today="2026-08-08")
+    assert s["current"] == 8.0 and s["uuid"] == "B"
+    assert s["d7"] == 8.0 - 10.0          # envelope: min(now) - min(7d ago)
+    series = watchlist_db.price_series(db, ["A", "B"], today="2026-08-08")
+    assert series["points"] == [("2026-08-01", 10.0), ("2026-08-08", 8.0)]
+
+
 def test_entry_price_summary_prefers_normal(db):
     seed(db)
     db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Sol Ring','uuid-a')")

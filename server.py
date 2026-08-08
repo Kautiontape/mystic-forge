@@ -2765,7 +2765,7 @@ async def watchlist_clone(params: WatchlistCloneInput) -> str:
 from html import escape as _esc
 
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -2846,7 +2846,53 @@ async def watch_history_page(request: Request):
         if row is None:
             return HTMLResponse("unknown passphrase", status_code=404)
         return HTMLResponse(watchlist_pages.render_history(
-            db, row, editable=True, hp=_page_int(request, "hp")))
+            db, row, editable=True, hp=_page_int(request, "hp"),
+            shop=request.query_params.get("shop", "tcgplayer")))
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/w/{passphrase}/export.csv", methods=["GET"])
+async def export_csv(request: Request):
+    """Dense spreadsheet feed: every number the board computes, one row per
+    card, stable columns — built for Sheets IMPORTDATA."""
+    import csv
+    import io
+    db = _wl_db()
+    try:
+        row = _page_row(db, request, "passphrase", by_share=False)
+        if row is None:
+            return PlainTextResponse("unknown passphrase", status_code=404)
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["card", "set_code", "collector_number", "tcgplayer_usd",
+                    "cardkingdom_usd", "cardmarket_eur", "d7", "d7_pct",
+                    "d30", "d30_pct", "target_usd", "pct_to_target",
+                    "price_date"])
+        for e in watchlist_db.current_entries(db, row["id"]):
+            per_shop = {shop: watchlist_db.entry_price_summary(db, e, provider=shop)
+                        for shop in ("tcgplayer", "cardkingdom", "cardmarket")}
+            s = per_shop["tcgplayer"]
+
+            def pct(delta):
+                if not s or delta is None or s["current"] == delta:
+                    return ""
+                then = s["current"] - delta
+                return round(delta / then * 100, 1) if then else ""
+
+            tgt = e["target_price"]
+            w.writerow([
+                e["card_name"], e["set_code"] or "", e["collector_number"] or "",
+                *(per_shop[shop]["current"] if per_shop[shop] else ""
+                  for shop in ("tcgplayer", "cardkingdom", "cardmarket")),
+                s["d7"] if s else "", pct(s["d7"]) if s else "",
+                s["d30"] if s else "", pct(s["d30"]) if s else "",
+                tgt if tgt is not None else "",
+                (round((s["current"] - tgt) / tgt * 100, 1)
+                 if s and tgt else ""),
+                s["date"] if s else "",
+            ])
+        return PlainTextResponse(out.getvalue(), media_type="text/csv")
     finally:
         db.close()
 

@@ -1,10 +1,16 @@
 """Server-rendered watchlist pages — the "arcane ledger".
 
 Catppuccin Latte (day) / Macchiato (night), serif display over mono data.
-Two views per list: the main board (cards + sparklines) and a separate
-history view (revision chain + fork/restore), Google-Docs style.
-Single-series price charts: blue line; status deltas always carry a glyph +
-ink-token text (never color alone). All assets inline — no external requests.
+Two views per list: the main board (cards + sparklines + verdict) and a
+separate history view (revision chain + fork/restore), Google-Docs style.
+
+Semantics that keep the numbers honest (persona-review driven):
+- Unpinned cards chart the min-across-printings envelope (watchlist_db).
+- Targets are USD/tcgplayer-basis: hit state is computed against tcgplayer
+  regardless of the display shop, so "at target" never changes meaning.
+- The freshness line shows the newest PRICE date, not the ingest date.
+All assets inline — no external requests. Revision-modal content is escaped
+client-side (X()) because it round-trips through innerHTML.
 """
 
 import json
@@ -63,60 +69,70 @@ h1 .rune{color:var(--mauve)}
 .iconbtn:hover{background:var(--mantle);color:var(--text)}
 #theme{margin-left:auto;font-size:1.2rem}
 .meta{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;color:var(--sub);
-  font-size:.85rem;margin-bottom:1.4rem}
+  font-size:.85rem;margin-bottom:1.1rem}
 .chip{font-family:var(--font-data);font-size:.75rem;background:var(--mantle);
   border:1px solid var(--surface0);border-radius:999px;padding:.15rem .6rem;
   color:var(--sub);text-decoration:none;display:inline-block}
 button.chip{cursor:pointer}
 .chip:hover{border-color:var(--overlay);color:var(--text)}
 .shops{display:inline-flex;border:1px solid var(--surface0);border-radius:999px;overflow:hidden}
-.shops a{font-family:var(--font-data);font-size:.72rem;padding:.18rem .6rem;
+.shops a{font-family:var(--font-data);font-size:.75rem;padding:.18rem .6rem;
   color:var(--sub);text-decoration:none}
 .shops a.on{background:var(--mauve);color:var(--base)}
 .shops a:not(.on):hover{background:var(--mantle)}
+.verdict{font-family:var(--font-data);font-size:.9rem;background:var(--card);
+  border:1px solid var(--surface0);border-left:3px solid var(--green);
+  border-radius:.8rem;padding:.65rem .95rem;margin-bottom:1rem;
+  backdrop-filter:blur(6px);line-height:1.7}
+.verdict .buy{color:var(--green);font-weight:600}
+.verdict .wait{color:var(--yellow);font-weight:600}
+.verdict .quiet{color:var(--sub)}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(9.5rem,1fr));
   gap:.8rem;margin-bottom:1.6rem}
 .stat{background:var(--card);border:1px solid var(--surface0);border-radius:.8rem;
   padding:.7rem .9rem;backdrop-filter:blur(6px)}
 .stat b{display:block;font-family:var(--font-data);font-size:1.25rem;font-weight:600}
-.stat span{font-size:.72rem;color:var(--sub);text-transform:uppercase;letter-spacing:.08em}
+.stat span{font-size:.75rem;color:var(--sub);text-transform:uppercase;letter-spacing:.08em}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(15.5rem,1fr));gap:.9rem}
 .card{background:var(--card);border:1px solid var(--surface0);border-radius:1rem;
   padding:.9rem 1rem .7rem;cursor:pointer;backdrop-filter:blur(6px);
   box-shadow:0 1px 2px var(--shadow);transition:transform .18s,box-shadow .18s,border-color .18s;
   animation:rise .5s both;position:relative}
 .card:hover{transform:translateY(-3px);box-shadow:0 8px 24px var(--shadow);border-color:var(--lavender)}
+.card:focus-visible,.rev:focus-visible,.chip:focus-visible,.iconbtn:focus-visible{
+  outline:2px solid var(--lavender);outline-offset:2px}
 .card.hit{border-color:var(--green);background:linear-gradient(var(--hitbg),var(--hitbg)),var(--card);
   box-shadow:0 0 0 1px var(--green),0 0 18px var(--hitglow)}
 .card.hit:hover{box-shadow:0 0 0 1px var(--green),0 8px 26px var(--hitglow)}
 @keyframes rise{from{opacity:0;transform:translateY(10px)}}
 .card h3{font-size:1.02rem;font-weight:600;line-height:1.25}
-.badge{font-family:var(--font-data);font-size:.66rem;color:var(--sub);
+.badge{font-family:var(--font-data);font-size:.7rem;color:var(--sub);
   border:1px solid var(--surface1);border-radius:.35rem;padding:.05rem .35rem;
   vertical-align:2px;margin-left:.35rem;white-space:nowrap}
 .note{font-style:italic;color:var(--sub);font-size:.78rem;margin:.15rem 0 .4rem;min-height:1em}
 .price{font-family:var(--font-data);font-size:1.5rem;font-weight:600;letter-spacing:-.01em}
 .price small{font-size:.7rem;color:var(--peach);font-weight:400}
 .deltas{display:flex;gap:.7rem;font-family:var(--font-data);font-size:.75rem;
-  color:var(--text);margin:.15rem 0 .35rem}
-.deltas .lbl{color:var(--overlay)}
+  color:var(--text);margin:.15rem 0 .35rem;flex-wrap:wrap}
+.deltas .lbl{color:var(--sub)}
+.deltas .pct{color:var(--sub)}
 .dn{color:var(--green)}.up{color:var(--red)}.fl{color:var(--overlay)}
-.target{font-size:.74rem;color:var(--sub);font-family:var(--font-data)}
+.target{font-size:.75rem;color:var(--sub);font-family:var(--font-data)}
 .target.hit{color:var(--green);font-weight:600}
 .spark{width:100%;height:auto;display:block;margin-top:.45rem}
-.spark polyline{stroke-dasharray:600;stroke-dashoffset:600;animation:draw 1.1s .15s forwards ease-out}
+.spark polyline{stroke-dasharray:1;stroke-dashoffset:1;animation:draw 1.1s .15s forwards ease-out}
 @keyframes draw{to{stroke-dashoffset:0}}
-.nodata{color:var(--overlay);font-size:.75rem;font-style:italic;margin-top:.6rem}
+.nodata{color:var(--overlay);font-size:.78rem;font-style:italic;margin-top:.6rem}
 .rail{background:var(--card);border:1px solid var(--surface0);border-radius:1rem;
   padding:1.1rem 1.2rem;backdrop-filter:blur(6px);max-width:44rem;margin:0 auto}
 .rev{display:flex;gap:.55rem;align-items:baseline;padding:.45rem .3rem;border-radius:.5rem;
   cursor:pointer;font-size:.85rem;border-bottom:1px dashed var(--surface0)}
 .rev:hover{background:var(--mantle)}
 .rev .n{font-family:var(--font-data);color:var(--mauve);min-width:2.6rem}
-.rev .a{font-family:var(--font-data);font-size:.7rem;color:var(--sub);
-  text-transform:uppercase;min-width:5rem}
+.rev .a{font-family:var(--font-data);font-size:.72rem;color:var(--sub);min-width:5.4rem}
+.rev .dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;margin-right:.3rem}
 .rev .d{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rev .t{color:var(--overlay);font-size:.7rem;white-space:nowrap}
+.rev .t{color:var(--sub);font-size:.72rem;white-space:nowrap}
 .pager{display:flex;justify-content:center;gap:.8rem;margin-top:.7rem;
   font-family:var(--font-data);font-size:.8rem}
 .pager a{color:var(--blue);text-decoration:none}.pager span{color:var(--sub)}
@@ -137,11 +153,14 @@ dialog .sub{color:var(--sub);font-size:.8rem;margin-bottom:.8rem}
 .sites a::after{content:" ↗";color:var(--overlay)}
 .tgtedit{display:flex;gap:.5rem;align-items:center;margin-top:.7rem;flex-wrap:wrap}
 .tgtedit label{font-size:.8rem;color:var(--sub)}
-.tgtedit input{font-family:var(--font-data);font-size:.85rem;width:6.5rem;
+.tgtedit input,#renameInput{font-family:var(--font-data);font-size:.85rem;
   background:var(--mantle);color:var(--text);border:1px solid var(--surface1);
   border-radius:.45rem;padding:.3rem .5rem}
+.tgtedit input{width:6.5rem}
+#renameInput{width:100%;margin:.5rem 0}
+.err{color:var(--red);font-family:var(--font-data);font-size:.75rem}
 table.snap{width:100%;border-collapse:collapse;font-size:.84rem;margin:.5rem 0}
-table.snap th{text-align:left;color:var(--sub);font-size:.7rem;text-transform:uppercase;
+table.snap th{text-align:left;color:var(--sub);font-size:.72rem;text-transform:uppercase;
   letter-spacing:.06em;padding:.3rem .5rem;border-bottom:1px solid var(--surface1)}
 table.snap td{padding:.32rem .5rem;border-bottom:1px solid var(--surface0)}
 table.snap td.num{font-family:var(--font-data)}
@@ -152,14 +171,17 @@ button.act.primary{background:var(--mauve);border-color:var(--mauve);color:var(-
 button.act:hover{filter:brightness(1.08)}
 .secret{font-family:var(--font-data);background:var(--mantle);border:1px dashed var(--peach);
   border-radius:.5rem;padding:.5rem .7rem;margin:.5rem 0;word-break:break-all}
-footer{margin-top:2.5rem;text-align:center;color:var(--overlay);font-size:.75rem}
+footer{margin-top:2.5rem;text-align:center;color:var(--sub);font-size:.75rem}
 footer a{color:var(--sub)}
-.axis{font-family:var(--font-data);font-size:10px;fill:var(--sub)}
+.axis{font-family:var(--font-data);font-size:11px;fill:var(--sub)}
 .gridline{stroke:var(--surface0);stroke-width:1}
+.targetline{stroke:var(--peach);stroke-width:1.5;stroke-dasharray:5 4}
 """
 
 _JS = """
 const KEY=%(key)s, EDITABLE=%(editable)s, CPAD=%(cpad)d, CW=%(cw)d, CH=%(ch)d, CUR=%(cur)s;
+const X=s=>String(s??'').replace(/[&<>"']/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const themeBtn=document.getElementById('theme');
 function themeGlyph(){themeBtn.textContent=
   document.documentElement.dataset.theme==='latte'?'\\u{1F319}':'\\u2600\\uFE0F';
@@ -176,17 +198,41 @@ document.querySelectorAll('[data-copy]').forEach(c=>c.onclick=e=>{
 });
 document.querySelectorAll('dialog').forEach(d=>
   d.addEventListener('click',e=>{if(e.target===d)d.close()}));
-const renameBtn=document.getElementById('rename');
-if(renameBtn)renameBtn.onclick=async()=>{
-  const label=prompt('Rename this list:',renameBtn.dataset.label||'');
-  if(label===null)return;
-  const r=await fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({key:KEY,label})});
-  if(r.ok)location.reload();
+const keyable=el=>{el.setAttribute('tabindex','0');el.setAttribute('role','button');
+  el.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();el.click()}}};
+// ── rename via its own themed dialog, never browser chrome ──
+const renameBtn=document.getElementById('rename'),renameDlg=document.getElementById('renameDlg');
+if(renameBtn&&renameDlg){
+  renameBtn.onclick=()=>{document.getElementById('renameInput').value=
+    renameBtn.dataset.label||'';document.getElementById('renameErr').textContent='';
+    renameDlg.showModal();};
+  document.getElementById('renameSave').onclick=async()=>{
+    const r=await fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:KEY,label:document.getElementById('renameInput').value})});
+    if(r.ok)location.reload();
+    else document.getElementById('renameErr').textContent='could not rename';
+  };
+}
+// ── claim: start your own list from a shared one ──
+const claimBtn=document.getElementById('claim');
+if(claimBtn)claimBtn.onclick=async()=>{
+  const dlg=document.getElementById('claimDlg');dlg.showModal();
+  const out=document.getElementById('claimOut');
+  out.innerHTML='<p class=sub>minting your copy\\u2026</p>';
+  const r=await fetch('/api/fork',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key:KEY,mode:'fork'})});
+  if(!r.ok){out.innerHTML='<p class=err>could not create a copy</p>';return}
+  const d=await r.json();
+  out.innerHTML=`<div class=secret>Your key (screenshot this \\u2014 it is shown once):<br>`+
+    `<b>${d.passphrase}</b></div>`+
+    `<p class=sub>That key is how you edit your list \\u2014 open `+
+    `<a href="${d.page}">your page</a> or tell it to Claude in chat. `+
+    `Your copy starts with everything on this board and is yours alone.</p>`;
 };
 // ── card detail modal ──
 const cardDlg=document.getElementById('cardDlg');
 if(cardDlg)document.querySelectorAll('.card[data-name]').forEach(card=>{
+  keyable(card);
   card.onclick=()=>{
     document.getElementById('cardTitle').textContent=card.dataset.name;
     document.getElementById('cardSub').textContent=card.dataset.sub;
@@ -195,7 +241,8 @@ if(cardDlg)document.querySelectorAll('.card[data-name]').forEach(card=>{
     document.getElementById('siteHost').innerHTML=card.dataset.sites||'';
     const te=document.getElementById('tgtEdit');
     if(te){te.dataset.entry=card.dataset.entry;
-      document.getElementById('tgtInput').value=card.dataset.target||'';}
+      document.getElementById('tgtInput').value=card.dataset.target||'';
+      document.getElementById('tgtErr').textContent='';}
     const pts=card.dataset.pts?JSON.parse(card.dataset.pts):[];
     if(pts.length)armCrosshair(pts);
     cardDlg.showModal();
@@ -213,7 +260,7 @@ function armCrosshair(pts){
   svg.append(vline,dot);
   const lo=Math.min(...pts.map(p=>p[1])),hi=Math.max(...pts.map(p=>p[1]));
   const pad=(hi-lo)||1;
-  svg.onmousemove=e=>{
+  const show=e=>{                       // pointer events: mouse, touch, pen
     const r=svg.getBoundingClientRect();
     const fx=Math.min(1,Math.max(0,(e.clientX-r.left)/r.width));
     const i=Math.round(fx*(pts.length-1));
@@ -226,7 +273,8 @@ function armCrosshair(pts){
     tip.style.left=(x/CW*r.width)+'px';tip.style.top=(y/CH*r.height)+'px';
     tip.textContent=pts[i][0]+' \\u00b7 '+CUR+pts[i][1].toFixed(2);
   };
-  svg.onmouseleave=()=>{tip.style.display='none';
+  svg.onpointermove=show;svg.onpointerdown=show;
+  svg.onpointerleave=()=>{tip.style.display='none';
     vline.setAttribute('x1',-9);vline.setAttribute('x2',-9);dot.setAttribute('cx',-9)};
 }
 const tgtSave=document.getElementById('tgtSave');
@@ -235,12 +283,13 @@ if(tgtSave)tgtSave.onclick=async()=>{
   const r=await fetch('/api/target',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({key:KEY,entry_id:+document.getElementById('tgtEdit').dataset.entry,
                          target_price:v===''?null:+v})});
-  if(r.ok)location.reload();else alert('Could not save target');
+  if(r.ok)location.reload();
+  else document.getElementById('tgtErr').textContent='could not save target';
 };
-// ── revision modal (history view) ──
+// ── revision modal (history view) ── all interpolated data goes through X()
 const revDlg=document.getElementById('revDlg');
 if(revDlg){
-  document.querySelectorAll('.rev').forEach(r=>r.onclick=async()=>{
+  document.querySelectorAll('.rev').forEach(r=>{keyable(r);r.onclick=async()=>{
     const seq=r.dataset.seq;
     document.getElementById('revTitle').textContent='Revision #'+seq;
     document.getElementById('revBody').innerHTML='<p class=sub>consulting the ledger\\u2026</p>';
@@ -252,14 +301,14 @@ if(revDlg){
     let h='<table class=snap><tr><th>Card</th><th>Printing</th><th>Target</th><th>Note</th></tr>';
     if(!d.entries.length)h+='<tr><td colspan=4><i>empty at this revision</i></td></tr>';
     for(const e of d.entries){
-      h+=`<tr><td>${e.card_name}</td><td class=num>${e.set_code?e.set_code+' #'+e.collector_number:'cheapest'}</td>`+
-         `<td class=num>${e.target_price!=null?'$'+e.target_price.toFixed(2):'\\u2014'}</td><td>${e.note||''}</td></tr>`;
+      h+=`<tr><td>${X(e.card_name)}</td><td class=num>${e.set_code?X(e.set_code)+' #'+X(e.collector_number):'cheapest'}</td>`+
+         `<td class=num>${e.target_price!=null?'$'+(+e.target_price).toFixed(2):'\\u2014'}</td><td>${X(e.note||'')}</td></tr>`;
     }
     document.getElementById('revBody').innerHTML=h+'</table>';
     document.getElementById('forkBtn').dataset.seq=seq;
     const rec=document.getElementById('recoverBtn');
     if(rec)rec.dataset.seq=seq;
-  });
+  }});
   async function doFork(mode,seq){
     const res=await fetch('/api/fork',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({key:KEY,at_seq:+seq,mode})});
@@ -278,16 +327,6 @@ document.querySelectorAll('dialog .close').forEach(b=>b.onclick=()=>b.closest('d
 """
 
 
-def _pts(db, entry, shop):
-    s = watchlist_db.entry_price_summary(db, entry, provider=shop)
-    if not s:
-        return None, []
-    series = watchlist_db.price_series(
-        db, watchlist_db.uuids_for_entry(db, entry), days=90, provider=shop,
-        finish=s.get("finish", "normal"))
-    return s, (series["points"] if series else [])
-
-
 def _coords(points, w, h, pad):
     lo = min(p[1] for p in points)
     hi = max(p[1] for p in points)
@@ -301,7 +340,7 @@ def _coords(points, w, h, pad):
     return out, lo, hi
 
 
-def _spark_svg(points, name):
+def _spark_svg(points, name, color="var(--blue)"):
     if len(points) < 2:
         return ""
     xy, _, _ = _coords(points, SW, SH, 4)
@@ -311,22 +350,31 @@ def _spark_svg(points, name):
     return (
         f'<svg class="spark" viewBox="0 0 {SW} {SH}" role="img">'
         f'<title>{esc(name)} — 90 day price trend</title>'
-        f'<path d="{area}" fill="var(--blue)" opacity=".12"/>'
-        f'<polyline points="{pl}" fill="none" stroke="var(--blue)" stroke-width="2" stroke-linejoin="round"/>'
-        f'<circle cx="{ex}" cy="{ey}" r="3" fill="var(--blue)" stroke="var(--base)" stroke-width="2"/>'
+        f'<path d="{area}" fill="{color}" opacity=".12"/>'
+        f'<polyline points="{pl}" pathLength="1" fill="none" stroke="{color}"'
+        f' stroke-width="2" stroke-linejoin="round"/>'
+        f'<circle cx="{ex}" cy="{ey}" r="3" fill="{color}" stroke="var(--base)" stroke-width="2"/>'
         f'</svg>')
 
 
-def _big_svg(points, name, cur):
+def _big_svg(points, name, cur, target=None):
     if len(points) < 2:
         return "<p class=nodata>Not enough history yet.</p>"
     xy, lo, hi = _coords(points, CW, CH, CPAD)
     pl = " ".join(f"{x},{y}" for x, y in xy)
     grid = "".join(f'<line class="gridline" x1="{CPAD}" y1="{y}" x2="{CW - CPAD}" y2="{y}"/>'
                    for y in (CPAD, CH / 2, CH - CPAD))
+    tline = ""
+    if target is not None and lo <= target <= hi:
+        rng = (hi - lo) or 1.0
+        ty = round(CH - CPAD - (CH - 2 * CPAD) * ((target - lo) / rng), 1)
+        tline = (f'<line class="targetline" x1="{CPAD}" y1="{ty}"'
+                 f' x2="{CW - CPAD}" y2="{ty}"/>'
+                 f'<text class="axis" x="{CW - CPAD}" y="{ty - 5}"'
+                 f' text-anchor="end" fill="var(--peach)">target {cur}{target:.2f}</text>')
     return (
-        f'<svg viewBox="0 0 {CW} {CH}" style="width:100%;height:auto" role="img">'
-        f'<title>{esc(name)} — 90 day price history</title>{grid}'
+        f'<svg viewBox="0 0 {CW} {CH}" style="width:100%;height:auto;touch-action:none" role="img">'
+        f'<title>{esc(name)} — 90 day price history</title>{grid}{tline}'
         f'<text class="axis" x="{CPAD}" y="{CPAD - 6}">{cur}{hi:.2f}</text>'
         f'<text class="axis" x="{CPAD}" y="{CH - CPAD + 14}">{cur}{lo:.2f}</text>'
         f'<text class="axis" x="{CW - CPAD}" y="{CPAD - 6}" text-anchor="end">now {cur}{points[-1][1]:.2f}</text>'
@@ -336,12 +384,15 @@ def _big_svg(points, name, cur):
         f'</svg>')
 
 
-def _delta(v, label, cur):
+def _delta_pct(v, ref_now, label, cur):
+    """Delta chip with percentage vs the price `label` days ago."""
     if v is None:
         return f'<span><span class="lbl">{label}</span> <span class="fl">·—</span></span>'
     cls, glyph = ("dn", "▼") if v < 0 else ("up", "▲") if v > 0 else ("fl", "·")
+    then = ref_now - v
+    pct = f' <span class="pct">{abs(v) / then * 100:.1f}%</span>' if then else ""
     return (f'<span title="change vs {label} ago"><span class="lbl">{label}</span> '
-            f'<span class="{cls}">{glyph}</span>{cur}{abs(v):.2f}</span>')
+            f'<span class="{cls}">{glyph}</span>{cur}{abs(v):.2f}{pct}</span>')
 
 
 def _ago(ts):
@@ -386,32 +437,45 @@ def _site_links(entry) -> str:
         for n, u in links) + "</div>"
 
 
-def _card_html(db, entry, idx, shop, cur):
-    s, points = _pts(db, entry, shop)
+def _hit(entry, s) -> bool:
+    return bool(s and entry.get("target_price") is not None
+                and s["current"] <= entry["target_price"])
+
+
+def _card_html(db, entry, s, hit, idx, shop, cur):
+    """One board card. `s` is the DISPLAY-shop summary; `hit` was computed on
+    the tcgplayer basis (targets are USD) so it never flips with the shop."""
+    points = []
+    if s:
+        series = watchlist_db.price_series(
+            db, watchlist_db.uuids_for_entry(db, entry), days=90, provider=shop,
+            finish=s.get("finish", "normal"))
+        points = series["points"] if series else []
     name = esc(entry["card_name"])
     badge = (f'<span class="badge">{esc(entry["set_code"])} '
              f'#{esc(entry["collector_number"] or "")}</span>'
              if entry.get("set_code") else "")
     note = f'<p class="note">{esc(entry["note"] or "")}</p>'
-    hit = bool(s and entry.get("target_price") is not None
-               and s["current"] <= entry["target_price"])
     if s:
         foil = ' <small>(foil)</small>' if s.get("finish") == "foil" else ""
         price = f'<div class="price">{cur}{s["current"]:.2f}{foil}</div>'
-        deltas = (f'<div class="deltas">{_delta(s["d7"], "7d", cur)}'
-                  f'{_delta(s["d30"], "30d", cur)}</div>')
+        deltas = (f'<div class="deltas">{_delta_pct(s["d7"], s["current"], "7d", cur)}'
+                  f'{_delta_pct(s["d30"], s["current"], "30d", cur)}</div>')
     else:
         price = '<div class="nodata">awaiting first ingest…</div>'
         deltas = ""
     target = ""
     if entry.get("target_price") is not None:
+        usd_hint = " (USD)" if cur != "$" else ""
         if hit:
             target = (f'<div class="target hit">🎯 at target '
-                      f'{cur}{entry["target_price"]:.2f} — buy window</div>')
+                      f'${entry["target_price"]:.2f}{usd_hint} — buy window</div>')
         else:
-            gap = f' · {cur}{s["current"] - entry["target_price"]:.2f} above' if s else ""
-            target = f'<div class="target">target {cur}{entry["target_price"]:.2f}{gap}</div>'
-    spark = _spark_svg(points, entry["card_name"]) if points else ""
+            gap = (f' · ${s["current"] - entry["target_price"]:.2f} above'
+                   if s and shop == "tcgplayer" else "")
+            target = f'<div class="target">target ${entry["target_price"]:.2f}{usd_hint}{gap}</div>'
+    spark = _spark_svg(points, entry["card_name"],
+                       "var(--green)" if hit else "var(--blue)") if points else ""
     sub = (f'{entry["set_code"]} #{entry["collector_number"]}'
            if entry.get("set_code") else "cheapest printing") + f" · {shop}"
     data = (f' data-name="{name}" data-sub="{esc(sub)}"'
@@ -419,11 +483,41 @@ def _card_html(db, entry, idx, shop, cur):
             f' data-target="{entry["target_price"] if entry.get("target_price") is not None else ""}"'
             f' data-sites="{esc(_site_links(entry))}"'
             f' data-pts="{esc(json.dumps(points))}"'
-            f' data-chart="{esc(_big_svg(points, entry["card_name"], cur))}"'
+            f' data-chart="{esc(_big_svg(points, entry["card_name"], cur, entry.get("target_price") if shop == "tcgplayer" else None))}"'
             f' data-tail="{esc(_tail_table(points, cur))}"')
     return (f'<article class="card{" hit" if hit else ""}" '
-            f'style="animation-delay:{idx * 45}ms"{data}>'
+            f'aria-label="{name} details" style="animation-delay:{idx * 45}ms"{data}>'
             f'<h3>{name}{badge}</h3>{note}{price}{deltas}{target}{spark}</article>')
+
+
+def _verdict(pairs) -> str:
+    """One server-rendered sentence: BUY / WAIT / nothing close.
+
+    tcgplayer basis. Rule: at/below target → BUY when well under (≥10%) or no
+    longer falling; WAIT while it just crossed and is still dropping."""
+    buys, waits = [], []
+    misses = []
+    for entry, s, hit in pairs:
+        if hit:
+            well_under = s["current"] <= entry["target_price"] * 0.9
+            falling = s["d7"] is not None and s["d7"] < 0
+            pct = (1 - s["current"] / entry["target_price"]) * 100
+            if well_under or not falling:
+                buys.append(f'<span class="buy">BUY</span> {esc(entry["card_name"])} '
+                            f'${s["current"]:.2f} ({pct:.0f}% under target)')
+            else:
+                waits.append(f'<span class="wait">WAIT</span> {esc(entry["card_name"])} '
+                             f'${s["current"]:.2f} (under target, still falling)')
+        elif s and entry.get("target_price") is not None:
+            misses.append((s["current"] - entry["target_price"], entry, s))
+    parts = buys + waits
+    if not parts:
+        if misses:
+            gap, entry, s = min(misses, key=lambda t: t[0])
+            return (f'<div class="verdict"><span class="quiet">No buy windows open — '
+                    f'closest: {esc(entry["card_name"])} ${gap:.2f} above target.</span></div>')
+        return ""
+    return '<div class="verdict">' + ' <span class="quiet">·</span> '.join(parts) + "</div>"
 
 
 def _pager(base, param, page, total, per, keep=""):
@@ -437,14 +531,14 @@ def _pager(base, param, page, total, per, keep=""):
     return f'<nav class="pager">{prev}<span>{page}/{pages}</span>{nxt}</nav>'
 
 
-def _shell(row, editable, body, dialogs, shop="tcgplayer"):
+def _shell(row, editable, body, dialogs, cur="$"):
     key = row["_key"]
     title = esc(row["label"] or "Watchlist")
-    cur = SHOPS.get(shop, "$")
     js = _JS % {"key": json.dumps(key), "editable": json.dumps(editable),
                 "cpad": CPAD, "cw": CW, "ch": CH, "cur": json.dumps(cur)}
     rename = (f'<button class="iconbtn" id="rename" title="Rename list" '
-              f'data-label="{esc(row["label"] or "")}">✎</button>' if editable else "")
+              f'aria-label="Rename list" data-label="{esc(row["label"] or "")}">✎</button>'
+              if editable else "")
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
@@ -456,9 +550,10 @@ def _shell(row, editable, body, dialogs, shop="tcgplayer"):
 <style>{_CSS}</style></head><body>
 <div class="wrap">
 <header class="masthead"><h1><span class="rune">✦</span> {title}</h1>{rename}
-<button class="iconbtn" id="theme"></button></header>
+<button class="iconbtn" id="theme" aria-label="Toggle theme"></button></header>
 {body}
-<footer>forged in the Mystic Forge · <a href="/health">health</a></footer>
+<footer>forged in the Mystic Forge · card price watchlist ·
+<a href="/health" title="server status">status</a></footer>
 </div>
 {dialogs}
 <script>{js}</script>
@@ -466,75 +561,116 @@ def _shell(row, editable, body, dialogs, shop="tcgplayer"):
 
 
 def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -> str:
-    """The board: stat tiles + card grid. History lives in its own view."""
+    """The board: verdict + stat tiles + card grid, buy windows first."""
     key = row["_key"]
     shop = shop if shop in SHOPS else "tcgplayer"
     cur = SHOPS[shop]
     base = f"/w/{esc(key)}" if editable else f"/s/{esc(key)}"
+    keep = f"&shop={shop}" if shop != "tcgplayer" else ""
+    qshop = f"?shop={shop}" if shop != "tcgplayer" else ""
     entries = watchlist_db.current_entries(db, row["id"])
-    summaries = [(e, watchlist_db.entry_price_summary(db, e, provider=shop))
-                 for e in entries]
-    total_val = sum(s["current"] for _, s in summaries if s)
-    net7 = sum(s["d7"] for _, s in summaries if s and s["d7"] is not None)
-    hits = sum(1 for e, s in summaries
-               if s and e["target_price"] is not None and s["current"] <= e["target_price"])
-    last = db.execute("SELECT value FROM meta WHERE key='last_ingest'").fetchone()
-    last = last["value"] if last else "never"
 
-    page_cards = entries[(cp - 1) * CARDS_PER_PAGE: cp * CARDS_PER_PAGE]
-    cards = "".join(_card_html(db, e, i, shop, cur)
-                    for i, e in enumerate(page_cards)) or \
+    # tcgplayer basis for hits/verdict (targets are USD); display shop for prices
+    pairs = []
+    for e in entries:
+        base_s = watchlist_db.entry_price_summary(db, e, provider="tcgplayer")
+        disp_s = (base_s if shop == "tcgplayer"
+                  else watchlist_db.entry_price_summary(db, e, provider=shop))
+        pairs.append((e, base_s, disp_s, _hit(e, base_s)))
+    pairs.sort(key=lambda t: not t[3])          # buy windows first, stable
+
+    total_val = sum(s["current"] for _, _, s, _ in pairs if s)
+    net7 = sum(s["d7"] for _, _, s, _ in pairs if s and s["d7"] is not None)
+    hits = sum(1 for _, _, _, h in pairs if h)
+    through = db.execute("SELECT MAX(date) FROM prices WHERE provider=?",
+                         (shop,)).fetchone()[0]
+    last_ingest = db.execute(
+        "SELECT value FROM meta WHERE key='last_ingest'").fetchone()
+    last_ingest = last_ingest["value"] if last_ingest else "never"
+
+    page = pairs[(cp - 1) * CARDS_PER_PAGE: cp * CARDS_PER_PAGE]
+    cards = "".join(_card_html(db, e, disp_s, h, i, shop, cur)
+                    for i, (e, _, disp_s, h) in enumerate(page)) or \
         '<p class="nodata">Nothing watched yet — ask Claude to <code>watchlist_add</code> a card.</p>'
 
     shop_links = "".join(
         f'<a href="{base}?shop={s}" class="{"on" if s == shop else ""}">{s}</a>'
         for s in SHOPS)
     share = (f'<button class="chip" data-copy="{esc(row["share_code"])}" '
-             f'title="Copy the read-only share code">share {esc(row["share_code"])} ⧉</button>')
-    ro = '' if editable else '<span class="chip">read-only</span>'
+             f'title="Copy this list\'s read-only share code — friends can view it at '
+             f'{base.replace("/w/", "/s/")}">share {esc(row["share_code"])} ⧉</button>'
+             if editable else '<span class="chip">viewing a shared list (read-only)</span>')
+    claim = ('' if editable else
+             '<button class="chip" id="claim">⑂ start my own list from this one</button>')
     superseded = ('<p class="note">⚠ superseded by a recovery clone — this copy '
                   'is historical.</p>' if row["superseded_by"] else "")
 
     tgt_edit = ""
     if editable:
         tgt_edit = ('<div class="tgtedit" id="tgtEdit"><label for="tgtInput">'
-                    'target price</label><input id="tgtInput" type="number" '
+                    'target price ($)</label><input id="tgtInput" type="number" '
                     'step="0.01" min="0" placeholder="none">'
-                    '<button class="act" id="tgtSave">Save</button></div>')
+                    '<button class="act" id="tgtSave">Save</button>'
+                    '<span class="err" id="tgtErr"></span></div>')
     dialogs = (f'<dialog id="cardDlg"><h3 id="cardTitle"></h3><p class="sub" id="cardSub"></p>'
                f'<div class="chart-wrap"><div id="chartHost"></div><div class="tip" id="tip"></div></div>'
                f'<div id="siteHost"></div>{tgt_edit}<div id="snapHost"></div>'
                f'<div class="btnrow"><button class="act close">Close</button></div></dialog>')
+    if editable:
+        dialogs += ('<dialog id="renameDlg"><h3>Rename list</h3>'
+                    '<input id="renameInput" maxlength="80">'
+                    '<span class="err" id="renameErr"></span>'
+                    '<div class="btnrow"><button class="act primary" id="renameSave">Save</button>'
+                    '<button class="act close">Cancel</button></div></dialog>')
+    else:
+        dialogs += ('<dialog id="claimDlg"><h3>Your own watchlist</h3>'
+                    '<div id="claimOut"></div>'
+                    '<div class="btnrow"><button class="act close">Close</button></div></dialog>')
 
+    freshness = (f'<span title="last ingest: {esc(last_ingest)}">prices through '
+                 f'{esc(through)}</span>' if through
+                 else '<span>no price data yet — first ingest tonight</span>')
     body = f"""
-<div class="meta">{ro}{share}
-<a class="chip" href="{base}/history" title="Every change ever made, and time travel">⟲ history</a>
+<div class="meta">{share}{claim}
+<a class="chip" href="{base}/history{qshop}" title="Every change ever made to this list — inspect or restore any point">⟲ history</a>
 <span class="shops">{shop_links}</span>
-<span title="A falling price (▼) means it's getting cheaper to buy">▼ = cheaper</span>
-<span>prices as of {esc(last)}</span></div>
+<span title="These are buy prices — falling (▼, green) is good news">▼ = getting cheaper</span>
+{freshness}</div>
 {superseded}
+{_verdict([(e, bs, h) for e, bs, _, h in pairs])}
 <div class="stats">
-<div class="stat"><b>{cur}{total_val:.2f}</b><span>list total</span></div>
+<div class="stat"><b>{hits}</b><span>buy windows</span></div>
 <div class="stat"><b>{"▼" if net7 < 0 else "▲" if net7 > 0 else "·"}{cur}{abs(net7):.2f}</b><span>7-day net</span></div>
-<div class="stat"><b>{hits}</b><span>at target</span></div>
+<div class="stat"><b>{cur}{total_val:.2f}</b><span>list total</span></div>
 <div class="stat"><b>{len(entries)}</b><span>cards</span></div>
 </div>
 <div class="grid">{cards}</div>
-{_pager(base, "cp", cp, len(entries), CARDS_PER_PAGE, keep=f"&shop={shop}")}"""
-    return _shell(row, editable, body, dialogs, shop)
+{_pager(base, "cp", cp, len(entries), CARDS_PER_PAGE, keep=keep)}"""
+    return _shell(row, editable, body, dialogs, cur)
 
 
-def render_history(db, row, editable: bool, hp: int = 1) -> str:
+_ACTION_LABELS = {"create": ("forged", "var(--mauve)"),
+                  "add": ("added", "var(--green)"),
+                  "remove": ("removed", "var(--red)"),
+                  "set_target": ("target set", "var(--yellow)"),
+                  "set_note": ("note set", "var(--yellow)"),
+                  "set_label": ("renamed", "var(--yellow)"),
+                  "clone_init": ("cloned from", "var(--mauve)")}
+
+
+def render_history(db, row, editable: bool, hp: int = 1,
+                   shop: str = "tcgplayer") -> str:
     """The stashed-away revision view: full chain, revision modal, fork/restore."""
     key = row["_key"]
     base = f"/w/{esc(key)}" if editable else f"/s/{esc(key)}"
+    qshop = f"?shop={shop}" if shop in SHOPS and shop != "tcgplayer" else ""
     total_ev = db.execute("SELECT COUNT(*) FROM events WHERE list_id=?",
                           (row["id"],)).fetchone()[0]
     events = db.execute(
         "SELECT * FROM events WHERE list_id=? ORDER BY seq DESC LIMIT ? OFFSET ?",
         (row["id"], EVENTS_PER_PAGE, (hp - 1) * EVENTS_PER_PAGE)).fetchall()
-    # set_target/set_note/remove payloads carry only entry_id — resolve the
-    # card name through the add event that minted that entry (entry_id == seq).
+    # older set_target/set_note/remove payloads carry only entry_id — resolve
+    # the card name through the add event that minted it (entry_id == seq).
     adds = {ev["seq"]: json.loads(ev["payload_json"]).get("card_name", "")
             for ev in db.execute(
                 "SELECT seq, payload_json FROM events WHERE list_id=?"
@@ -544,17 +680,22 @@ def render_history(db, row, editable: bool, hp: int = 1) -> str:
         d = payload.get("card_name") or payload.get("label") or ""
         if not d and payload.get("entry_id") in adds:
             d = adds[payload["entry_id"]]
-            if ev["action"] == "set_target":
-                tp = payload.get("target_price")
-                d += " → no target" if tp is None else f" → ${tp:.2f}"
+        if ev["action"] == "set_target" and d:
+            tp = payload.get("target_price")
+            d += " → no target" if tp is None else f" → ${tp:.2f}"
         return d
 
-    revs = "".join(
-        f'<div class="rev" data-seq="{ev["seq"]}"><span class="n">#{ev["seq"]}</span>'
-        f'<span class="a">{esc(ev["action"].replace("_", " "))}</span>'
-        f'<span class="d">{esc(_detail(ev, json.loads(ev["payload_json"])))}</span>'
-        f'<span class="t">{_ago(ev["ts"])}</span></div>'
-        for ev in events)
+    revs = ""
+    for ev in events:
+        label, color = _ACTION_LABELS.get(ev["action"],
+                                          (ev["action"].replace("_", " "), "var(--sub)"))
+        revs += (
+            f'<div class="rev" data-seq="{ev["seq"]}" aria-label="Revision {ev["seq"]}">'
+            f'<span class="n">#{ev["seq"]}</span>'
+            f'<span class="a"><span class="dot" style="background:{color}"></span>'
+            f'{esc(label)}</span>'
+            f'<span class="d">{esc(_detail(ev, json.loads(ev["payload_json"])))}</span>'
+            f'<span class="t">{_ago(ev["ts"])}</span></div>')
     recover_btn = ('<button class="act" id="recoverBtn">Restore here (supersede)</button>'
                    if editable else "")
     dialogs = (f'<dialog id="revDlg"><h3 id="revTitle"></h3>'
@@ -563,8 +704,10 @@ def render_history(db, row, editable: bool, hp: int = 1) -> str:
                f'<div class="btnrow"><button class="act primary" id="forkBtn">⑂ Fork this revision</button>'
                f'{recover_btn}<button class="act close">Close</button></dialog>')
     body = f"""
-<div class="meta"><a class="chip" href="{base}">← back to the board</a>
-<span>{total_ev} revisions · append-only · click one to inspect or time-travel</span></div>
+<div class="meta"><a class="chip" href="{base}{qshop}">← back to the board</a>
+<span>every change to this list, oldest to newest, nothing ever deleted ·
+click a revision to see the list as it was, copy it, or restore it</span></div>
 <div class="rail">{revs}
-{_pager(base + "/history", "hp", hp, total_ev, EVENTS_PER_PAGE)}</div>"""
+{_pager(base + "/history", "hp", hp, total_ev, EVENTS_PER_PAGE,
+        keep=qshop.replace("?", "&") if qshop else "")}</div>"""
     return _shell(row, editable, body, dialogs)
