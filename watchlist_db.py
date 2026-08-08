@@ -11,7 +11,7 @@ import json
 import os
 import secrets
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = os.environ.get("MYSTIC_FORGE_DB", "mystic_forge.db")
@@ -285,3 +285,82 @@ def clone_list(db, source_list_id: int, at_seq: int | None = None,
                    (new_id, source_list_id))
         db.commit()
     return new_id, passphrase, share_code
+
+
+def upsert_price(db, uuid: str, date: str, provider: str, finish: str,
+                 price: float, commit: bool = True) -> None:
+    db.execute("INSERT OR REPLACE INTO prices (uuid, date, provider, finish,"
+               " price) VALUES (?,?,?,?,?)", (uuid, date, provider, finish, price))
+    if commit:
+        db.commit()
+
+
+def _cheapest_latest(db, uuids, provider, finish):
+    """(uuid, price, date) with the lowest most-recent price, else None."""
+    if not uuids:
+        return None
+    marks = ",".join("?" * len(uuids))
+    row = db.execute(
+        f"""SELECT uuid, price, date FROM (
+              SELECT uuid, price, date,
+                     ROW_NUMBER() OVER (PARTITION BY uuid ORDER BY date DESC) rn
+              FROM prices
+              WHERE provider=? AND finish=? AND uuid IN ({marks}))
+            WHERE rn=1 ORDER BY price ASC LIMIT 1""",
+        [provider, finish, *uuids]).fetchone()
+    return (row["uuid"], row["price"], row["date"]) if row else None
+
+
+def _price_at_or_before(db, uuid, provider, finish, date):
+    row = db.execute(
+        "SELECT price FROM prices WHERE uuid=? AND provider=? AND finish=?"
+        " AND date<=? ORDER BY date DESC LIMIT 1",
+        (uuid, provider, finish, date)).fetchone()
+    return row["price"] if row else None
+
+
+def price_summary(db, uuids, provider: str = "tcgplayer",
+                  finish: str = "normal", today: str | None = None):
+    """Cheapest printing's current price + 7d/30d deltas, or None if no data."""
+    best = _cheapest_latest(db, list(uuids), provider, finish)
+    if best is None:
+        return None
+    uuid, current, date = best
+    today = today or _date.today().isoformat()
+    out = {"uuid": uuid, "current": current, "date": date, "d7": None, "d30": None}
+    for key, days in (("d7", 7), ("d30", 30)):
+        ref_date = (_date.fromisoformat(today) - timedelta(days=days)).isoformat()
+        ref = _price_at_or_before(db, uuid, provider, finish, ref_date)
+        if ref is not None:
+            out[key] = round(current - ref, 2)
+    return out
+
+
+def price_series(db, uuids, days: int = 90, provider: str = "tcgplayer",
+                 finish: str = "normal", today: str | None = None):
+    best = _cheapest_latest(db, list(uuids), provider, finish)
+    if best is None:
+        return None
+    uuid = best[0]
+    today = today or _date.today().isoformat()
+    start = (_date.fromisoformat(today) - timedelta(days=days)).isoformat()
+    points = [(r["date"], r["price"]) for r in db.execute(
+        "SELECT date, price FROM prices WHERE uuid=? AND provider=? AND"
+        " finish=? AND date>=? ORDER BY date", (uuid, provider, finish, start))]
+    return {"uuid": uuid, "provider": provider, "finish": finish,
+            "points": points}
+
+
+def uuids_for_entry(db, entry: dict) -> list[str]:
+    """MTGJSON uuids an entry tracks: its pinned printing, else all printings."""
+    if entry.get("uuid"):
+        return [entry["uuid"]]
+    q = "SELECT uuid FROM card_uuids WHERE LOWER(card_name)=LOWER(?)"
+    args = [entry["card_name"]]
+    if entry.get("set_code"):
+        q += " AND LOWER(set_code)=LOWER(?)"
+        args.append(entry["set_code"])
+    if entry.get("collector_number"):
+        q += " AND collector_number=?"
+        args.append(entry["collector_number"])
+    return [r["uuid"] for r in db.execute(q, args)]
