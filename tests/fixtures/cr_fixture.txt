@@ -40,7 +40,7 @@ Example: “Flying” is a keyword ability.
 702.2a Deathtouch is a static ability.
 
 702.2b A creature with toughness 0 or less that’s been dealt damage by a source with deathtouch since the last time state-based actions were checked is destroyed as a state-based action. See rule 704.
-
+ 
 702.2c Any nonzero amount of combat damage assigned to a creature by a source with deathtouch is considered to be lethal damage, regardless of that creature’s toughness. See rules 510.1c–d.
 
 704. State-Based Actions
@@ -58,10 +58,10 @@ A keyword ability that causes damage dealt by an object to be especially effecti
 
 Destroy
 To move a permanent from the battlefield to its owner’s graveyard. See rule 701.7, “Destroy.”
-
+ 
 Dies
 A creature or planeswalker “dies” if it’s put into a graveyard from the battlefield.
-
+ 
 It is used interchangeably with “is put into a graveyard from the battlefield.”
 
 Credits
