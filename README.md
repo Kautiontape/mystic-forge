@@ -10,8 +10,9 @@ A unified MCP (Model Context Protocol) server for Magic: The Gathering. Combines
 | `scryfall_search` | Full Scryfall query syntax search |
 | `scryfall_named` | Look up a card by name (exact + fuzzy) |
 | `scryfall_random` | Random card with optional filter |
-| `scryfall_price` | Current prices across all printings |
-| `scryfall_price_list` | Batch-price up to 75 cards at once |
+| `scryfall_price` | Prices per printing; pin one with set code + collector number, filter by finish |
+| `scryfall_price_list` | Price a decklist at the printing and finish on each line |
+| `scryfall_card_text` | Exact oracle text for a whole list of cards in one call |
 
 ### EDHRec — Commander Recommendations
 | Tool | Description |
@@ -27,7 +28,7 @@ A unified MCP (Model Context Protocol) server for Magic: The Gathering. Combines
 ### Archidekt — Deck Reading
 | Tool | Description |
 |---|---|
-| `archidekt_deck` | Fetch a public deck by ID or URL |
+| `archidekt_deck` | Fetch a public deck by ID or URL (`include_text` adds full oracle text) |
 | `archidekt_user_decks` | List a user's public decks |
 | `archidekt_export` | Export deck as importable card list |
 
@@ -105,11 +106,24 @@ cp .env.example .env
 
 **Important:** Never deploy credentials on a shared/public server. Private deck access is for self-hosted instances only.
 
+## Price watchlist
+
+Personal MTG price watchlists with ~90 days of MTGJSON daily history.
+Lists are identified by a passphrase (shown once at `watchlist_create`):
+use it in a personal connector URL (`https://mcp.kautiontape.com/mtg/mcp/<passphrase>`)
+or pass it to tools in chat. Share codes (`SC-…`) grant read-only viewing at
+`https://mcp.kautiontape.com/mtg/s/<code>`. Every change is an append-only event —
+see the full chain at `https://mcp.kautiontape.com/mtg/w/<passphrase>` and recover
+any revision with `watchlist_clone(at_seq=N)` (mints a new passphrase).
+Prices ingest nightly from MTGJSON (tcgplayer/cardkingdom/cardmarket retail).
+Health: `GET /health`.
+
 ## Data Sources
 
 - **[Scryfall](https://scryfall.com)** — Card data and prices (updated daily from TCGPlayer, Cardmarket, Cardhoarder)
 - **[EDHRec](https://edhrec.com)** — Commander metagame data and recommendations
 - **[Archidekt](https://archidekt.com)** — Deck building and storage
+- **[MTGJSON](https://mtgjson.com)** — Daily price history and printing/uuid mapping for the watchlist
 
 ## License
 
