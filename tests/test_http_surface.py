@@ -369,7 +369,7 @@ def test_pager_numbered_and_sort_agnostic(db_path):
     assert "Next ›" in p1 and 'class="pnum dis">‹ Prev' in p1
     assert 'class="pnum cur" aria-current="page">4' in p4
     assert p4.count('class="gap"') == 2                # 1 … 3 4 5 … 7
-    assert f'href="/w/{pp}?cp=7"' in p4                # last page reachable
+    assert f'href="{server.PUBLIC_PREFIX}/w/{pp}?cp=7"' in p4  # last page reachable
 
 
 def test_api_note_set_clear_and_share_forbidden(db_path):
