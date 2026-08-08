@@ -878,9 +878,9 @@ def _shell(row, editable, body, dialogs, cur="$", subtitle="", rightnav=""):
 <meta property="og:site_name" content="Mystic Forge">
 <meta property="og:type" content="website">
 <meta property="og:title" content="{title} · a Magic price watchlist">
-<meta property="og:description" content="Buy-window targets, 90 days of price
-history, and shareable boards — forged in Mystic Forge. Nothing here goes
-stale: open the link for live prices.">
+<meta property="og:description" content="A Magic: The Gathering price
+watchlist — buy-window targets, price trends, and shareable boards, forged
+in Mystic Forge.">
 <meta property="og:image" content="{PUBLIC_BASE}/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
