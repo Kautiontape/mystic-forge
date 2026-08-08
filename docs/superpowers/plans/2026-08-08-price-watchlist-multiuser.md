@@ -1,5 +1,9 @@
 # Multi-List Price Watchlist Implementation Plan
 
+> **Status: complete.** All tasks executed on branch `price_history`; the
+> shipped system went beyond this plan (see the spec's "Shipped beyond this
+> spec" section). Steps are checked off for the record.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Passphrase-named MTG price watchlists with event-sourced history, share codes, clone-only recovery, MTGJSON price ingest, health checks, and deploy wiring — per `docs/superpowers/specs/2026-08-08-price-watchlist-multiuser-design.md`.
@@ -26,7 +30,7 @@
 - Test: `tests/test_watchlist_db.py`
 - Modify: `conftest.py` (shared db fixture + ingest guard)
 
-- [ ] **Step 1: Fetch and commit the wordlist**
+- [x] **Step 1: Fetch and commit the wordlist**
 
 ```bash
 cd /home/shawn/.herdr/worktrees/mystic-forge/price-history
@@ -35,7 +39,7 @@ wc -l watchlist_words.txt   # expect 1296
 git add watchlist_words.txt && git commit -m "watchlist: Add EFF short wordlist for passphrase minting"
 ```
 
-- [ ] **Step 2: Add shared fixtures to `conftest.py`**
+- [x] **Step 2: Add shared fixtures to `conftest.py`**
 
 Append to the existing `conftest.py` (keep the current sys.path lines):
 
@@ -67,7 +71,7 @@ def db(db_path):
     conn.close()
 ```
 
-- [ ] **Step 3: Write failing tests**
+- [x] **Step 3: Write failing tests**
 
 Create `tests/test_watchlist_db.py`:
 
@@ -121,12 +125,12 @@ def test_create_records_create_event(db):
     assert ev["seq"] == 1 and ev["action"] == "create"
 ```
 
-- [ ] **Step 4: Run tests to verify they fail**
+- [x] **Step 4: Run tests to verify they fail**
 
 Run: `pytest tests/test_watchlist_db.py -v`
 Expected: FAIL / ERROR with `ModuleNotFoundError: No module named 'watchlist_db'`
 
-- [ ] **Step 5: Implement `watchlist_db.py`**
+- [x] **Step 5: Implement `watchlist_db.py`**
 
 ```python
 """SQLite storage for the multi-list price watchlist (spec 2026-08-08).
@@ -283,12 +287,12 @@ def append_event(db, list_id: int, action: str, payload: dict) -> int:
     return seq
 ```
 
-- [ ] **Step 6: Run tests to verify they pass**
+- [x] **Step 6: Run tests to verify they pass**
 
 Run: `pytest tests/test_watchlist_db.py -v`
 Expected: all PASS. Also run `pytest` (whole suite) to confirm the conftest change breaks nothing.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add watchlist_db.py tests/test_watchlist_db.py conftest.py
@@ -303,7 +307,7 @@ git commit -m "watchlist: Add DB core with passphrase-named lists"
 - Modify: `watchlist_db.py`
 - Test: `tests/test_watchlist_db.py`
 
-- [ ] **Step 1: Write failing tests** (append to `tests/test_watchlist_db.py`)
+- [x] **Step 1: Write failing tests** (append to `tests/test_watchlist_db.py`)
 
 ```python
 def test_add_card_materializes_current(db):
@@ -389,12 +393,12 @@ def test_replay_reproduces_current(db):
             assert entry[col] == current[eid][col], f"{col} diverged"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_watchlist_db.py -v`
 Expected: new tests FAIL with `AttributeError: ... 'add_card'`
 
-- [ ] **Step 3: Implement in `watchlist_db.py`**
+- [x] **Step 3: Implement in `watchlist_db.py`**
 
 Replace the Task-1 `append_event` (drop its internal `db.commit()`) and add:
 
@@ -522,11 +526,11 @@ Also update `create_list` to `db.commit()` after its `append_event` call (since 
     return list_id, passphrase, share_code
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_watchlist_db.py -v` — Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add watchlist_db.py tests/test_watchlist_db.py
@@ -541,7 +545,7 @@ git commit -m "watchlist: Add event-sourced add/remove with replay invariant"
 - Modify: `watchlist_db.py`
 - Test: `tests/test_watchlist_db.py`
 
-- [ ] **Step 1: Write failing tests** (append)
+- [x] **Step 1: Write failing tests** (append)
 
 ```python
 def test_clone_at_seq_matches_source_state(db):
@@ -590,11 +594,11 @@ def test_clone_history_starts_with_clone_init_then_adds(db):
     assert [e["card_name"] for e in replayed.values()] == ["Sol Ring"]
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_watchlist_db.py -v` — Expected: FAIL with `AttributeError: ... 'clone_list'`
 
-- [ ] **Step 3: Implement `clone_list` in `watchlist_db.py`**
+- [x] **Step 3: Implement `clone_list` in `watchlist_db.py`**
 
 ```python
 def clone_list(db, source_list_id: int, at_seq: int | None = None,
@@ -631,11 +635,11 @@ def clone_list(db, source_list_id: int, at_seq: int | None = None,
     return new_id, passphrase, share_code
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_watchlist_db.py -v` — Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add watchlist_db.py tests/test_watchlist_db.py
@@ -650,7 +654,7 @@ git commit -m "watchlist: Add clone-at-revision with recovery supersession"
 - Modify: `watchlist_db.py`
 - Test: `tests/test_watchlist_prices.py` (new)
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Create `tests/test_watchlist_prices.py`:
 
@@ -710,11 +714,11 @@ def test_price_series_respects_days_window(db):
     assert all(d >= "2026-07-29" for d, _ in series["points"])
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_watchlist_prices.py -v` — Expected: FAIL with `AttributeError: ... 'upsert_price'`
 
-- [ ] **Step 3: Implement in `watchlist_db.py`**
+- [x] **Step 3: Implement in `watchlist_db.py`**
 
 ```python
 from datetime import date as _date, timedelta
@@ -799,11 +803,11 @@ def uuids_for_entry(db, entry: dict) -> list[str]:
     return [r["uuid"] for r in db.execute(q, args)]
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_watchlist_prices.py -v` — Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add watchlist_db.py tests/test_watchlist_prices.py
@@ -819,11 +823,11 @@ git commit -m "watchlist: Add cheapest-printing price summaries and series"
 - Test: `tests/test_watchlist_ingest.py`
 - Modify: `requirements.txt` (add `ijson`)
 
-- [ ] **Step 1: Add dependency**
+- [x] **Step 1: Add dependency**
 
 Append to `requirements.txt`: `ijson>=3.2` — then `pip install ijson`.
 
-- [ ] **Step 2: Write failing tests**
+- [x] **Step 2: Write failing tests**
 
 Create `tests/test_watchlist_ingest.py`:
 
@@ -943,11 +947,11 @@ def test_run_ingest_records_last_ingest(db, db_path, tmp_path, monkeypatch):
     db2.close()
 ```
 
-- [ ] **Step 3: Run tests to verify they fail**
+- [x] **Step 3: Run tests to verify they fail**
 
 Run: `pytest tests/test_watchlist_ingest.py -v` — Expected: `ModuleNotFoundError: No module named 'watchlist_ingest'`
 
-- [ ] **Step 4: Implement `watchlist_ingest.py`**
+- [x] **Step 4: Implement `watchlist_ingest.py`**
 
 ```python
 """MTGJSON ingest for the price watchlist.
@@ -1115,11 +1119,11 @@ def _needs_unresolved(db) -> bool:
            LIMIT 1""").fetchone() is not None
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `pytest tests/test_watchlist_ingest.py -v` — Expected: all PASS. (The memory test streams 5000 uuids; if `peak` is unexpectedly high, check that `ijson.kvitems` is used — never `json.load`.)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add watchlist_ingest.py tests/test_watchlist_ingest.py requirements.txt
@@ -1134,7 +1138,7 @@ git commit -m "watchlist: Add streaming MTGJSON ingest with uuid resolution"
 - Modify: `server.py` (imports near top; middleware + entrypoint near bottom)
 - Test: `tests/test_identity.py` (new)
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Create `tests/test_identity.py`:
 
@@ -1208,11 +1212,11 @@ def test_context_cleared_between_requests(db_path):
     assert inner.seen_list is None
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_identity.py -v` — Expected: FAIL with `AttributeError: module 'server' has no attribute 'PassphraseMiddleware'`
 
-- [ ] **Step 3: Implement in `server.py`**
+- [x] **Step 3: Implement in `server.py`**
 
 Add imports at the top (near existing imports):
 
@@ -1324,11 +1328,11 @@ if __name__ == "__main__":
         uvicorn.run(build_app(), host="0.0.0.0", port=8000)
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_identity.py -v` — Expected: all PASS. Run `pytest` to confirm no regressions.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server.py tests/test_identity.py
@@ -1345,7 +1349,7 @@ git commit -m "watchlist: Route passphrase URLs through ASGI identity middleware
 
 All tools follow the repo convention: pydantic input model, `@mcp.tool(name=...)`, async, return markdown string. Identity resolution order (spec): explicit `passphrase` param → URL context → helpful error.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Create `tests/test_watchlist_tools.py`:
 
@@ -1452,11 +1456,11 @@ async def test_mutating_superseded_list_warns(db_path, a_list, fake_scryfall):
     assert successor["share_code"] in out
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_watchlist_tools.py -v` — Expected: FAIL with `AttributeError: ... 'watchlist_create'`
 
-- [ ] **Step 3: Implement the tools in `server.py`**
+- [x] **Step 3: Implement the tools in `server.py`**
 
 Add a new section before the ENTRYPOINT section:
 
@@ -1670,11 +1674,11 @@ async def watchlist_list(params: WatchlistListInput) -> str:
         db.close()
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_watchlist_tools.py -v` — Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server.py tests/test_watchlist_tools.py
@@ -1689,7 +1693,7 @@ git commit -m "watchlist: Add create/add/remove/list MCP tools"
 - Modify: `server.py` (same WATCHLIST section)
 - Test: `tests/test_watchlist_tools.py`
 
-- [ ] **Step 1: Write failing tests** (append to `tests/test_watchlist_tools.py`)
+- [x] **Step 1: Write failing tests** (append to `tests/test_watchlist_tools.py`)
 
 ```python
 def _seed_prices(db_path, name="Sol Ring", uuid="uuid-a"):
@@ -1765,11 +1769,11 @@ async def test_price_history_series(db_path, a_list, fake_scryfall):
     assert "2026-08-08" in out and "7.0" in out
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_watchlist_tools.py -v` — Expected: new tests FAIL (`watchlist_report` missing).
 
-- [ ] **Step 3: Implement** (append to the WATCHLIST section in `server.py`)
+- [x] **Step 3: Implement** (append to the WATCHLIST section in `server.py`)
 
 ```python
 class WatchlistViewInput(BaseModel):
@@ -1948,11 +1952,11 @@ async def price_history(params: PriceHistoryInput) -> str:
         db.close()
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_watchlist_tools.py -v` — Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server.py tests/test_watchlist_tools.py
@@ -1967,7 +1971,7 @@ git commit -m "watchlist: Add report/view/history/clone/price_history tools"
 - Modify: `server.py`
 - Test: `tests/test_http_surface.py` (new)
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Create `tests/test_http_surface.py`:
 
@@ -2032,11 +2036,11 @@ def test_share_page_readonly_no_passphrase_leak(db_path):
     assert pp not in r.text                  # passphrase never on share page
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_http_surface.py -v` — Expected: 404s / assertion failures (routes don't exist yet).
 
-- [ ] **Step 3: Implement routes in `server.py`** (after the tools, before ENTRYPOINT)
+- [x] **Step 3: Implement routes in `server.py`** (after the tools, before ENTRYPOINT)
 
 ```python
 from html import escape as _esc
@@ -2133,11 +2137,11 @@ async def share_page(request: Request):
         db.close()
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_http_surface.py -v` — Expected: all PASS. Then full suite: `pytest`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server.py tests/test_http_surface.py
@@ -2151,7 +2155,7 @@ git commit -m "watchlist: Add health endpoint and read-only history pages"
 **Files:**
 - Modify: `Dockerfile`, `docker-compose.yml`, `README.md`, `server.py` (instructions string)
 
-- [ ] **Step 1: Dockerfile — ship the new modules**
+- [x] **Step 1: Dockerfile — ship the new modules**
 
 Replace `COPY server.py .` with:
 
@@ -2159,7 +2163,7 @@ Replace `COPY server.py .` with:
 COPY server.py watchlist_db.py watchlist_ingest.py watchlist_words.txt ./
 ```
 
-- [ ] **Step 2: Dev compose parity** (`docker-compose.yml` in this repo)
+- [x] **Step 2: Dev compose parity** (`docker-compose.yml` in this repo)
 
 ```yaml
 services:
@@ -2184,7 +2188,7 @@ volumes:
   mystic_forge_data:
 ```
 
-- [ ] **Step 3: Append watchlist guidance to the FastMCP `instructions` string** in `server.py` (inside the existing parenthesized string):
+- [x] **Step 3: Append watchlist guidance to the FastMCP `instructions` string** in `server.py` (inside the existing parenthesized string):
 
 ```python
         "Watchlist: price watchlists are identified by a passphrase. When the "
@@ -2193,7 +2197,7 @@ volumes:
         "remember it for future chats. Share codes (SC-…) are read-only."
 ```
 
-- [ ] **Step 4: README** — add a `## Price watchlist` section after the existing tool docs:
+- [x] **Step 4: README** — add a `## Price watchlist` section after the existing tool docs:
 
 ```markdown
 ## Price watchlist
@@ -2209,7 +2213,7 @@ Prices ingest nightly from MTGJSON (tcgplayer/cardkingdom/cardmarket retail).
 Health: `GET /health`.
 ```
 
-- [ ] **Step 5: Verify + commit**
+- [x] **Step 5: Verify + commit**
 
 Run: `pytest` (full suite) and `docker build -t mf-test . && docker run --rm mf-test python -c "import server"` if docker is available locally; otherwise pytest only.
 
@@ -2226,7 +2230,7 @@ git commit -m "watchlist: Package modules, dev volume, docs, instructions"
 - Modify: `docker-compose.yml`
 - Modify: `Caddyfile`
 
-- [ ] **Step 1: Create a branch** (do NOT touch main; do NOT push)
+- [x] **Step 1: Create a branch** (do NOT touch main; do NOT push)
 
 ```bash
 cd /home/shawn/documents/apps/kautiontape/mcp-servers
@@ -2234,7 +2238,7 @@ git status   # confirm clean before branching; stop and report if dirty
 git checkout -b watchlist-deploy
 ```
 
-- [ ] **Step 2: compose — replace the mystic-forge service block**
+- [x] **Step 2: compose — replace the mystic-forge service block**
 
 ```yaml
   mystic-forge:
@@ -2264,7 +2268,7 @@ volumes:
   mystic_forge_data:
 ```
 
-- [ ] **Step 3: Caddyfile — add watchlist page + health routes** (after the `@mtg_mcp` handle block):
+- [x] **Step 3: Caddyfile — add watchlist page + health routes** (after the `@mtg_mcp` handle block):
 
 ```
     # Mystic Forge — watchlist pages + health (public, no auth)
@@ -2275,7 +2279,7 @@ volumes:
     }
 ```
 
-- [ ] **Step 4: Validate + commit**
+- [x] **Step 4: Validate + commit**
 
 ```bash
 docker compose config -q && echo compose-ok
@@ -2290,12 +2294,12 @@ git checkout main   # leave the checkout back on main for the user
 
 ### Task 12: Full verification + live smoke test
 
-- [ ] **Step 1: Full suite in the worktree**
+- [x] **Step 1: Full suite in the worktree**
 
 Run: `cd /home/shawn/.herdr/worktrees/mystic-forge/price-history && pytest -v`
 Expected: everything passes, including the pre-existing precon tests.
 
-- [ ] **Step 2: Live smoke test** (real server, real streamable HTTP client)
+- [x] **Step 2: Live smoke test** (real server, real streamable HTTP client)
 
 ```bash
 cd /home/shawn/.herdr/worktrees/mystic-forge/price-history
@@ -2344,7 +2348,7 @@ propagating through the session manager's task group), fall back to stamping
 via `mcp.get_context().request_context.request.scope` — then re-run this smoke
 test until it passes, and update the identity tests to match.
 
-- [ ] **Step 3: Check off spec acceptance criteria** in the spec doc, commit any doc updates, and stop. Merging `price_history` → main and pushing are the user's call (use superpowers:finishing-a-development-branch).
+- [x] **Step 3: Check off spec acceptance criteria** in the spec doc, commit any doc updates, and stop. Merging `price_history` → main and pushing are the user's call (use superpowers:finishing-a-development-branch).
 
 ---
 

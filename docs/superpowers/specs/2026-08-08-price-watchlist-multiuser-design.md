@@ -1,6 +1,8 @@
 # Spec: Mystic Forge — Card Price History + Multi-List Watchlist
 
-Status: approved design (2026-08-08). Supersedes the single-user draft of this spec.
+Status: **implemented** (2026-08-08) on branch `price_history`; supersedes the
+single-user draft. Sections below describe the shipped system. Deltas that
+emerged during build and review are listed under "Shipped beyond this spec".
 
 ## Problem
 
@@ -258,6 +260,34 @@ the pattern:
       real streamable HTTP)
 - [x] `GET /health` reports DB status and ingest freshness
       (`test_http_surface.py`); container healthcheck probes it every 60 s
+
+## Shipped beyond this spec
+
+Added during implementation and the persona/design reviews:
+
+- **Instant backfill on add** — a new card's 90-day history is streamed from the
+  nightly-cached MTGJSON files immediately (no downloads, ~5 s), instead of
+  waiting for the next nightly run.
+- **Price envelope** — unpinned cards chart the per-date *minimum across
+  printings*, so a reprint changing which printing is cheapest can't silently
+  rewrite history or deltas.
+- **USD target basis** — hit state always computes against tcgplayer USD, so
+  "at target" means the same thing on every shop tab.
+- **Bought state** — entries can be marked bought (`bought`/`unbought` events):
+  muted card, sorted last, excluded from stats/verdict/alerts, purchase date
+  drawn on the detail chart.
+- **ntfy alerts** (P1 promoted) — one push per newly-opened buy window to topic
+  `mystic-forge-<share-code>`; state in `meta`, `MYSTIC_FORGE_NTFY_OFF` disables.
+- **Editable board** — add (Scryfall URL or name, validated), set target,
+  rename, remove, and fork/restore from the page via `/api/*`; share codes stay
+  read-only (enforced server-side, not just hidden).
+- **Verdict line, shop toggle, CSV export** (`/w/<passphrase>/export.csv`),
+  external site links, and a morph-refresh UI that never full-page navigates.
+- **Mint throttle** — the spec's promised rate limit: `MYSTIC_FORGE_MINT_LIMIT`
+  (default 8) new lists per hour, per IP for the page API and per process for
+  the MCP tool.
+- **Design language** — `DESIGN.md` (Primer interaction grammar over a
+  Catppuccin skin) governs the pages.
 
 ## P1 (fast follow, not v1)
 

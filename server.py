@@ -2418,6 +2418,36 @@ def _wl_db():
     return db
 
 
+# Mint throttle (spec: the mitigation for "anyone who finds the public URL can
+# create lists"). In-memory and per-process — enough for a friend-group server;
+# a restart forgives, which is fine for abuse this mild.
+MINT_LIMIT = int(os.environ.get("MYSTIC_FORGE_MINT_LIMIT", "8"))
+MINT_WINDOW = 3600.0
+_mint_log: dict[str, list[float]] = {}
+
+
+def _mint_allowed(who: str) -> bool:
+    now = time.monotonic()
+    hits = [t for t in _mint_log.get(who, []) if now - t < MINT_WINDOW]
+    if len(hits) >= MINT_LIMIT:
+        _mint_log[who] = hits
+        return False
+    hits.append(now)
+    _mint_log[who] = hits
+    if len(_mint_log) > 4096:                      # bound the dict
+        for k in [k for k, v in _mint_log.items()
+                  if not any(now - t < MINT_WINDOW for t in v)]:
+            _mint_log.pop(k, None)
+    return True
+
+
+def _client_key(request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def _schedule_backfill(card_name: str) -> bool:
     """Instant-history kick after an add: resolve + backfill this one card
     from the nightly-cached MTGJSON files, off the request path. No network —
@@ -2487,6 +2517,9 @@ async def watchlist_create(params: WatchlistCreateInput) -> str:
     """Create a new price watchlist. Returns its passphrase (SHOWN ONLY ONCE —
     offer to remember it for the user), personal connector URL, and read-only
     share code."""
+    if not _mint_allowed("mcp"):
+        return ("Too many new watchlists just now — try again later. "
+                "(If you already have a list, give me its passphrase instead.)")
     db = _wl_db()
     try:
         _, pp, sc = watchlist_db.create_list(db, label=params.label)
@@ -3184,6 +3217,9 @@ async def api_fork(request: Request):
             return JSONResponse(
                 {"error": "recovery needs the passphrase, not a share code"},
                 status_code=403)
+        if not _mint_allowed(_client_key(request)):
+            return JSONResponse({"error": "too many new lists from this address;"
+                                 " try again later"}, status_code=429)
         at_seq = body.get("at_seq")
         new_id, pp, sc = watchlist_db.clone_list(
             db, row["id"], at_seq=at_seq, recovery=(mode == "recover"))

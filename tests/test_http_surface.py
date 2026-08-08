@@ -275,6 +275,32 @@ def test_shop_survives_history_roundtrip(db_path):
     assert f'href="/w/{pp}?shop=cardmarket"' in hist
 
 
+def test_mint_throttle_limits_new_lists(db_path, monkeypatch):
+    """Spec mitigation: a public no-auth URL can't be farmed for lists."""
+    import server as srv
+    monkeypatch.setattr(srv, "MINT_LIMIT", 2)
+    monkeypatch.setattr(srv, "_mint_log", {})
+    db = watchlist_db.connect(db_path)
+    _, _, sc = watchlist_db.create_list(db)
+    db.close()
+    codes = []
+    with client() as c:
+        for _ in range(3):
+            r = c.post("/api/fork", json={"key": sc})
+            codes.append(r.status_code)
+    assert codes == [200, 200, 429]
+
+
+async def test_mint_throttle_applies_to_the_mcp_tool(db_path, monkeypatch):
+    import server as srv
+    monkeypatch.setattr(srv, "MINT_LIMIT", 1)
+    monkeypatch.setattr(srv, "_mint_log", {})
+    first = await srv.watchlist_create(srv.WatchlistCreateInput(label="a"))
+    second = await srv.watchlist_create(srv.WatchlistCreateInput(label="b"))
+    assert "Passphrase" in first
+    assert "Too many" in second
+
+
 def test_csv_export(db_path):
     db = watchlist_db.connect(db_path)
     list_id, pp, _ = watchlist_db.create_list(db)
