@@ -98,3 +98,76 @@ async def test_mutating_superseded_list_warns(db_path, a_list, fake_scryfall):
         name="Sol Ring", passphrase=pp))
     assert "superseded" in out.lower()
     assert successor["share_code"] in out
+
+
+def _seed_prices(db_path, name="Sol Ring", uuid="uuid-a"):
+    db = watchlist_db.connect(db_path)
+    db.execute("INSERT OR IGNORE INTO card_uuids (card_name, uuid) VALUES (?,?)",
+               (name, uuid))
+    watchlist_db.upsert_price(db, uuid, "2026-07-09", "tcgplayer", "normal", 10.0)
+    watchlist_db.upsert_price(db, uuid, "2026-08-01", "tcgplayer", "normal", 8.0)
+    watchlist_db.upsert_price(db, uuid, "2026-08-08", "tcgplayer", "normal", 7.0)
+    db.close()
+
+
+async def test_report_flags_target_hits(db_path, a_list, fake_scryfall):
+    list_id, pp, _ = a_list
+    await server.watchlist_add(server.WatchlistAddInput(
+        name="Sol Ring", passphrase=pp, target_price=30.0))
+    _seed_prices(db_path)
+    out = await server.watchlist_report(server.WatchlistListInput(passphrase=pp))
+    assert "Sol Ring" in out and "target" in out.lower()
+
+
+async def test_view_by_share_code_is_readonly_surface(db_path, a_list,
+                                                      fake_scryfall):
+    list_id, pp, sc = a_list
+    await server.watchlist_add(server.WatchlistAddInput(name="Sol Ring",
+                                                        passphrase=pp))
+    out = await server.watchlist_view(server.WatchlistViewInput(share_code=sc))
+    assert "Sol Ring" in out
+    out = await server.watchlist_view(server.WatchlistViewInput(
+        share_code="SC-ZZZZZZ"))
+    assert "not" in out.lower()          # unknown code
+
+
+async def test_history_lists_chain(db_path, a_list, fake_scryfall):
+    list_id, pp, _ = a_list
+    await server.watchlist_add(server.WatchlistAddInput(name="Sol Ring",
+                                                        passphrase=pp))
+    await server.watchlist_remove(server.WatchlistRemoveInput(
+        name="Sol Ring", passphrase=pp))
+    out = await server.watchlist_history(server.WatchlistHistoryInput(
+        passphrase=pp))
+    assert "add" in out and "remove" in out and "#3" in out
+
+
+async def test_clone_own_list_is_recovery(db_path, a_list, fake_scryfall):
+    list_id, pp, _ = a_list
+    await server.watchlist_add(server.WatchlistAddInput(name="Sol Ring",
+                                                        passphrase=pp))
+    out = await server.watchlist_clone(server.WatchlistCloneInput(passphrase=pp))
+    assert "Passphrase" in out
+    db = watchlist_db.connect(db_path)
+    assert watchlist_db.get_list(db, list_id)["superseded_by"] is not None
+    db.close()
+
+
+async def test_clone_via_share_code_is_fork(db_path, a_list, fake_scryfall):
+    list_id, pp, sc = a_list
+    await server.watchlist_add(server.WatchlistAddInput(name="Sol Ring",
+                                                        passphrase=pp))
+    out = await server.watchlist_clone(server.WatchlistCloneInput(share_code=sc))
+    assert "Passphrase" in out
+    db = watchlist_db.connect(db_path)
+    assert watchlist_db.get_list(db, list_id)["superseded_by"] is None
+    db.close()
+
+
+async def test_price_history_series(db_path, a_list, fake_scryfall):
+    list_id, pp, _ = a_list
+    await server.watchlist_add(server.WatchlistAddInput(name="Sol Ring",
+                                                        passphrase=pp))
+    _seed_prices(db_path)
+    out = await server.price_history(server.PriceHistoryInput(name="Sol Ring"))
+    assert "2026-08-08" in out and "7.0" in out

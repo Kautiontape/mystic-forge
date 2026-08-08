@@ -2571,6 +2571,182 @@ async def watchlist_list(params: WatchlistListInput) -> str:
         db.close()
 
 
+class WatchlistViewInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    share_code: str = Field(..., description="Read-only share code, e.g. SC-ABC123")
+
+
+class WatchlistHistoryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    passphrase: Optional[str] = Field(None, description="List passphrase")
+    share_code: Optional[str] = Field(None, description="Read-only share code")
+    limit: int = Field(50, description="Most recent events to show")
+
+
+class WatchlistCloneInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    passphrase: Optional[str] = Field(None, description="Clone your own list (recovery: marks it superseded)")
+    share_code: Optional[str] = Field(None, description="Clone someone's shared list (fork)")
+    at_seq: Optional[int] = Field(None, description="Revision to clone at (from watchlist_history); default latest")
+
+
+class PriceHistoryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(..., description="Card name")
+    days: int = Field(90, description="Days of history")
+    provider: str = Field("tcgplayer", description="tcgplayer | cardkingdom | cardmarket")
+
+
+@mcp.tool(name="watchlist_report")
+async def watchlist_report(params: WatchlistListInput) -> str:
+    """Movers report: biggest 7-day drops/rises and anything at/below target."""
+    db = _wl_db()
+    try:
+        try:
+            row = _resolve_list_row(db, params.passphrase)
+        except _NoIdentity as e:
+            return str(e)
+        entries = watchlist_db.current_entries(db, row["id"])
+        priced = []
+        for e in entries:
+            s = watchlist_db.price_summary(db, watchlist_db.uuids_for_entry(db, e))
+            if s:
+                priced.append((e, s))
+        if not priced:
+            return "No price data yet — history arrives with the nightly ingest."
+        hits = [(e, s) for e, s in priced
+                if e["target_price"] is not None and s["current"] <= e["target_price"]]
+        movers = sorted((t for t in priced if t[1]["d7"] is not None),
+                        key=lambda t: t[1]["d7"])
+        lines = [f"# Watchlist report{': ' + row['label'] if row['label'] else ''}"]
+        if hits:
+            lines.append("\n## 🎯 At or below target")
+            for e, s in hits:
+                lines.append(f"- **{e['card_name']}** {_fmt_price(s['current'])}"
+                             f" (target {_fmt_price(e['target_price'])})")
+        if movers:
+            lines.append("\n## 📉 Biggest 7-day drops")
+            for e, s in movers[:5]:
+                if s["d7"] < 0:
+                    lines.append(f"- {e['card_name']}: {_fmt_price(s['current'])}"
+                                 f" ({_fmt_delta(s['d7'])})")
+            lines.append("\n## 📈 Biggest 7-day rises")
+            for e, s in movers[::-1][:5]:
+                if s["d7"] > 0:
+                    lines.append(f"- {e['card_name']}: {_fmt_price(s['current'])}"
+                                 f" ({_fmt_delta(s['d7'])})")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+@mcp.tool(name="watchlist_view")
+async def watchlist_view(params: WatchlistViewInput) -> str:
+    """View a friend's watchlist read-only via its share code."""
+    db = _wl_db()
+    try:
+        row = watchlist_db.get_list_by_share(db, params.share_code)
+        if row is None:
+            return "That share code is not recognized."
+        header = (f"# Shared watchlist"
+                  f"{': ' + row['label'] if row['label'] else ''} "
+                  f"(read-only via `{row['share_code']}`)\n")
+        return header + "\n".join(_render_entries(db, row["id"]))
+    finally:
+        db.close()
+
+
+@mcp.tool(name="watchlist_history")
+async def watchlist_history(params: WatchlistHistoryInput) -> str:
+    """Show a list's append-only event chain (what changed, when). Accepts a
+    passphrase (own list) or share code (read-only)."""
+    db = _wl_db()
+    try:
+        if params.share_code:
+            row = watchlist_db.get_list_by_share(db, params.share_code)
+            if row is None:
+                return "That share code is not recognized."
+        else:
+            try:
+                row = _resolve_list_row(db, params.passphrase)
+            except _NoIdentity as e:
+                return str(e)
+        events = db.execute(
+            "SELECT * FROM events WHERE list_id=? ORDER BY seq DESC LIMIT ?",
+            (row["id"], params.limit)).fetchall()
+        lines = [f"# History{': ' + row['label'] if row['label'] else ''} "
+                 f"(newest first)"]
+        for ev in events:
+            payload = json.loads(ev["payload_json"])
+            detail = payload.get("card_name") or payload.get("label") or ""
+            extras = {k: v for k, v in payload.items()
+                      if k not in ("card_name", "label", "added_at") and v is not None}
+            lines.append(f"- **#{ev['seq']}** {ev['ts']} `{ev['action']}` "
+                         f"{detail} {extras if extras else ''}".rstrip())
+        lines.append(f"\nRecover any revision with `watchlist_clone(at_seq=N)`.")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+@mcp.tool(name="watchlist_clone")
+async def watchlist_clone(params: WatchlistCloneInput) -> str:
+    """Clone a list at a revision into a NEW list with a new passphrase.
+    Cloning your own list (passphrase) is recovery and supersedes it; cloning
+    a share code is a fork of a friend's list."""
+    db = _wl_db()
+    try:
+        recovery = False
+        if params.share_code:
+            row = watchlist_db.get_list_by_share(db, params.share_code)
+            if row is None:
+                return "That share code is not recognized."
+        else:
+            try:
+                row = _resolve_list_row(db, params.passphrase)
+            except _NoIdentity as e:
+                return str(e)
+            recovery = True
+        new_id, pp, sc = watchlist_db.clone_list(db, row["id"],
+                                                 at_seq=params.at_seq,
+                                                 recovery=recovery)
+        kind = "Recovery clone — the old list is now marked superseded" \
+            if recovery else "Fork"
+        return (
+            f"# {kind}\n\n"
+            f"**Passphrase (save this — shown only once):** `{pp}`\n\n"
+            f"- Personal connector URL: `{PUBLIC_BASE}/mcp/{pp}`\n"
+            f"- History page: {PUBLIC_BASE}/w/{pp}\n"
+            f"- Share code: `{sc}`\n\n"
+            f"Update your claude.ai connector URL and anywhere the old "
+            f"passphrase is remembered."
+        )
+    finally:
+        db.close()
+
+
+@mcp.tool(name="price_history")
+async def price_history(params: PriceHistoryInput) -> str:
+    """Daily price series (cheapest printing) for a card from the local price
+    DB. Data exists for cards someone watches; global, needs no passphrase."""
+    db = _wl_db()
+    try:
+        uuids = [r["uuid"] for r in db.execute(
+            "SELECT uuid FROM card_uuids WHERE LOWER(card_name)=LOWER(?)",
+            (params.name,))]
+        series = watchlist_db.price_series(db, uuids, days=params.days,
+                                           provider=params.provider)
+        if not series or not series["points"]:
+            return (f"No local history for '{params.name}'. It appears after a "
+                    f"watchlist add + nightly ingest; for a spot price use "
+                    f"scryfall_price.")
+        pts = "\n".join(f"{d}: {p}" for d, p in series["points"])
+        return (f"# {params.name} — {params.provider}, cheapest printing "
+                f"({series['uuid']})\n```\n{pts}\n```")
+    finally:
+        db.close()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENTRYPOINT
 # ═══════════════════════════════════════════════════════════════════════════════
