@@ -33,8 +33,10 @@ SW, SH = 240, 56
 _CSS = """
 :root{
   --font-display:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+  --font-ui:"Avenir Next","Seravek","Segoe UI",system-ui,Cantarell,sans-serif;
   --font-data:ui-monospace,"Cascadia Code","JetBrains Mono","Fira Code",Menlo,monospace;
 }
+@view-transition{navigation:auto}   /* crossfade instead of flash on navigation */
 [data-theme=latte]{
   --base:#eff1f5;--mantle:#e6e9ef;--crust:#dce0e8;--surface0:#ccd0da;
   --surface1:#bcc0cc;--text:#4c4f69;--sub:#6c6f85;--overlay:#9ca0b0;
@@ -56,7 +58,7 @@ _CSS = """
 *{box-sizing:border-box;margin:0}
 html{background:var(--base)}   /* real navigations never flash white */
 body{
-  font-family:var(--font-display);color:var(--text);background:var(--base);
+  font-family:var(--font-ui);color:var(--text);background:var(--base);
   background-image:radial-gradient(60rem 40rem at 85% -10%,var(--glow1),transparent 60%),
                    radial-gradient(50rem 34rem at -10% 100%,var(--glow2),transparent 55%);
   background-attachment:fixed;min-height:100vh;padding-bottom:4rem;
@@ -65,19 +67,20 @@ body{
 body::before{content:"";position:fixed;inset:0 0 auto 0;height:3px;z-index:5;
   background:linear-gradient(90deg,var(--mauve),var(--peach),var(--teal))}
 .wrap{max-width:72rem;margin:0 auto;padding:2.2rem 1.2rem 0}
-header.masthead{display:flex;align-items:flex-start;gap:.7rem;margin-bottom:.4rem}
-h1{font-size:clamp(1.6rem,4vw,2.4rem);font-weight:600;letter-spacing:.01em;flex:1 1 auto}
+header.masthead{display:block;margin-bottom:.4rem}
+h1{font-family:var(--font-display);font-size:clamp(1.6rem,4vw,2.4rem);
+  font-weight:600;letter-spacing:.01em}
 h1 .rune{color:var(--mauve)}
 h1 .iconbtn{font-size:1.05rem;vertical-align:.35rem;margin-left:.2rem}
 .iconbtn{background:none;border:none;color:var(--sub);cursor:pointer;font-size:1.05rem;
   padding:.25rem;border-radius:.4rem;line-height:1}
 .iconbtn:hover{background:var(--mantle);color:var(--text)}
-#theme{margin-left:auto;font-size:1.2rem}
+#theme{float:right;font-size:1.2rem;margin:.3rem 0 .3rem .6rem}  /* title flows around it */
 .meta{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;color:var(--sub);
   font-size:.85rem;margin-bottom:1.1rem}
 .meta .mright{margin-left:auto;display:flex;gap:.5rem;align-items:center}
-.chip{font-family:var(--font-display);font-size:.8rem;background:var(--mantle);
-  border:1px solid var(--surface0);border-radius:999px;padding:.2rem .7rem;
+.chip{font-family:var(--font-ui);font-size:.8rem;background:var(--mantle);
+  border:1px solid var(--surface0);border-radius:.55rem;padding:.25rem .7rem;
   color:var(--text);text-decoration:none;display:inline-flex;align-items:center;gap:.25rem}
 button.chip{cursor:pointer}
 button.chip:hover,a.chip:hover{border-color:var(--overlay)}
@@ -88,7 +91,7 @@ button.chip:hover,a.chip:hover{border-color:var(--overlay)}
 .caption{color:var(--sub);font-size:.8rem;margin:-.6rem 0 1.1rem}
 .pagehead{font-size:1.1rem;letter-spacing:.05em;text-transform:uppercase;
   color:var(--sub);text-align:center;margin-bottom:.6rem}
-.shops{display:inline-flex;border:1px solid var(--surface0);border-radius:999px;overflow:hidden}
+.shops{display:inline-flex;border:1px solid var(--surface0);border-radius:.55rem;overflow:hidden}
 .shops a{font-family:var(--font-data);font-size:.75rem;padding:.18rem .6rem;
   color:var(--text);text-decoration:none}
 .shops a.on{background:var(--mauve);color:var(--base)}
@@ -104,10 +107,10 @@ button.chip:hover,a.chip:hover{border-color:var(--overlay)}
 .verdict .quiet{color:var(--sub)}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(9.5rem,1fr));
   gap:.8rem;margin-bottom:1.6rem}
-.stat{background:var(--card);border:1px solid var(--surface0);border-radius:.8rem;
-  padding:.7rem .9rem;backdrop-filter:blur(6px)}
-.stat b{display:block;font-family:var(--font-data);font-size:1.25rem;font-weight:600}
-.stat span{font-size:.75rem;color:var(--sub);text-transform:uppercase;letter-spacing:.08em}
+.stat{background:var(--card);border:1px solid var(--surface0);border-radius:.7rem;
+  padding:.65rem .85rem;backdrop-filter:blur(6px)}
+.stat b{display:block;font-family:var(--font-data);font-size:1.4rem;font-weight:600}
+.stat span{font-size:.72rem;color:var(--sub);text-transform:uppercase;letter-spacing:.09em}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(15.5rem,1fr));gap:.9rem}
 .card{background:var(--card);border:1px solid var(--surface0);border-radius:1rem;
   padding:.9rem 1rem .7rem;cursor:pointer;backdrop-filter:blur(6px);
@@ -123,11 +126,13 @@ button.chip:hover,a.chip:hover{border-color:var(--overlay)}
 .card.bought .price{color:var(--sub)}
 .boughtnote{font-size:.75rem;color:var(--lavender);font-family:var(--font-data)}
 @keyframes rise{from{opacity:0;transform:translateY(10px)}}
-.card h3{font-size:1.02rem;font-weight:600;line-height:1.25}
+.card h3{font-family:var(--font-display);font-size:1.05rem;font-weight:600;line-height:1.25}
+dialog h3{font-family:var(--font-display)}
 .badge{font-family:var(--font-data);font-size:.7rem;color:var(--sub);
   border:1px solid var(--surface1);border-radius:.35rem;padding:.05rem .35rem;
   vertical-align:2px;margin-left:.35rem;white-space:nowrap}
-.note{font-style:italic;color:var(--sub);font-size:.78rem;margin:.15rem 0 .4rem;min-height:1em}
+.note{font-family:var(--font-display);font-style:italic;color:var(--sub);
+  font-size:.78rem;margin:.15rem 0 .4rem;min-height:1em}
 .price{font-family:var(--font-data);font-size:1.5rem;font-weight:600;letter-spacing:-.01em}
 .price small{font-size:.7rem;color:var(--peach-text);font-weight:400}
 .deltas{display:flex;gap:.7rem;font-family:var(--font-data);font-size:.75rem;
@@ -210,7 +215,7 @@ footer a{color:var(--sub)}
 .targetline{stroke:var(--peach);stroke-width:1.5;stroke-dasharray:5 4}
 @media(max-width:40rem){
   .wrap{padding:1.3rem .9rem 0}
-  h1{font-size:1.75rem}                        /* full width; pencil rides inside */
+  h1{font-size:1.6rem}                         /* full width; pencil rides inside */
   .iconbtn{font-size:1.35rem;padding:.45rem .6rem}
   .meta{gap:.55rem .5rem}
   .meta .mright{margin-left:0;width:100%}
@@ -239,45 +244,52 @@ footer a{color:var(--sub)}
 }
 """
 
-_JS = """
+_JS = r"""
 const KEY=%(key)s, EDITABLE=%(editable)s, CPAD=%(cpad)d, CW=%(cw)d, CH=%(ch)d, CUR=%(cur)s;
 const X=s=>String(s??'').replace(/[&<>"']/g,
   c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-// In-place refresh: fetch this page and swap .wrap — no navigation, no white
-// flash; the card entrance animations replay as the change lands.
-async function refresh(){
+// ── flashless navigation: every internal link and mutation morphs in place ──
+async function morphNavigate(url,push=true){
   try{
-    const r=await fetch(location.href);
+    const r=await fetch(url);
     if(!r.ok)throw 0;
     const doc=new DOMParser().parseFromString(await r.text(),'text/html');
     const nw=doc.querySelector('.wrap');
     if(!nw)throw 0;
-    document.querySelector('.wrap').replaceWith(nw);
-    document.querySelectorAll('dialog[open]').forEach(d=>d.close());
-    wire();
-  }catch(e){location.reload()}
+    const apply=()=>{
+      document.querySelector('.wrap').replaceWith(nw);
+      document.querySelectorAll('body > dialog').forEach(d=>d.remove());
+      doc.querySelectorAll('body > dialog').forEach(d=>document.body.append(d));
+      document.title=doc.title;
+      wire();wireDialogs();
+    };
+    if(document.startViewTransition)document.startViewTransition(apply);
+    else apply();
+    if(push&&url!==location.href)history.pushState({},'',url);
+  }catch(e){location.href=url}
 }
+const refresh=()=>morphNavigate(location.href,false);
+window.onpopstate=()=>morphNavigate(location.href,false);
 const copyable=c=>c.onclick=e=>{
   e.stopPropagation();
   navigator.clipboard.writeText(c.dataset.copy.startsWith('/')
     ?location.origin+c.dataset.copy:c.dataset.copy);
   if(!c.style.minWidth){c.style.minWidth=c.getBoundingClientRect().width+'px';
-    c.style.textAlign='center'}       // lock width so the row never reflows
+    c.style.textAlign='center'}
   if(!c.dataset.orig)c.dataset.orig=c.textContent;
-  c.textContent='copied \\u2713';clearTimeout(c._t);
+  c.textContent='copied \u2713';clearTimeout(c._t);
   c._t=setTimeout(()=>{c.textContent=c.dataset.orig},900);
 };
 const enterClicks=(inputId,btnId)=>{const i=document.getElementById(inputId);
   if(i)i.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();
     document.getElementById(btnId).click()}}};
-document.querySelectorAll('dialog').forEach(d=>
-  d.addEventListener('click',e=>{if(e.target===d)d.close()}));
 const keyable=el=>{el.setAttribute('tabindex','0');el.setAttribute('role','button');
   el.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();el.click()}}};
 const themeGlyph=()=>{const b=document.getElementById('theme');if(!b)return;
-  b.textContent=document.documentElement.dataset.theme==='latte'?'\\u{1F319}':'\\u2600\\uFE0F';
+  b.textContent=document.documentElement.dataset.theme==='latte'?'\u{1F319}':'\u2600\uFE0F';
   b.title='switch to '+(document.documentElement.dataset.theme==='latte'?'macchiato':'latte');};
-// wire(): bindings for elements inside .wrap — rerun after every refresh().
+let pending=null;
+// ── wire(): bindings inside .wrap — rerun after every morph ──
 function wire(){
   const themeBtn=document.getElementById('theme');
   if(themeBtn)themeBtn.onclick=()=>{const h=document.documentElement;
@@ -288,6 +300,9 @@ function wire(){
     themeGlyph();};
   themeGlyph();
   document.querySelectorAll('[data-copy]').forEach(copyable);
+  // internal links (shop tabs, pager, history/back chips) morph, never navigate
+  document.querySelectorAll('.wrap a[href^="/"]').forEach(a=>
+    a.onclick=e=>{e.preventDefault();morphNavigate(a.getAttribute('href'))});
   const renameBtn=document.getElementById('rename');
   if(renameBtn)renameBtn.onclick=()=>{
     document.getElementById('renameInput').value=renameBtn.dataset.label||'';
@@ -309,70 +324,106 @@ function wire(){
   if(document.getElementById('revDlg'))
     document.querySelectorAll('.rev').forEach(wireRev);
 }
-// ── rename via its own themed dialog, never browser chrome ──
-if(document.getElementById('renameDlg')){
-  document.getElementById('renameSave').onclick=async()=>{
+// ── wireDialogs(): bindings inside <dialog>s — rerun when dialogs are swapped ──
+function wireDialogs(){
+  document.querySelectorAll('dialog').forEach(d=>
+    d.onclick=e=>{if(e.target===d)d.close()});
+  document.querySelectorAll('dialog .xclose,dialog .close').forEach(b=>
+    b.onclick=()=>b.closest('dialog').close());
+  const renameSave=document.getElementById('renameSave');
+  if(renameSave){renameSave.onclick=async()=>{
     const r=await fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({key:KEY,label:document.getElementById('renameInput').value})});
     if(r.ok){document.getElementById('renameDlg').close();refresh()}
     else document.getElementById('renameErr').textContent='could not rename';
+  };enterClicks('renameInput','renameSave');}
+  const addLookup=document.getElementById('addLookup');
+  if(addLookup){
+    addLookup.onclick=async()=>{
+      const q=document.getElementById('addInput').value.trim();if(!q)return;
+      document.getElementById('addErr').textContent='';
+      document.getElementById('addPreview').innerHTML='<p class=sub>consulting Scryfall\u2026</p>';
+      const r=await fetch('/api/resolve',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({key:KEY,query:q})});
+      if(!r.ok){document.getElementById('addPreview').innerHTML='';
+        document.getElementById('addErr').textContent=(await r.json()).error||'not found';return}
+      pending=await r.json();
+      const printing=pending.set_code?` <span class=badge>${X(pending.set_code.toUpperCase())} #${X(pending.collector_number)}</span>`:'';
+      document.getElementById('addPreview').innerHTML=
+        `<h3>${X(pending.name)}${printing}</h3>`+
+        (pending.usd?`<div class=price>$${(+pending.usd).toFixed(2)}</div>`:'')+
+        (pending.chart||'<p class=nodata>Local history arrives after tonight\u2019s ingest.</p>')+
+        (pending.sites||'')+
+        `<div class=tgtedit><label>target price ($)</label>`+
+        `<input id=addTarget type=number step=0.01 min=0 placeholder=none></div>`;
+      document.getElementById('addGo').style.display='';
+    };
+    enterClicks('addInput','addLookup');
+    document.getElementById('addGo').onclick=async()=>{
+      const t=document.getElementById('addTarget');
+      const r=await fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({key:KEY,name:pending.name,set_code:pending.set_code,
+          collector_number:pending.collector_number,
+          target_price:t&&t.value.trim()!==''?+t.value:null})});
+      if(!r.ok){document.getElementById('addErr').textContent='could not add';return}
+      const d=await r.json();
+      if(d.backfilling)document.getElementById('addPreview').innerHTML+=
+        '<p class=sub>added \u2713 \u2014 pulling 90 days of history from the '+
+        'cached price data; it appears within a minute or two.</p>';
+      setTimeout(()=>{document.getElementById('addDlg').close();refresh()},
+                 d.backfilling?1500:0);
+    };
+  }
+  const boughtBtn=document.getElementById('boughtBtn');
+  if(boughtBtn)boughtBtn.onclick=async()=>{
+    const r=await fetch('/api/bought',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:KEY,entry_id:+boughtBtn.dataset.entry,
+                           bought:!boughtBtn.dataset.bought})});
+    if(r.ok){document.getElementById('cardDlg').close();refresh()}
   };
-  enterClicks('renameInput','renameSave');
+  const removeBtn=document.getElementById('removeBtn');
+  if(removeBtn){
+    removeBtn.onclick=()=>{removeBtn.style.display='none';
+      document.getElementById('rmConfirm').style.display='';};
+    document.getElementById('rmNo').onclick=()=>{
+      document.getElementById('rmConfirm').style.display='none';
+      removeBtn.style.display='';};
+    document.getElementById('rmYes').onclick=async()=>{
+      const r=await fetch('/api/remove',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({key:KEY,entry_id:+removeBtn.dataset.entry})});
+      if(r.ok){document.getElementById('cardDlg').close();refresh()}
+    };
+  }
+  const tgtSave=document.getElementById('tgtSave');
+  if(tgtSave){tgtSave.onclick=async()=>{
+    const v=document.getElementById('tgtInput').value.trim();
+    const r=await fetch('/api/target',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:KEY,entry_id:+document.getElementById('tgtEdit').dataset.entry,
+                           target_price:v===''?null:+v})});
+    if(r.ok){document.getElementById('cardDlg').close();refresh()}
+    else document.getElementById('tgtErr').textContent='could not save target';
+  };enterClicks('tgtInput','tgtSave');}
+  const forkBtn=document.getElementById('forkBtn');
+  if(forkBtn){
+    forkBtn.onclick=e=>doFork('fork',e.target.dataset.seq);
+    const recBtn=document.getElementById('recoverBtn');
+    if(recBtn)recBtn.onclick=e=>doFork('recover',e.target.dataset.seq);
+  }
 }
-// ── add a card from a Scryfall link or name ──
-let pending=null;
-if(document.getElementById('addDlg')){
-  document.getElementById('addLookup').onclick=async()=>{
-    const q=document.getElementById('addInput').value.trim();if(!q)return;
-    document.getElementById('addErr').textContent='';
-    document.getElementById('addPreview').innerHTML='<p class=sub>consulting Scryfall\\u2026</p>';
-    const r=await fetch('/api/resolve',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({key:KEY,query:q})});
-    if(!r.ok){document.getElementById('addPreview').innerHTML='';
-      document.getElementById('addErr').textContent=(await r.json()).error||'not found';return}
-    pending=await r.json();
-    const printing=pending.set_code?` <span class=badge>${X(pending.set_code.toUpperCase())} #${X(pending.collector_number)}</span>`:'';
-    document.getElementById('addPreview').innerHTML=
-      `<h3>${X(pending.name)}${printing}</h3>`+
-      (pending.usd?`<div class=price>$${(+pending.usd).toFixed(2)}</div>`:'')+
-      (pending.chart||'<p class=nodata>Local history arrives after tonight\\u2019s ingest.</p>')+
-      (pending.sites||'')+
-      `<div class=tgtedit><label>target price ($)</label>`+
-      `<input id=addTarget type=number step=0.01 min=0 placeholder=none></div>`;
-    document.getElementById('addGo').style.display='';
-  };
-  enterClicks('addInput','addLookup');
-  document.getElementById('addGo').onclick=async()=>{
-    const t=document.getElementById('addTarget');
-    const r=await fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({key:KEY,name:pending.name,set_code:pending.set_code,
-        collector_number:pending.collector_number,
-        target_price:t&&t.value.trim()!==''?+t.value:null})});
-    if(!r.ok){document.getElementById('addErr').textContent='could not add';return}
-    const d=await r.json();
-    if(d.backfilling)document.getElementById('addPreview').innerHTML+=
-      '<p class=sub>added \\u2713 \\u2014 pulling 90 days of history from the '+
-      'cached price data; it appears within a minute or two.</p>';
-    setTimeout(()=>{document.getElementById('addDlg').close();refresh()},
-               d.backfilling?1500:0);
-  };
-}
-// ── claim: start your own list from a shared one ──
 async function claimFlow(){
   const dlg=document.getElementById('claimDlg');dlg.showModal();
   const out=document.getElementById('claimOut');
-  out.innerHTML='<p class=sub>minting your copy\\u2026</p>';
+  out.innerHTML='<p class=sub>minting your copy\u2026</p>';
   const r=await fetch('/api/fork',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({key:KEY,mode:'fork'})});
   if(!r.ok){out.innerHTML='<p class=err>could not create a copy</p>';return}
   const d=await r.json();
-  out.innerHTML=`<div class=secret>Your key (screenshot this \\u2014 it is shown once):<br>`+
+  out.innerHTML=`<div class=secret>Your key (screenshot this \u2014 it is shown once):<br>`+
     `<b>${d.passphrase}</b></div>`+
-    `<p class=sub>That key is how you edit your list \\u2014 open `+
+    `<p class=sub>That key is how you edit your list \u2014 open `+
     `<a href="${d.page}">your page</a> or tell it to Claude in chat. `+
     `Your copy starts with everything on this board and is yours alone.</p>`;
 }
-// ── card detail modal ──
 function wireCard(card){
   keyable(card);
   card.onclick=()=>{
@@ -388,7 +439,7 @@ function wireCard(card){
       document.getElementById('tgtErr').textContent='';}
     const bb=document.getElementById('boughtBtn'),rb=document.getElementById('removeBtn');
     if(bb){bb.dataset.entry=card.dataset.entry;
-      bb.textContent=card.dataset.bought?'Not bought after all':'Bought \\u2713';
+      bb.textContent=card.dataset.bought?'Not bought after all':'Bought \u2713';
       bb.dataset.bought=card.dataset.bought||'';}
     if(rb){rb.dataset.entry=card.dataset.entry;
       document.getElementById('rmConfirm').style.display='none';rb.style.display='';}
@@ -397,25 +448,37 @@ function wireCard(card){
     cardDlg.showModal();
   };
 }
-const boughtBtn=document.getElementById('boughtBtn');
-if(boughtBtn)boughtBtn.onclick=async()=>{
-  const r=await fetch('/api/bought',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({key:KEY,entry_id:+boughtBtn.dataset.entry,
-                         bought:!boughtBtn.dataset.bought})});
-  if(r.ok){document.getElementById('cardDlg').close();refresh()}
-};
-const removeBtn=document.getElementById('removeBtn');
-if(removeBtn){
-  removeBtn.onclick=()=>{removeBtn.style.display='none';
-    document.getElementById('rmConfirm').style.display='';};
-  document.getElementById('rmNo').onclick=()=>{
-    document.getElementById('rmConfirm').style.display='none';
-    removeBtn.style.display='';};
-  document.getElementById('rmYes').onclick=async()=>{
-    const r=await fetch('/api/remove',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({key:KEY,entry_id:+removeBtn.dataset.entry})});
-    if(r.ok){document.getElementById('cardDlg').close();refresh()}
+function wireRev(r){
+  keyable(r);r.onclick=async()=>{
+    const seq=r.dataset.seq,revDlg=document.getElementById('revDlg');
+    document.getElementById('revTitle').textContent='Revision #'+seq;
+    document.getElementById('revBody').innerHTML='<p class=sub>consulting the ledger\u2026</p>';
+    document.getElementById('forkOut').innerHTML='';
+    revDlg.showModal();
+    const res=await fetch('/api/revision/'+encodeURIComponent(KEY)+'/'+seq);
+    if(!res.ok){document.getElementById('revBody').textContent='Could not read revision.';return}
+    const d=await res.json();
+    let h='<table class=snap><tr><th>Card</th><th>Printing</th><th>Target</th><th>Note</th></tr>';
+    if(!d.entries.length)h+='<tr><td colspan=4><i>empty at this revision</i></td></tr>';
+    for(const e of d.entries){
+      h+=`<tr><td>${X(e.card_name)}</td><td class=num>${e.set_code?X(e.set_code)+' #'+X(e.collector_number):'cheapest'}</td>`+
+         `<td class=num>${e.target_price!=null?'$'+(+e.target_price).toFixed(2):'\u2014'}</td><td>${X(e.note||'')}</td></tr>`;
+    }
+    document.getElementById('revBody').innerHTML=h+'</table>';
+    document.getElementById('forkBtn').dataset.seq=seq;
+    const rec=document.getElementById('recoverBtn');
+    if(rec)rec.dataset.seq=seq;
   };
+}
+async function doFork(mode,seq){
+  const res=await fetch('/api/fork',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key:KEY,at_seq:+seq,mode})});
+  const out=document.getElementById('forkOut');
+  if(!res.ok){out.textContent='Fork failed: '+await res.text();return}
+  const d=await res.json();
+  out.innerHTML=`<div class=secret>\u26a0 shown once \u2014 passphrase: <b>${d.passphrase}</b><br>`+
+    `page: <a href="${d.page}">${d.page}</a> \u00b7 share: ${d.share_code}</div>`+
+    (mode==='recover'?'<p class=sub>The current list is now marked superseded.</p>':'');
 }
 function armCrosshair(pts){
   const svg=document.querySelector('#chartHost svg');if(!svg)return;
@@ -429,7 +492,7 @@ function armCrosshair(pts){
   svg.append(vline,dot);
   const lo=Math.min(...pts.map(p=>p[1])),hi=Math.max(...pts.map(p=>p[1]));
   const pad=(hi-lo)||1;
-  const show=e=>{                       // pointer events: mouse, touch, pen
+  const show=e=>{
     const r=svg.getBoundingClientRect();
     const fx=Math.min(1,Math.max(0,(e.clientX-r.left)/r.width));
     const i=Math.round(fx*(pts.length-1));
@@ -440,65 +503,13 @@ function armCrosshair(pts){
     dot.setAttribute('cx',x);dot.setAttribute('cy',y);
     tip.style.display='block';
     tip.style.left=(x/CW*r.width)+'px';tip.style.top=(y/CH*r.height)+'px';
-    tip.textContent=pts[i][0]+' \\u00b7 '+CUR+pts[i][1].toFixed(2);
+    tip.textContent=pts[i][0]+' \u00b7 '+CUR+pts[i][1].toFixed(2);
   };
   svg.onpointermove=show;svg.onpointerdown=show;
   svg.onpointerleave=()=>{tip.style.display='none';
     vline.setAttribute('x1',-9);vline.setAttribute('x2',-9);dot.setAttribute('cx',-9)};
 }
-const tgtSave=document.getElementById('tgtSave');
-if(tgtSave)tgtSave.onclick=async()=>{
-  const v=document.getElementById('tgtInput').value.trim();
-  const r=await fetch('/api/target',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({key:KEY,entry_id:+document.getElementById('tgtEdit').dataset.entry,
-                         target_price:v===''?null:+v})});
-  if(r.ok){document.getElementById('cardDlg').close();refresh()}
-  else document.getElementById('tgtErr').textContent='could not save target';
-};
-if(tgtSave)enterClicks('tgtInput','tgtSave');
-document.querySelectorAll('dialog .xclose').forEach(b=>
-  b.onclick=()=>b.closest('dialog').close());
-// ── revision modal (history view) ── all interpolated data goes through X()
-const revDlg=document.getElementById('revDlg');
-function wireRev(r){
-  keyable(r);r.onclick=async()=>{
-    const seq=r.dataset.seq;
-    document.getElementById('revTitle').textContent='Revision #'+seq;
-    document.getElementById('revBody').innerHTML='<p class=sub>consulting the ledger\\u2026</p>';
-    document.getElementById('forkOut').innerHTML='';
-    revDlg.showModal();
-    const res=await fetch('/api/revision/'+encodeURIComponent(KEY)+'/'+seq);
-    if(!res.ok){document.getElementById('revBody').textContent='Could not read revision.';return}
-    const d=await res.json();
-    let h='<table class=snap><tr><th>Card</th><th>Printing</th><th>Target</th><th>Note</th></tr>';
-    if(!d.entries.length)h+='<tr><td colspan=4><i>empty at this revision</i></td></tr>';
-    for(const e of d.entries){
-      h+=`<tr><td>${X(e.card_name)}</td><td class=num>${e.set_code?X(e.set_code)+' #'+X(e.collector_number):'cheapest'}</td>`+
-         `<td class=num>${e.target_price!=null?'$'+(+e.target_price).toFixed(2):'\\u2014'}</td><td>${X(e.note||'')}</td></tr>`;
-    }
-    document.getElementById('revBody').innerHTML=h+'</table>';
-    document.getElementById('forkBtn').dataset.seq=seq;
-    const rec=document.getElementById('recoverBtn');
-    if(rec)rec.dataset.seq=seq;
-  };
-}
-if(revDlg){
-  async function doFork(mode,seq){
-    const res=await fetch('/api/fork',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({key:KEY,at_seq:+seq,mode})});
-    const out=document.getElementById('forkOut');
-    if(!res.ok){out.textContent='Fork failed: '+await res.text();return}
-    const d=await res.json();
-    out.innerHTML=`<div class=secret>\\u26a0 shown once \\u2014 passphrase: <b>${d.passphrase}</b><br>`+
-      `page: <a href="${d.page}">${d.page}</a> \\u00b7 share: ${d.share_code}</div>`+
-      (mode==='recover'?'<p class=sub>The current list is now marked superseded.</p>':'');
-  }
-  document.getElementById('forkBtn').onclick=e=>doFork('fork',e.target.dataset.seq);
-  const recBtn=document.getElementById('recoverBtn');
-  if(recBtn)recBtn.onclick=e=>doFork('recover',e.target.dataset.seq);
-}
-document.querySelectorAll('dialog .close').forEach(b=>b.onclick=()=>b.closest('dialog').close());
-wire();
+wire();wireDialogs();
 """
 
 
@@ -734,6 +745,12 @@ def _shell(row, editable, body, dialogs, cur="$"):
     rename = (f'<button class="iconbtn" id="rename" title="Rename list" '
               f'aria-label="Rename list" data-label="{esc(row["label"] or "")}">✎</button>'
               if editable else "")
+    # keep the pencil glued to the title's last word so it never orphans
+    if rename and " " in title:
+        head, tail = title.rsplit(" ", 1)
+        title_html = f'{head} <span style="white-space:nowrap">{tail}{rename}</span>'
+    else:
+        title_html = f"{title}{rename}"
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
@@ -747,8 +764,8 @@ document.querySelector('meta[name=theme-color]').content=
   t==='macchiato'?'#24273a':'#eff1f5';}})();</script>
 <style>{_CSS}</style></head><body>
 <div class="wrap">
-<header class="masthead"><h1><span class="rune">✦</span> {title}{rename}</h1>
-<button class="iconbtn" id="theme" aria-label="Toggle theme"></button></header>
+<header class="masthead"><button class="iconbtn" id="theme" aria-label="Toggle theme"></button>
+<h1><span class="rune">✦</span> {title_html}</h1></header>
 {body}
 <footer>forged in the Mystic Forge · card price watchlist ·
 <a href="/health" title="server status">status</a></footer>
