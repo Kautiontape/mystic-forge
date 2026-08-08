@@ -374,3 +374,58 @@ def test_price_sections_multiply_by_quantity():
     index = server._index_collection_results([SOL_RING_LTC])
     result = server._build_price_sections(entries, index, [])
     assert result["total"] == Decimal("25.10")
+
+
+# ── identifier dedupe and batching ────────────────────────────────────────────
+
+def test_dedupe_identifiers_collapses_repeated_printings():
+    entries = [
+        server.DecklistEntry(1, "Sol Ring", "ltc", "284", None),
+        server.DecklistEntry(1, "Sol Ring", "ltc", "284", "foil"),   # same printing
+        server.DecklistEntry(1, "Counterspell", "dmr", "281", None),
+    ]
+    # Finish is not part of the identifier, so the first two collapse to one.
+    assert server._dedupe_identifiers(entries) == [
+        {"set": "ltc", "collector_number": "284"},
+        {"set": "dmr", "collector_number": "281"},
+    ]
+
+
+def test_dedupe_identifiers_preserves_first_seen_order():
+    entries = [
+        server.DecklistEntry(1, "Rhystic Study", None, None, None),
+        server.DecklistEntry(1, "Sol Ring", "ltc", "284", None),
+        server.DecklistEntry(1, "Rhystic Study", None, None, None),
+    ]
+    assert server._dedupe_identifiers(entries) == [
+        {"name": "Rhystic Study"},
+        {"set": "ltc", "collector_number": "284"},
+    ]
+
+
+def test_chunk_splits_at_the_batch_limit():
+    assert server._chunk(list(range(160)), 75) == [
+        list(range(75)), list(range(75, 150)), list(range(150, 160))]
+    assert server._chunk([], 75) == []
+    assert server._chunk([1, 2], 75) == [[1, 2]]
+
+
+def test_identifier_key_is_stable_across_construction_order():
+    assert server._identifier_key({"set": "ltc", "collector_number": "284"}) == \
+        server._identifier_key({"collector_number": "284", "set": "ltc"})
+    assert server._identifier_key({"name": "Sol Ring"}) != \
+        server._identifier_key({"name": "Sol Ring", "set": "ltc"})
+
+
+def test_unchecked_entries_are_not_reported_as_not_found():
+    # A batch that failed leaves its identifiers unchecked. Reporting them as
+    # "not found" would claim a real card does not exist.
+    entries = [
+        server.DecklistEntry(1, "Sol Ring", "ltc", "284", None),
+        server.DecklistEntry(1, "Black Lotus", None, None, None),
+    ]
+    result = server._build_price_sections(
+        entries, {}, [{"name": "Black Lotus"}],
+        [{"set": "ltc", "collector_number": "284"}])
+    assert result["unchecked"] == ["1x Sol Ring (LTC #284)"]
+    assert result["missing"] == ["1x Black Lotus"]

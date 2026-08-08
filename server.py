@@ -426,29 +426,31 @@ async def scryfall_price_list(params: PriceListInput) -> str:
     if len(entries) > 500:
         return f"Too many lines ({len(entries)}). Maximum is 500."
 
-    # De-duplicate identifiers; several lines may name the same printing.
-    identifiers: list[dict] = []
-    seen: set[str] = set()
-    for entry in entries:
-        identifier = _entry_identifier(entry)
-        key = repr(sorted(identifier.items()))
-        if key not in seen:
-            seen.add(key)
-            identifiers.append(identifier)
+    identifiers = _dedupe_identifiers(entries)
 
     found_cards: list[dict] = []
     not_found: list[dict] = []
-    for i in range(0, len(identifiers), 75):   # Scryfall's hard per-request cap
-        batch = identifiers[i:i + 75]
+    unchecked: list[dict] = []
+    errors: list[str] = []
+
+    for batch in _chunk(identifiers, 75):   # Scryfall's hard per-request cap
         try:
             data = await _scryfall_post("/cards/collection", {"identifiers": batch})
         except Exception as e:
-            return _scryfall_error(e)
+            # Keep what other batches returned. These identifiers are unchecked,
+            # NOT missing — reporting them as "not found" would tell the user a
+            # real card does not exist because of a transient API failure.
+            unchecked.extend(batch)
+            errors.append(_scryfall_error(e))
+            continue
         found_cards.extend(data.get("data", []))
         not_found.extend(data.get("not_found", []))
 
+    if unchecked and not found_cards:
+        return errors[0]
+
     sections = _build_price_sections(
-        entries, _index_collection_results(found_cards), not_found)
+        entries, _index_collection_results(found_cards), not_found, unchecked)
 
     total_cards = sum(e.quantity for e in entries)
     parts: list[str] = []
@@ -468,6 +470,12 @@ async def scryfall_price_list(params: PriceListInput) -> str:
     if sections["no_price"]:
         parts.append("**No price in the requested finish (excluded from total):**")
         parts.extend(f"- {line}" for line in sections["no_price"])
+        parts.append("")
+
+    if sections["unchecked"]:
+        parts.append("**Could not be checked — Scryfall request failed (excluded from total):**")
+        parts.extend(f"- {line}" for line in sections["unchecked"])
+        parts.append(f"  ({errors[0]})")
         parts.append("")
 
     if sections["missing"]:
@@ -1565,6 +1573,37 @@ def _entry_identifier(entry: DecklistEntry) -> dict:
     return {"name": entry.name}
 
 
+def _identifier_key(identifier: dict) -> str:
+    """Stable comparable key for a Scryfall identifier dict.
+
+    Identifier shapes differ ({set,collector_number} / {name,set} / {name}), so
+    sort before repr to get a key that does not depend on construction order.
+    """
+    return repr(sorted(identifier.items()))
+
+
+def _dedupe_identifiers(entries: list[DecklistEntry]) -> list[dict]:
+    """Unique identifiers for these entries, in first-seen order.
+
+    Several lines may name the same printing; each printing only needs asking
+    about once.
+    """
+    identifiers: list[dict] = []
+    seen: set[str] = set()
+    for entry in entries:
+        identifier = _entry_identifier(entry)
+        key = _identifier_key(identifier)
+        if key not in seen:
+            seen.add(key)
+            identifiers.append(identifier)
+    return identifiers
+
+
+def _chunk(items: list, size: int) -> list[list]:
+    """Split items into chunks of at most `size`."""
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
 def _price_for_finish(card: dict, finish: Optional[str]) -> Optional[Decimal]:
     """USD price of this card in exactly the requested finish, or None.
 
@@ -1693,6 +1732,7 @@ def _build_price_sections(
     entries: list[DecklistEntry],
     index: dict,
     not_found: list[dict],
+    unchecked: Optional[list[dict]] = None,
 ) -> dict:
     """Sort priced lines into sections and total only what was actually priced.
 
@@ -1704,6 +1744,8 @@ def _build_price_sections(
     no_price: list[str] = []
     missing: list[str] = []
     missing_identifiers: set[str] = set()
+    unchecked_lines: list[str] = []
+    unchecked_keys = {_identifier_key(i) for i in (unchecked or [])}
 
     total = Decimal("0")
     priced_cards = 0
@@ -1711,8 +1753,13 @@ def _build_price_sections(
     for entry in entries:
         card = _lookup_entry(index, entry)
         if card is None:
-            missing.append(f"{entry.quantity}x {entry.name}{_entry_suffix(entry)}")
-            missing_identifiers.add(repr(sorted(_entry_identifier(entry).items())))
+            entry_key = _identifier_key(_entry_identifier(entry))
+            if entry_key in unchecked_keys:
+                unchecked_lines.append(
+                    f"{entry.quantity}x {entry.name}{_entry_suffix(entry)}")
+            else:
+                missing.append(f"{entry.quantity}x {entry.name}{_entry_suffix(entry)}")
+                missing_identifiers.add(entry_key)
             continue
 
         unit = _price_for_finish(card, entry.finish)
@@ -1741,7 +1788,7 @@ def _build_price_sections(
     # a not_found identifier here if it somehow has no matching line above —
     # defensive, but avoids reporting the same missing card twice.
     for identifier in not_found:
-        key = repr(sorted(identifier.items()))
+        key = _identifier_key(identifier)
         if key not in missing_identifiers:
             missing.append(_identifier_label(identifier))
 
@@ -1750,6 +1797,7 @@ def _build_price_sections(
         "defaulted": [text for _, text in defaulted],
         "no_price": no_price,
         "missing": missing,
+        "unchecked": unchecked_lines,
         "total": total,
         "priced_cards": priced_cards,
     }
