@@ -23,12 +23,13 @@ from __future__ import annotations
 import re
 from collections import Counter
 from dataclasses import dataclass, field
+from difflib import get_close_matches
 
 _SUBRULE_RE = re.compile(r"^(\d{3}\.\d+)([a-z]+)\.? (.*)$")
 _RULE_RE = re.compile(r"^(\d{3}\.\d+)\.? (.*)$")
 _SUBSECTION_RE = re.compile(r"^(\d{3})\. (.*)$")
 _SECTION_RE = re.compile(r"^(\d)\. (.*)$")
-_RULE_REF_RE = re.compile(r"rule (\d{3}(?:\.\d+)?[a-z]{0,2})")
+_RULE_REF_RE = re.compile(r"(?<!\d)(\d{3}(?:\.\d+)?[a-z]{0,2})(?!\d)")
 _EFFECTIVE_RE = re.compile(r"effective as of (\w+) (\d{1,2}), (\d{4})")
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
 
@@ -75,7 +76,6 @@ class RulesIndex:
 
     def suggest(self, ref: str, n: int = 5) -> list[str]:
         """Closest rule numbers and glossary terms for a failed lookup."""
-        from difflib import get_close_matches
         pool = list(self.rules) + list(self.glossary_display.values())
         return get_close_matches(ref, pool, n=n, cutoff=0.6)
 
@@ -151,3 +151,16 @@ def _parse_glossary(idx: RulesIndex, lines: list[str]) -> None:
             term = block[0].lower()
             idx.glossary[term] = " ".join(block[1:])
             idx.glossary_display[term] = block[0]
+
+    # Compound headwords ('Banding, "Bands with Other"') get alias keys for
+    # each part, so lookups by the primary word resolve. Real entries win.
+    for key in list(idx.glossary):
+        display = idx.glossary_display[key]
+        if "," not in display:
+            continue
+        for part in display.split(","):
+            alias_display = part.strip().strip("“”\"")
+            alias = alias_display.lower()
+            if alias and alias not in idx.glossary:
+                idx.glossary[alias] = idx.glossary[key]
+                idx.glossary_display[alias] = alias_display

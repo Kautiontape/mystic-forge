@@ -97,3 +97,10 @@ def test_real_cr_parses_structurally():
     # Glossary headwords ending in a curly quote must stay separate entries.
     assert "banding, “bands with other”" in idx.glossary
     assert any(k.startswith("partner,") for k in idx.glossary)
+    # Citation lists ("rules X and Y") are captured in full, in order.
+    assert idx.glossary_refs("win the game") == ["104", "810.8", "809.5"]
+    # Compound headwords are reachable by each part.
+    assert "banding" in idx.glossary
+    assert idx.glossary_display["banding"] == "Banding"
+    assert "partner" in idx.glossary
+    assert "kicked" in idx.glossary
