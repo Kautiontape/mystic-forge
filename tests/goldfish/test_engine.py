@@ -665,6 +665,9 @@ def test_unknown_verb_raises():
     g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
     with pytest.raises(IllegalAction):
         execute_verb(g, None, "scry")
+    with pytest.raises(IllegalAction):
+        execute_verb(g, None, "scry", count=0)   # even at count 0: the verb
+        # check runs before the zero-count early return
 
 
 # -- Task 6 review fixes: recursion bound, zero counts, snapshot pins ------
@@ -685,10 +688,11 @@ def test_trigger_loop_bounded_by_depth_limit():
     execute_verb(g, None, "create_token", count=1, power=1, toughness=1)
     tokens = [p for p in g.battlefield if p.is_token]
     assert len(tokens) == _MAX_FIRE_DEPTH + 1   # 1 direct + 1 per dispatched level
-    assert sum("depth limit" in line for line in g.log) == 1
+    assert sum("trigger limit reached" in line for line in g.log) == 1
     assert g._fire_depth == 0                   # fully unwound
     execute_verb(g, None, "create_token", count=1, power=1, toughness=1)
-    assert sum("depth limit" in line for line in g.log) == 2   # next cascade warns afresh
+    assert sum("trigger limit reached" in line for line in g.log) == 2   # next
+    # cascade warns afresh
 
 
 def test_nested_triggers_within_depth_work_normally():
@@ -709,11 +713,47 @@ def test_nested_triggers_within_depth_work_normally():
     fire(g, "land_etb")
     assert sum(1 for p in g.battlefield if p.is_token) == 1
     assert len(g.hand) == before + 1
-    assert not any("depth limit" in line for line in g.log)
+    assert not any("trigger limit" in line for line in g.log)
     # cause precedes effects: "created" is logged before the ETB draw
     created = next(i for i, line in enumerate(g.log) if "created 1 token(s)" in line)
     drew = next(i for i, line in enumerate(g.log) if "drew" in line)
     assert created < drew
+
+
+def test_branching_trigger_cascade_bounded_by_fire_budget():
+    # Reviewer's breadth repro: TWO creature_etb -> create_token listeners
+    # branch into 2^depth fires, so the depth cap alone never terminates in
+    # useful time (65s at depth 14, ~days at 20). The per-cascade fire budget
+    # must cut the cascade off: every executed fire spawns at most 2 tokens,
+    # so the battlefield stays within 2 * budget + the direct token.
+    from goldfish.engine import _MAX_CASCADE_FIRES
+    cards = mini_cards()
+    for name in ("BroodA", "BroodB"):
+        cards[name] = SimCard(data=make_data(name, cost=parse_cost("{3}{G}"),
+                              types=frozenset({"enchantment"})), ann=None, scope_class=None)
+        annotated(cards, name, {"name": name, "triggers": [
+            {"on": "creature_etb", "do": "create_token", "power": 1, "toughness": 1}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.new_perm("BroodA"); g.new_perm("BroodB")
+    execute_verb(g, None, "create_token", count=1, power=1, toughness=1)
+    tokens = sum(1 for p in g.battlefield if p.is_token)
+    assert _MAX_CASCADE_FIRES <= tokens <= 2 * _MAX_CASCADE_FIRES + 1
+    assert sum("trigger limit reached" in line for line in g.log) == 1
+    assert g._fire_depth == 0 and g._cascade_fires == 0        # budget reset
+    execute_verb(g, None, "create_token", count=1, power=1, toughness=1)
+    assert sum("trigger limit reached" in line for line in g.log) == 2   # fresh
+    # budget and warning per cascade
+
+
+def test_negative_count_noops_defensively():
+    # annotation-level validation rejects negative counts; a direct engine
+    # call with one must still no-op (no heal-by-negative-damage), unlogged
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    log_len = len(g.log)
+    execute_verb(g, None, "damage", count=-3, target="each_opponent")
+    assert g.opponents == [40]
+    assert len(g.log) == log_len
 
 
 def test_zero_count_skips_mutation_and_log_but_records_fire():

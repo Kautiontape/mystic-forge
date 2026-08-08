@@ -145,10 +145,13 @@ def _parse_condition(card, raw):
 
 def _parse_count(card, raw):
     if isinstance(raw, int):
+        if raw < 0:               # negative counts are never legal DSL
+            raise AnnotationError(card, "count", raw,
+                                  SYMBOLIC_COUNTS | {"<non-negative int>"})
         return raw
     if raw in SYMBOLIC_COUNTS:
         return raw
-    raise AnnotationError(card, "count", raw, SYMBOLIC_COUNTS | {"<int>"})
+    raise AnnotationError(card, "count", raw, SYMBOLIC_COUNTS | {"<non-negative int>"})
 
 
 def _parse_keywords(card, d: dict) -> tuple:

@@ -224,6 +224,16 @@ def test_keywords_none_accepted_as_empty():
     assert anns["X"].statics[0].keywords == ()
 
 
+def test_negative_count_rejected():
+    # negative counts are never legal DSL, in triggers or activated abilities
+    with pytest.raises(AnnotationError):
+        validate_annotations([{"name": "X", "triggers": [
+            {"on": "etb", "do": "draw", "count": -1}]}])
+    with pytest.raises(AnnotationError):
+        validate_annotations([{"name": "X", "activated": [
+            {"cost": "{T}", "do": "draw", "count": -2}]}])
+
+
 def test_activated_bad_cost_reraised_as_annotation_error():
     with pytest.raises(AnnotationError) as ei:
         validate_annotations([{"name": "Krenko, Mob Boss", "activated": [

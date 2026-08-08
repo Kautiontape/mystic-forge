@@ -5,7 +5,7 @@ import hashlib
 import random
 from dataclasses import dataclass, field
 
-from .cards import COLORS, DAMAGE_TARGETS, CardData, Cost, SimCard, parse_cost
+from .cards import COLORS, DAMAGE_TARGETS, VERBS, CardData, Cost, SimCard, parse_cost
 
 
 def derive_seed(master_seed: int, game_index: int) -> int:
@@ -89,8 +89,9 @@ class Game:
     log: list = field(default_factory=list)
     _next_id: int = 1
     # Not serialized: trigger dispatch fully unwinds within one action, so
-    # depth never crosses a step boundary.
+    # none of these cross a step boundary.
     _fire_depth: int = 0
+    _cascade_fires: int = 0           # total fires this cascade (fan-out budget)
     _depth_warned: bool = False       # one suppression line per cascade
 
     # -- identity helpers -------------------------------------------------
@@ -442,10 +443,15 @@ def _do_attach(g: Game, eq: Permanent, tgt: Permanent):
 
 def execute_verb(g: Game, source, verb: str, ctx: dict | None = None, **params):
     ctx = ctx or {}
+    if verb not in VERBS:     # checked before the zero-count return so typo'd
+                              # verbs can't silently no-op at count 0
+        raise IllegalAction(f"verb {verb!r} not implemented")
     n = resolve_count(g, params.get("count", 1), ctx)
-    if n == 0:
+    if n <= 0:
         return    # zero-count convention: no mutation AND no log line for the
-                  # verb (fire() still records the trigger_fires entry)
+                  # verb (fire() still records the trigger_fires entry);
+                  # negative counts are rejected at annotation level and
+                  # no-op defensively here
     if verb == "draw":
         for _ in range(n):
             if g.library:
@@ -593,7 +599,10 @@ def execute_verb(g: Game, source, verb: str, ctx: dict | None = None, **params):
 
 # -- Event dispatch ---------------------------------------------------------
 
-_MAX_FIRE_DEPTH = 20
+_MAX_FIRE_DEPTH = 20        # bounds chain depth
+_MAX_CASCADE_FIRES = 200    # bounds total fires per cascade (branching fan-out:
+                            # two etb->create_token listeners give 2^depth fires,
+                            # so a depth cap alone is not enough)
 
 
 def fire(g: Game, event: str, source_perm=None, entering=None, spell=None, ctx=None):
@@ -603,23 +612,27 @@ def fire(g: Game, event: str, source_perm=None, entering=None, spell=None, ctx=N
     snapshotted before execution so verb side effects (new tokens) don't feed
     the same dispatch.
 
-    Dispatch depth is bounded: a validation-legal annotation loop (e.g.
-    creature_etb -> create_token) would otherwise recurse without bound and
-    blow the stack mid-mutation. Past the limit, deeper triggers are
-    suppressed — deterministically, with one log line per cascade — and the
-    game continues."""
-    if g._fire_depth >= _MAX_FIRE_DEPTH:
+    Dispatch is bounded two ways — chain depth AND total fires per cascade:
+    a validation-legal annotation loop (e.g. creature_etb -> create_token)
+    would otherwise recurse without bound, and two such listeners branch into
+    2^depth fires. Past either limit, further triggers are suppressed —
+    deterministically, with one log line per cascade — and the game
+    continues."""
+    if (g._fire_depth >= _MAX_FIRE_DEPTH
+            or g._cascade_fires >= _MAX_CASCADE_FIRES):
         if not g._depth_warned:
             g._depth_warned = True
-            g.emit("trigger depth limit reached — deeper triggers suppressed")
+            g.emit("trigger limit reached — further triggers suppressed")
         return
     g._fire_depth += 1
+    g._cascade_fires += 1
     try:
         _dispatch(g, event, entering, spell, ctx)
     finally:
         g._fire_depth -= 1
-        if g._fire_depth == 0:
-            g._depth_warned = False   # next cascade warns afresh
+        if g._fire_depth == 0:        # cascade fully unwound: next one starts
+            g._depth_warned = False   # fresh with a full budget and may warn
+            g._cascade_fires = 0      # again
 
 
 def _dispatch(g: Game, event: str, entering, spell, ctx):
