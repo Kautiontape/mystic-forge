@@ -289,3 +289,34 @@ def test_identifier_label_renders_each_identifier_shape_readably():
     assert server._identifier_label(
         {"name": "Arcane Signet", "set": "otc"}) == "Arcane Signet (OTC)"
     assert server._identifier_label({"name": "Rhystic Study"}) == "Rhystic Study"
+
+
+# ── display helpers ───────────────────────────────────────────────────────────
+
+def test_printing_label_names_the_exact_printing_and_finish():
+    assert server._printing_label(COUNTERSPELL_DMR, "foil") == \
+        "Counterspell (DMR #281, foil)"
+    assert server._printing_label(COUNTERSPELL_DMR, None) == \
+        "Counterspell (DMR #281, nonfoil)"
+
+
+def test_available_finishes_lists_prices_the_printing_actually_has():
+    assert server._available_finishes(ALL_FINISHES) == \
+        "nonfoil $29.04, foil (no price), etched $26.31"
+
+
+def test_available_finishes_omits_finishes_the_printing_lacks():
+    assert server._available_finishes(FOIL_ONLY) == "foil $48.21"
+
+
+def test_available_finishes_handles_a_printing_with_no_finish_data():
+    assert server._available_finishes({"prices": {}}) == "none listed"
+
+
+def test_entry_suffix_describes_what_the_line_asked_for():
+    assert server._entry_suffix(
+        server.DecklistEntry(1, "Sol Ring", "ltc", "284", "foil")) == " (LTC #284) foil"
+    assert server._entry_suffix(
+        server.DecklistEntry(1, "Sol Ring", "otc", None, None)) == " (OTC)"
+    assert server._entry_suffix(
+        server.DecklistEntry(1, "Sol Ring", None, None, None)) == ""

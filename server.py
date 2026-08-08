@@ -1625,6 +1625,42 @@ def _identifier_label(identifier: dict) -> str:
     return name or str(identifier)
 
 
+def _printing_label(card: dict, finish: Optional[str]) -> str:
+    """'Counterspell (DMR #281, foil)' — the printing a price refers to."""
+    name = card.get("name", "?")
+    set_code = (card.get("set") or "?").upper()
+    collector = card.get("collector_number", "?")
+    return f"{name} ({set_code} #{collector}, {finish or 'nonfoil'})"
+
+
+def _available_finishes(card: dict) -> str:
+    """What this printing does exist in, and what those cost.
+
+    Shown when the requested finish has no price, so the user learns why rather
+    than just that the number is missing.
+    """
+    bits: list[str] = []
+    for finish in ("nonfoil", "foil", "etched"):
+        if finish not in (card.get("finishes") or []):
+            continue
+        price = _price_for_finish(card, finish)
+        bits.append(f"{finish} ${price:.2f}" if price is not None else f"{finish} (no price)")
+    return ", ".join(bits) if bits else "none listed"
+
+
+def _entry_suffix(entry: DecklistEntry) -> str:
+    """What the decklist line asked for, for lines with no matching card."""
+    bits: list[str] = []
+    if entry.set_code:
+        printing = entry.set_code.upper()
+        if entry.collector_number:
+            printing += f" #{entry.collector_number}"
+        bits.append(f"({printing})")
+    if entry.finish:
+        bits.append(entry.finish)
+    return (" " + " ".join(bits)) if bits else ""
+
+
 @mcp.tool(name="validate_decklist")
 async def validate_decklist(params: ValidateDecklistInput) -> str:
     """Validate a Commander decklist for card name accuracy, deck size, and color identity.
