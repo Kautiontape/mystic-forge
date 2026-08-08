@@ -320,3 +320,57 @@ def test_entry_suffix_describes_what_the_line_asked_for():
         server.DecklistEntry(1, "Sol Ring", "otc", None, None)) == " (OTC)"
     assert server._entry_suffix(
         server.DecklistEntry(1, "Sol Ring", None, None, None)) == ""
+
+
+# ── section assembly ──────────────────────────────────────────────────────────
+
+def test_price_sections_group_lines_and_total_only_what_it_priced():
+    entries = [
+        server.DecklistEntry(2, "Counterspell", "dmr", "281", "foil"),   # 2 x 2.17
+        server.DecklistEntry(1, "Sol Ring", "ltc", "284", None),          # 2.51
+        server.DecklistEntry(1, "Arcane Signet", "sld", "589", "foil"),   # no foil price
+        server.DecklistEntry(3, "Rhystic Study", None, None, None),       # default printing
+        server.DecklistEntry(1, "Black Lotus", None, None, None),         # not found
+    ]
+    rhystic = {
+        "name": "Rhystic Study", "set": "j22", "collector_number": "114",
+        "finishes": ["nonfoil"], "prices": {"usd": "69.53"},
+    }
+    index = server._index_collection_results(
+        [COUNTERSPELL_DMR, SOL_RING_LTC, ALL_FINISHES, rhystic])
+
+    result = server._build_price_sections(entries, index, [{"name": "Black Lotus"}])
+
+    assert result["total"] == Decimal("215.44")   # 4.34 + 2.51 + 208.59
+    assert result["priced_cards"] == 6            # 2 + 1 + 3
+    assert len(result["priced"]) == 2             # the two lines naming a printing
+    assert len(result["defaulted"]) == 1          # Rhystic Study
+    assert len(result["no_price"]) == 1           # Arcane Signet foil
+    assert len(result["missing"]) == 1            # Black Lotus
+
+
+def test_price_sections_exclude_unpriced_lines_from_the_total():
+    entries = [server.DecklistEntry(1, "Arcane Signet", "sld", "589", "foil")]
+    index = server._index_collection_results([ALL_FINISHES])
+    result = server._build_price_sections(entries, index, [])
+    assert result["total"] == Decimal("0")
+    assert result["priced_cards"] == 0
+    assert "foil" in result["no_price"][0]
+    assert "nonfoil $29.04" in result["no_price"][0]
+
+
+def test_price_sections_use_exact_decimal_arithmetic():
+    # 100 lines at $0.07 is exactly $7.00; float accumulation drifts.
+    card = {"name": "Island", "set": "unf", "collector_number": "240",
+            "finishes": ["nonfoil"], "prices": {"usd": "0.07"}}
+    entries = [server.DecklistEntry(1, "Island", "unf", "240", None)] * 100
+    index = server._index_collection_results([card])
+    result = server._build_price_sections(entries, index, [])
+    assert result["total"] == Decimal("7.00")
+
+
+def test_price_sections_multiply_by_quantity():
+    entries = [server.DecklistEntry(10, "Sol Ring", "ltc", "284", None)]
+    index = server._index_collection_results([SOL_RING_LTC])
+    result = server._build_price_sections(entries, index, [])
+    assert result["total"] == Decimal("25.10")

@@ -272,10 +272,17 @@ class PriceInput(BaseModel):
 
 class PriceListInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    cards: list[str] = Field(
+    decklist: str = Field(
         ...,
-        description="List of card names to price (max 75 per request).",
-        min_length=1, max_length=75,
+        description=(
+            "Decklist text, one card per line. Plain names work ('1 Sol Ring'), "
+            "and so do full Archidekt/Moxfield lines naming a printing and "
+            "finish ('1x Sol Ring (ltc) 284 *F* [Ramp]'). Lines with a set code "
+            "are priced at that exact printing; lines without one use Scryfall's "
+            "default printing and are flagged separately in the output. "
+            "Max 500 lines."
+        ),
+        min_length=1, max_length=50000,
     )
 
 
@@ -403,57 +410,78 @@ async def scryfall_price(params: PriceInput) -> str:
 
 @mcp.tool(name="scryfall_price_list")
 async def scryfall_price_list(params: PriceListInput) -> str:
-    """Price a list of cards and get the total cost.
+    """Price a decklist and total it, honoring the printing on each line.
 
-    Batch-prices up to 75 cards at once. Shows per-card prices sorted by
-    cost (most expensive first) and a total sum.
+    '1x Sol Ring (ltc) 284 *F*' is priced as that exact printing in that exact
+    finish. Lines naming no set use Scryfall's default printing and are listed
+    separately so the total is honest about what it guessed.
+
+    Never substitutes a different finish: if the requested finish has no price,
+    the line is reported on its own with the finishes that printing does have,
+    rather than being quietly totalled at another finish's price.
     """
-    identifiers = [{"name": name} for name in params.cards]
-    try:
-        data = await _scryfall_post("/cards/collection", {"identifiers": identifiers})
-    except Exception as e:
-        return _scryfall_error(e)
+    entries = _parse_decklist_entries(params.decklist)
+    if not entries:
+        return "No cards found in the decklist."
+    if len(entries) > 500:
+        return f"Too many lines ({len(entries)}). Maximum is 500."
 
-    found = data.get("data", [])
-    not_found = data.get("not_found", [])
+    # De-duplicate identifiers; several lines may name the same printing.
+    identifiers: list[dict] = []
+    seen: set[str] = set()
+    for entry in entries:
+        identifier = _entry_identifier(entry)
+        key = repr(sorted(identifier.items()))
+        if key not in seen:
+            seen.add(key)
+            identifiers.append(identifier)
 
-    priced: list[tuple[str, float]] = []
-    no_price: list[str] = []
+    found_cards: list[dict] = []
+    not_found: list[dict] = []
+    for i in range(0, len(identifiers), 75):   # Scryfall's hard per-request cap
+        batch = identifiers[i:i + 75]
+        try:
+            data = await _scryfall_post("/cards/collection", {"identifiers": batch})
+        except Exception as e:
+            return _scryfall_error(e)
+        found_cards.extend(data.get("data", []))
+        not_found.extend(data.get("not_found", []))
 
-    for card in found:
-        name = card.get("name", "?")
-        prices = card.get("prices", {})
-        usd = prices.get("usd") or prices.get("usd_foil") or prices.get("usd_etched")
-        if usd:
-            priced.append((name, float(usd)))
-        else:
-            no_price.append(name)
+    sections = _build_price_sections(
+        entries, _index_collection_results(found_cards), not_found)
 
-    priced.sort(key=lambda x: x[1], reverse=True)
-
+    total_cards = sum(e.quantity for e in entries)
     parts: list[str] = []
-    parts.append(f"# Price List ({len(found)} cards found)")
+    parts.append(f"# Price List ({total_cards} cards)")
     parts.append("")
 
-    total = 0.0
-    for name, val in priced:
-        parts.append(f"- **{name}** — ${val:.2f}")
-        total = round(total + val, 2)
-
-    if no_price:
+    if sections["priced"]:
+        parts.append("**Priced at the printing you named:**")
+        parts.extend(f"- {line}" for line in sections["priced"])
         parts.append("")
-        parts.append("**No USD price available:**")
-        for name in no_price:
-            parts.append(f"- {name}")
 
-    if not_found:
+    if sections["defaulted"]:
+        parts.append("**No printing specified — Scryfall's default printing used:**")
+        parts.extend(f"- {line}" for line in sections["defaulted"])
         parts.append("")
+
+    if sections["no_price"]:
+        parts.append("**No price in the requested finish (excluded from total):**")
+        parts.extend(f"- {line}" for line in sections["no_price"])
+        parts.append("")
+
+    if sections["missing"]:
         parts.append("**Not found on Scryfall:**")
-        for item in not_found:
-            parts.append(f"- {item.get('name', str(item))}")
+        parts.extend(f"- {line}" for line in sections["missing"])
+        parts.append("")
 
-    parts.append("")
-    parts.append(f"**Total: ${total:.2f}** ({len(priced)} cards priced)")
+    parts.append(
+        f"**Total: ${sections['total']:.2f}** "
+        f"({sections['priced_cards']} of {total_cards} cards priced)"
+    )
+    uncovered = total_cards - sections["priced_cards"]
+    if uncovered:
+        parts.append(f"{uncovered} card(s) are not included in this total — see the sections above.")
 
     return "\n".join(parts)
 
@@ -1659,6 +1687,72 @@ def _entry_suffix(entry: DecklistEntry) -> str:
     if entry.finish:
         bits.append(entry.finish)
     return (" " + " ".join(bits)) if bits else ""
+
+
+def _build_price_sections(
+    entries: list[DecklistEntry],
+    index: dict,
+    not_found: list[dict],
+) -> dict:
+    """Sort priced lines into sections and total only what was actually priced.
+
+    Returns lists of preformatted strings plus the total, so the tool body is
+    assembly only and this logic stays testable without network access.
+    """
+    priced: list[tuple[Decimal, str]] = []
+    defaulted: list[tuple[Decimal, str]] = []
+    no_price: list[str] = []
+    missing: list[str] = []
+    missing_identifiers: set[str] = set()
+
+    total = Decimal("0")
+    priced_cards = 0
+
+    for entry in entries:
+        card = _lookup_entry(index, entry)
+        if card is None:
+            missing.append(f"{entry.quantity}x {entry.name}{_entry_suffix(entry)}")
+            missing_identifiers.add(repr(sorted(_entry_identifier(entry).items())))
+            continue
+
+        unit = _price_for_finish(card, entry.finish)
+        if unit is None:
+            no_price.append(
+                f"{entry.quantity}x {_printing_label(card, entry.finish)} — "
+                f"no {entry.finish or 'nonfoil'} price. "
+                f"This printing has: {_available_finishes(card)}"
+            )
+            continue
+
+        line_total = unit * entry.quantity
+        total += line_total
+        priced_cards += entry.quantity
+        text = (f"{entry.quantity}x {_printing_label(card, entry.finish)} — "
+                f"${unit:.2f} ea → ${line_total:.2f}")
+        # A line that named no set got whichever printing Scryfall chose.
+        (priced if entry.set_code else defaulted).append((line_total, text))
+
+    priced.sort(key=lambda item: item[0], reverse=True)
+    defaulted.sort(key=lambda item: item[0], reverse=True)
+
+    # Every not_found identifier corresponds to some entry above whose lookup
+    # already failed (that's the identifier we sent for it), so it is already
+    # represented in `missing` with quantity and printing detail. Only surface
+    # a not_found identifier here if it somehow has no matching line above —
+    # defensive, but avoids reporting the same missing card twice.
+    for identifier in not_found:
+        key = repr(sorted(identifier.items()))
+        if key not in missing_identifiers:
+            missing.append(_identifier_label(identifier))
+
+    return {
+        "priced": [text for _, text in priced],
+        "defaulted": [text for _, text in defaulted],
+        "no_price": no_price,
+        "missing": missing,
+        "total": total,
+        "priced_cards": priced_cards,
+    }
 
 
 @mcp.tool(name="validate_decklist")
