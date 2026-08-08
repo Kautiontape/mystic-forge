@@ -20,6 +20,11 @@ import httpx
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP
 
+from goldfish import autoderive
+from goldfish.cards import (CONDITIONS, GLOBAL_EVENTS, SELF_EVENTS,
+                            STATIC_KINDS, SYMBOLIC_COUNTS, VERBS)
+from goldfish.odds import odds_at_least, odds_groups
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 SCRYFALL_API = "https://api.scryfall.com"
@@ -2268,6 +2273,356 @@ async def precon_diff(params: PreconDiffInput) -> str:
                  f"Upgraded: {upgraded_src}")
     if canon_note:
         parts.append(canon_note)
+
+    return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GOLDFISH — Deck simulation support: annotation pre-flight and draw odds
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+#: In-process cache of raw Scryfall card JSON, keyed by exact requested name.
+_GOLDFISH_CARD_CACHE: dict[str, dict] = {}
+
+_GOLDFISH_CMDR_RE = re.compile(r"\s*\*CMDR\*\s*$", re.IGNORECASE)
+_GOLDFISH_COUNT_RE = re.compile(r"^\d+x?\s+\S")
+_GOLDFISH_ARCHIDEKT_RE = re.compile(r"archidekt\.com/decks/\d+|^\d+$")
+
+#: One-line explanations for the D9 out-of-scope classes.
+_GOLDFISH_D9_NOTES = {
+    "interaction_removal": "interaction — counted, not simulated",
+    "interaction_wipe": "interaction — counted, not simulated",
+    "interaction_counter": "interaction — counted, not simulated",
+    "protection": "opponent-dependent protection — counted, not simulated",
+    "political": "table politics — counted, not simulated",
+    "unmodeled_other": "out of scope in v1 (Sagas, X-costs, coin flips, "
+                       "sac/life-payment costs, ...) — inert, counted",
+}
+
+_GOLDFISH_EXAMPLE_CLOUD = '''{"name": "Cloud, Ex-SOLDIER",
+ "triggers": [
+   {"on": "etb", "do": "attach_from_board"},
+   {"on": "attack", "do": "draw", "count": "per_equipped_attacker"},
+   {"on": "attack", "if": "power_gte:7", "do": "treasure", "count": 2}],
+ "statics": [],
+ "activated": [{"cost": "{3}{R}{W}", "do": "extra_combat"}]}'''
+
+_GOLDFISH_EXAMPLE_SIGNET = ('{"name": "Boros Signet",\n'
+                            ' "activated": [{"cost": "{1}{T}", "do": "add_mana",'
+                            ' "pips": "{R}{W}"}]}')
+
+
+async def _goldfish_fetch_cards(names: list[str]) -> tuple[list[dict], list[str]]:
+    """Fetch raw Scryfall card JSON for the given names (deduplicated, order
+    preserved) via batched POST /cards/collection, 75 identifiers per request.
+
+    Returns (cards, not_found_names). Cards are the untrimmed Scryfall dicts —
+    autoderive.derive consumes them as-is. Found cards are cached in
+    _GOLDFISH_CARD_CACHE under the exact requested name; unrecognized names
+    are not cached (a fixed typo re-queries)."""
+    unique = list(dict.fromkeys(names))
+    to_fetch = [n for n in unique if n not in _GOLDFISH_CARD_CACHE]
+    for i in range(0, len(to_fetch), 75):
+        batch = to_fetch[i:i + 75]
+        data = await _scryfall_post(
+            "/cards/collection",
+            {"identifiers": [{"name": n} for n in batch]},
+        )
+        missing = {item.get("name", "") if isinstance(item, dict) else str(item)
+                   for item in data.get("not_found", [])}
+        found = [n for n in batch if n not in missing]
+        # /cards/collection returns data in identifier order, skipping misses.
+        for req_name, card in zip(found, data.get("data", [])):
+            _GOLDFISH_CARD_CACHE[req_name] = card
+    cards = [_GOLDFISH_CARD_CACHE[n] for n in unique if n in _GOLDFISH_CARD_CACHE]
+    not_found = [n for n in unique if n not in _GOLDFISH_CARD_CACHE]
+    return cards, not_found
+
+
+def _goldfish_archidekt_commander(data: dict) -> str | None:
+    """Name of the first card in the deck's premier (Commander) category."""
+    premier = {c["name"] for c in data.get("categories", [])
+               if c.get("isPremier") or c.get("name") == "Commander"}
+    for entry in data.get("cards", []):
+        if any(cn in premier for cn in entry.get("categories", [])):
+            return entry.get("card", {}).get("oracleCard", {}).get("name")
+    return None
+
+
+async def _goldfish_load_deck(deck: str) -> tuple[list[str], str]:
+    """Resolve a deck reference into (flat card-name list, commander name).
+
+    Decklist text — anything containing a newline or starting with a count
+    like '2 Plains' — is parsed directly: the FIRST line's card is the
+    commander, unless a line ends with ' *CMDR*' (marker stripped, that card
+    is commander). Otherwise an Archidekt deck ID/URL is fetched and the
+    commander is the card in the premier (Commander) category. Raises
+    ValueError when the deck is empty or the commander cannot be identified;
+    Archidekt HTTP errors propagate for _archidekt_error."""
+    text = deck.strip()
+    is_text = "\n" in text or _GOLDFISH_COUNT_RE.match(text) is not None
+    if not is_text and _GOLDFISH_ARCHIDEKT_RE.search(text):
+        data = await _archidekt_get(f"/decks/{_parse_deck_id(text)}/")
+        commander = _goldfish_archidekt_commander(data)
+        if commander is None:
+            raise ValueError(
+                "Archidekt deck has no card in a premier (Commander) "
+                "category; cannot identify the commander.")
+        counts = _archidekt_in_deck_cards(data)
+        return [n for n, qty in counts.items() for _ in range(qty)], commander
+
+    pairs = _parse_decklist(text)
+    if not pairs:
+        raise ValueError(
+            "No cards found. Provide an Archidekt deck ID/URL or decklist "
+            "text ('1 Card Name' per line, commander first).")
+    commander: str | None = None
+    names: list[str] = []
+    for qty, name in pairs:
+        m = _GOLDFISH_CMDR_RE.search(name)
+        if m:
+            name = name[:m.start()].strip()
+            commander = name
+        names.extend([name] * qty)
+    if commander is None:
+        commander = names[0]        # first line's card (marker-free deck)
+    return names, commander
+
+
+def _goldfish_summary(d: autoderive.Derived) -> str:
+    """One-line human summary of an auto-derived card's model."""
+    card = d.card
+    data = card.data
+    ann = card.ann
+    if ann is not None and any(a.sac_self and a.do == "ramp_land"
+                               for a in ann.activated):
+        return "fetch land — sacrifice to put a land onto the battlefield"
+    if data.produces:
+        colors = [c for c in ("W", "U", "B", "R", "G", "C") if c in data.produces]
+        qty = max(data.produces[c] for c in colors)
+        if len(colors) == 1:
+            pips = f"{{{colors[0]}}}" * qty
+        elif qty == 1:
+            pips = " or ".join(f"{{{c}}}" for c in colors)
+        else:
+            pips = f"{qty} mana of " + "/".join(f"{{{c}}}" for c in colors)
+        kind = ("land" if card.is_land
+                else "mana creature" if card.is_creature else "mana rock")
+        return (f"{kind} — taps for {pips}"
+                + (", enters tapped" if data.enters_tapped else ""))
+    if card.is_land:
+        return "land" + (", enters tapped" if data.enters_tapped else "")
+    if ann is not None:
+        for t in ann.triggers:
+            if t.do == "draw":
+                return f"draw {t.count} on {t.on}"
+            if t.do == "ramp_land":
+                return f"ramp — {t.count} land(s) onto the battlefield on {t.on}"
+        if ann.grants is not None:
+            bits: list[str] = []
+            if "power" in ann.grants or "toughness" in ann.grants:
+                bits.append(f"+{ann.grants.get('power', 0)}"
+                            f"/+{ann.grants.get('toughness', 0)}")
+            bits.extend(str(k) for k in ann.grants.get("keywords", ()))
+            return "equipment — grants " + ", ".join(bits)
+    if card.is_creature:
+        kw = ", ".join(sorted(data.keywords))
+        base = f"vanilla {data.power}/{data.toughness}"
+        return f"{base} ({kw})" if kw else base
+    return "modeled from card data"
+
+
+# ── Goldfish Input Models ────────────────────────────────────────────────────
+
+
+class GoldfishOddsGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    copies: int = Field(..., ge=0, description="Copies of this group's cards in the deck.")
+    min_successes: int = Field(default=1, ge=0, description="Minimum copies that must appear in the sample.")
+
+
+class GoldfishOddsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    deck_size: int = Field(..., ge=2, le=500, description="Cards in the deck (library) being drawn from.")
+    draws: int = Field(..., ge=0, le=100, description="Cards seen (e.g. 7 for an opening hand).")
+    copies: int | None = Field(
+        default=None, ge=0,
+        description="Flat mode: copies of the card of interest in the deck.",
+    )
+    min_successes: int = Field(
+        default=1, ge=0,
+        description="Flat mode: minimum copies that must appear among the draws.",
+    )
+    groups: list[GoldfishOddsGroup] | None = Field(
+        default=None, max_length=8,
+        description="Joint mode: up to 8 groups of {copies, min_successes}; "
+                    "returns P(every group meets its minimum simultaneously), "
+                    "e.g. '>=1 piece A AND >=1 piece B in the top 12'.",
+    )
+
+
+class GoldfishAnnotateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    deck: str = Field(
+        ...,
+        description="Archidekt deck ID/URL, or decklist text ('1 Card Name' "
+                    "per line). For decklist text, list your commander first "
+                    "(or mark its line with a trailing ' *CMDR*').",
+        min_length=1,
+    )
+
+
+# ── Goldfish Tools ───────────────────────────────────────────────────────────
+
+
+@mcp.tool(name="goldfish_odds")
+async def goldfish_odds(params: GoldfishOddsInput) -> str:
+    """Exact hypergeometric draw odds — no simulation, closed form.
+
+    Flat mode (`copies`, optional `min_successes`): P(at least min_successes
+    of the copies appear in the top `draws` of a `deck_size`-card deck).
+    Joint mode (`groups`): P(EVERY group meets its minimum simultaneously) by
+    exact multivariate enumeration — answers "≥1 piece A AND ≥1 piece B in
+    the top m". Provide exactly one of `copies` or `groups`.
+    """
+    groups_in = params.groups or []
+    if (params.copies is None) == (not groups_in):
+        return ("Provide exactly one of `copies` (flat mode) or `groups` "
+                "(joint mode: [{copies, min_successes}, ...]).")
+    if params.draws > params.deck_size:
+        return "draws cannot exceed deck_size."
+    try:
+        if params.copies is not None:
+            p = odds_at_least(params.deck_size, params.draws, params.copies,
+                              params.min_successes)
+            return (f"P(≥{params.min_successes} of {params.copies} copies in "
+                    f"top {params.draws} of {params.deck_size}) = {p * 100:.2f}%"
+                    f"  [exact hypergeometric]")
+        groups = [{"copies": g.copies, "min_successes": g.min_successes}
+                  for g in groups_in]
+        joint = odds_groups(params.deck_size, params.draws, groups)
+        lines: list[str] = []
+        for i, g in enumerate(groups, 1):
+            p = odds_at_least(params.deck_size, params.draws, g["copies"],
+                              g["min_successes"])
+            lines.append(f"Group {i}: P(≥{g['min_successes']} of "
+                         f"{g['copies']} copies in top {params.draws} of "
+                         f"{params.deck_size}) = {p * 100:.2f}%")
+        lines.append(f"Joint: P(all {len(groups)} groups meet their minimums "
+                     f"in top {params.draws} of {params.deck_size}) = "
+                     f"{joint * 100:.2f}%  [exact multivariate hypergeometric]")
+        return "\n".join(lines)
+    except ValueError as e:
+        return str(e)
+
+
+@mcp.tool(name="goldfish_annotate")
+async def goldfish_annotate(params: GoldfishAnnotateInput) -> str:
+    """Pre-flight a deck for goldfish simulation: auto-derive what the engine
+    models on its own, classify out-of-scope cards, and show oracle text ONLY
+    for the plausibly simulable gaps — cutting a full-deck annotation pass to
+    the handful of cards that need one.
+
+    Deck input is an Archidekt deck ID/URL or decklist text. For decklist
+    text, list your commander first; a line ending in ' *CMDR*' overrides.
+    """
+    try:
+        names, commander = await _goldfish_load_deck(params.deck)
+    except ValueError as e:
+        return str(e)
+    except httpx.HTTPError as e:
+        return _archidekt_error(e)
+    try:
+        cards, not_found = await _goldfish_fetch_cards(names)
+    except httpx.HTTPError as e:
+        return _scryfall_error(e)
+
+    derived = autoderive.derive(cards)
+
+    auto_lines: list[str] = []
+    out_by_class: dict[str, list[str]] = {}
+    needs: list[tuple[dict, autoderive.Derived]] = []
+    seen: set[str] = set()
+    for raw in cards:
+        d = derived.get(raw.get("name", ""))
+        if d is None or d.card.name in seen:
+            continue
+        seen.add(d.card.name)
+        kinds = sorted({n.split(":", 1)[0] for n in d.approx_notes})
+        suffix = f"  [{', '.join(kinds)}]" if kinds else ""
+        if d.auto_annotated:
+            auto_lines.append(f"- {d.card.name} — {_goldfish_summary(d)}{suffix}")
+        elif d.needs_annotation:
+            needs.append((raw, d))
+        else:
+            cls = d.card.scope_class or "unmodeled_other"
+            out_by_class.setdefault(cls, []).append(f"{d.card.name}{suffix}")
+
+    total = len(names)
+    parts: list[str] = []
+    parts.append("# Goldfish annotation pre-flight")
+    parts.append(f"Commander: {commander} | Deck: {total} cards including commander")
+    if total != 100:
+        parts.append(f"Warning: {total} cards including commander — EDH decks "
+                     f"are 100. Simulating anyway if that's intended.")
+    if not_found:
+        parts.append("")
+        parts.append("Not recognized by Scryfall: " + ", ".join(not_found))
+        parts.append("These names were skipped — fix any typos and rerun.")
+
+    parts.append("")
+    parts.append(f"## Auto-derived ({len(auto_lines)} cards)")
+    if auto_lines:
+        parts.extend(auto_lines)
+    else:
+        parts.append("- (none)")
+
+    out_total = sum(len(v) for v in out_by_class.values())
+    parts.append("")
+    parts.append(f"## Out of scope ({out_total} cards)")
+    if out_total:
+        parts.append("Inert in the sim; counted by class in the honesty report.")
+        for cls in sorted(out_by_class):
+            parts.append(f"**{cls}** — {_GOLDFISH_D9_NOTES.get(cls, cls)}")
+            parts.extend(f"- {n}" for n in out_by_class[cls])
+    else:
+        parts.append("- (none)")
+
+    parts.append("")
+    parts.append(f"## Needs annotation ({len(needs)} cards)")
+    if not needs:
+        parts.append("- (none) — every card is auto-derived or classified.")
+        return "\n".join(parts)
+
+    parts.append("Write a JSON annotation for each card below (pass them to "
+                 "goldfish_run as `annotations`), or leave a card out to "
+                 "treat it as inert.")
+    for raw, d in needs:
+        mana = raw.get("mana_cost") or "—"
+        parts.append("")
+        parts.append(f"### {d.card.name} — {mana} — {raw.get('type_line', '?')}")
+        parts.append(d.oracle or "(no oracle text)")
+
+    parts.append("")
+    parts.append("### Registry cheat-sheet (unknown names are rejected)")
+    parts.append(f"- self events (on): {', '.join(sorted(SELF_EVENTS))}")
+    parts.append(f"- global events (on): {', '.join(sorted(GLOBAL_EVENTS))}")
+    parts.append(f"- verbs (do): {', '.join(sorted(VERBS))}")
+    parts.append(f"- conditions (if): {', '.join(sorted(CONDITIONS))} "
+                 f"(power_gte takes ':N', e.g. 'power_gte:7')")
+    parts.append(f"- counts: an integer or {', '.join(sorted(SYMBOLIC_COUNTS))}")
+    parts.append(f"- statics: {', '.join(sorted(STATIC_KINDS))}")
+    parts.append("")
+    parts.append("Worked example — trigger/static/activated card:")
+    parts.append("```json")
+    parts.append(_GOLDFISH_EXAMPLE_CLOUD)
+    parts.append("```")
+    parts.append("Worked example — Signet-style filter rock (these always "
+                 "land in this section by design):")
+    parts.append("```json")
+    parts.append(_GOLDFISH_EXAMPLE_SIGNET)
+    parts.append("```")
 
     return "\n".join(parts)
 
