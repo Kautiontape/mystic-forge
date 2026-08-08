@@ -461,7 +461,7 @@ project's dataviz guidance at implementation time.
 | `goldfish_start` | deck, annotations?, seed, interactive_mulligan?, resume_state? | game_id + full state + legal actions |
 | `goldfish_step` | game_id, action? \| until? | new state + applied action (+ `reason` if policy-chosen) + legal actions + log lines |
 | `goldfish_state` | game_id | current full state |
-| `goldfish_odds` | deck_size, draws, then either flat (copies, min_successes=1) or `groups: [{copies, min_successes}, ...]` | exact hypergeometric probability; multi-group via inclusion–exclusion (answers "≥1 piece A AND ≥1 piece B in top m") |
+| `goldfish_odds` | deck_size, draws, then either flat (copies, min_successes=1) or `groups: [{copies, min_successes}, ...]` | exact hypergeometric probability; multi-group via direct multivariate enumeration (answers "≥1 piece A AND ≥1 piece B in top m") |
 
 Illegal `goldfish_step` actions are rejected with a reason; state is never
 mutated on rejection.
