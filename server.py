@@ -9,8 +9,13 @@ No authentication required for public features. Self-hosters can optionally
 configure Archidekt credentials for private deck access.
 """
 
+import asyncio
+import json
+import logging
+import os
 import re
 import time
+from contextvars import ContextVar
 from typing import Optional, Dict, Any
 from enum import Enum
 from collections import Counter
@@ -19,6 +24,9 @@ from difflib import SequenceMatcher
 import httpx
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP
+
+import watchlist_db
+import watchlist_ingest
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -63,6 +71,88 @@ mcp = FastMCP(
     stateless_http=True,
     transport_security=None,
 )
+
+
+# ── Watchlist identity ───────────────────────────────────────────────────────
+# The list id for the current request, set by PassphraseMiddleware when the
+# connector URL carries a passphrase (/mcp/<passphrase>). Tools fall back to
+# this when no explicit passphrase parameter is given.
+_current_list: ContextVar[Optional[int]] = ContextVar("_current_list", default=None)
+
+_PP_RE = re.compile(r"^/mcp/(?P<pp>[a-z0-9][a-z0-9-]{6,})/?$")
+
+PUBLIC_BASE = os.environ.get("MYSTIC_FORGE_PUBLIC_BASE",
+                             "https://kautiontape.com/mtg")
+
+
+class PassphraseMiddleware:
+    """Maps /mcp/<passphrase> → /mcp with the resolved list in a ContextVar.
+
+    Also owns app lifespan add-ons: starts the nightly ingest loop on startup
+    (disabled via MYSTIC_FORGE_NO_INGEST for tests/dev)."""
+
+    def __init__(self, app):
+        self.app = app
+        self._ingest_task = None
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":
+            async def send_hooked(msg):
+                if (msg["type"] == "lifespan.startup.complete"
+                        and not os.environ.get("MYSTIC_FORGE_NO_INGEST")):
+                    self._ingest_task = asyncio.create_task(
+                        watchlist_ingest_loop())
+                if msg["type"] == "lifespan.shutdown.complete" and self._ingest_task:
+                    self._ingest_task.cancel()
+                await send(msg)
+            await self.app(scope, receive, send_hooked)
+            return
+
+        token = None
+        if scope["type"] == "http":
+            m = _PP_RE.match(scope["path"])
+            if m:
+                db = watchlist_db.connect()
+                try:
+                    watchlist_db.init_db(db)
+                    row = watchlist_db.get_list_by_passphrase(db, m["pp"])
+                finally:
+                    db.close()
+                if row is None:
+                    await send({"type": "http.response.start", "status": 404,
+                                "headers": [(b"content-type", b"text/plain")]})
+                    await send({"type": "http.response.body",
+                                "body": b"unknown passphrase"})
+                    return
+                scope = dict(scope, path="/mcp")
+                token = _current_list.set(row["id"])
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if token is not None:
+                _current_list.reset(token)
+
+
+async def watchlist_ingest_loop():
+    """Hourly check; actual ingest runs once per day (last_ingest guard)."""
+    while True:
+        try:
+            db = watchlist_db.connect()
+            watchlist_db.init_db(db)
+            row = db.execute("SELECT value FROM meta WHERE key='last_ingest'"
+                             ).fetchone()
+            db.close()
+            import datetime as _dt
+            if row is None or row["value"] != _dt.date.today().isoformat():
+                await asyncio.to_thread(watchlist_ingest.run_ingest,
+                                        watchlist_db.DB_PATH)
+        except Exception:
+            logging.getLogger("mystic_forge").exception("ingest loop error")
+        await asyncio.sleep(3600)
+
+
+def build_app():
+    return PassphraseMiddleware(mcp.streamable_http_app())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2278,5 +2368,8 @@ async def precon_diff(params: PreconDiffInput) -> str:
 
 if __name__ == "__main__":
     import sys
-    transport = "stdio" if "--stdio" in sys.argv else "streamable-http"
-    mcp.run(transport=transport)
+    if "--stdio" in sys.argv:
+        mcp.run(transport="stdio")
+    else:
+        import uvicorn
+        uvicorn.run(build_app(), host="0.0.0.0", port=8000)
