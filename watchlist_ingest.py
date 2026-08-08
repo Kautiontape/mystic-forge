@@ -143,11 +143,12 @@ def watched_uuids(db) -> set[str]:
            JOIN card_uuids cu ON LOWER(cu.card_name)=LOWER(wc.card_name)""")}
 
 
-def ingest_prices_file(db, gz_path: str) -> int:
-    """Stream a MTGJSON AllPrices/AllPricesToday .gz; upsert watched uuids only.
+def ingest_prices_file(db, gz_path: str, only_uuids=None) -> int:
+    """Stream a MTGJSON AllPrices/AllPricesToday .gz; upsert watched uuids only
+    (or a narrower explicit set for targeted backfills).
 
     Shape: data.<uuid>.paper.<provider>.retail.<finish>.<date> = price"""
-    watched = watched_uuids(db)
+    watched = set(only_uuids) if only_uuids is not None else watched_uuids(db)
     rows = 0
     with gzip.open(gz_path, "rb") as f:
         for uuid, obj in ijson.kvitems(f, "data"):
@@ -163,6 +164,33 @@ def ingest_prices_file(db, gz_path: str) -> int:
                         rows += 1
     db.commit()
     return rows
+
+
+def backfill_entry(db_path: str, data_dir: str | None = None,
+                   card_name: str | None = None) -> int:
+    """Instant history for one just-added card, entirely from the nightly-
+    cached MTGJSON files — no downloads. Resolves the name against the local
+    AllPrintings, then streams the cached AllPrices for just its uuids.
+    Returns price rows written (0 when nothing is cached yet — the nightly
+    ingest covers that case)."""
+    data_dir = data_dir or _data_dir()
+    db = watchlist_db.connect(db_path)
+    try:
+        watchlist_db.init_db(db)
+        ap = os.path.join(data_dir, "AllPrintings.sqlite")
+        if os.path.exists(ap):
+            resolve_watched(db, ap)
+        uuids = {r["uuid"] for r in db.execute(
+            "SELECT uuid FROM card_uuids WHERE LOWER(card_name)=LOWER(?)",
+            (card_name,))}
+        allp = os.path.join(data_dir, "AllPrices.json.gz")
+        if not uuids or not os.path.exists(allp):
+            return 0
+        n = ingest_prices_file(db, allp, only_uuids=uuids)
+        log.info("instant backfill %r: %d rows", card_name, n)
+        return n
+    finally:
+        db.close()
 
 
 def _needs_backfill(db) -> bool:

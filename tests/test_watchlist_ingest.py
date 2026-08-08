@@ -97,6 +97,33 @@ def test_streaming_never_loads_whole_file(db, tmp_path):
     assert peak < 20 * 1024 * 1024      # far below the ~15MB decoded JSON
 
 
+def test_backfill_entry_uses_cached_files_for_one_card(db, db_path, tmp_path):
+    """Adding a card gets instant history from the nightly-cached files:
+    resolve via local AllPrintings, stream cached AllPrices for its uuids."""
+    make_allprintings(tmp_path)
+    make_prices_gz(tmp_path, "AllPrices.json.gz", {
+        "uuid-a": PRICE_OBJ, "uuid-c": PRICE_OBJ, "uuid-other": PRICE_OBJ})
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    watchlist_db.add_card(db, list_id, "Cultivate")
+    db.commit()
+
+    n = watchlist_ingest.backfill_entry(db_path, str(tmp_path), "Sol Ring")
+    assert n == 3                                     # only Sol Ring's uuids
+    uuids = {r["uuid"] for r in db.execute("SELECT DISTINCT uuid FROM prices")}
+    assert uuids == {"uuid-a"}                        # uuid-c/other untouched
+    # resolution happened for ALL pending names as a side effect (it's cheap)
+    assert db.execute("SELECT COUNT(*) FROM card_uuids").fetchone()[0] == 3
+
+
+def test_backfill_entry_defers_when_nothing_cached(db, db_path, tmp_path):
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+    assert watchlist_ingest.backfill_entry(db_path, str(tmp_path),
+                                           "Sol Ring") == 0
+
+
 def test_notify_hits_pushes_once_per_new_hit(db, monkeypatch):
     posts = []
     monkeypatch.setattr(watchlist_ingest.httpx, "post",

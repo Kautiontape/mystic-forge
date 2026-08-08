@@ -2418,6 +2418,28 @@ def _wl_db():
     return db
 
 
+def _schedule_backfill(card_name: str) -> bool:
+    """Instant-history kick after an add: resolve + backfill this one card
+    from the nightly-cached MTGJSON files, off the request path. No network —
+    if nothing is cached yet, defer to the nightly ingest (returns False)."""
+    if os.environ.get("MYSTIC_FORGE_NO_INGEST"):
+        return False
+    data_dir = watchlist_ingest._data_dir()
+    if not os.path.exists(os.path.join(data_dir, "AllPrices.json.gz")):
+        return False
+
+    async def run():
+        try:
+            await asyncio.to_thread(watchlist_ingest.backfill_entry,
+                                    watchlist_db.DB_PATH, data_dir, card_name)
+        except Exception:
+            logging.getLogger("mystic_forge").exception(
+                "instant backfill failed for %r", card_name)
+
+    asyncio.get_running_loop().create_task(run())
+    return True
+
+
 def _resolve_list_row(db, passphrase: Optional[str]):
     """Explicit passphrase param wins over URL context (spec)."""
     if passphrase:
@@ -2526,8 +2548,13 @@ async def watchlist_add(params: WatchlistAddInput) -> str:
             target_price=params.target_price, note=params.note)
         uuids = watchlist_db.uuids_for_entry(db, entry)
         summary = watchlist_db.entry_price_summary(db, entry)
-        backfill = ("history ready" if summary
-                    else "history pending next nightly ingest")
+        if summary:
+            backfill = "history ready"
+        elif _schedule_backfill(entry["card_name"]):
+            backfill = ("history backfilling now from cached data — "
+                        "usually ready within a minute or two")
+        else:
+            backfill = "history pending next nightly ingest"
         printing = f" [{entry['set_code']} {entry['collector_number']}]" \
             if entry.get("set_code") else ""
         lines = [warning + f"Added **{name}**{printing} "
@@ -3036,7 +3063,10 @@ async def api_add(request: Request):
             set_code=body.get("set_code") or None,
             collector_number=body.get("collector_number") or None,
             target_price=tp)
-        return JSONResponse({"entry_id": entry["entry_id"]})
+        backfilling = (not watchlist_db.entry_price_summary(db, entry)
+                       and _schedule_backfill(entry["card_name"]))
+        return JSONResponse({"entry_id": entry["entry_id"],
+                             "backfilling": backfilling})
     finally:
         db.close()
 

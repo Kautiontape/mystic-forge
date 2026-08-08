@@ -271,8 +271,12 @@ if(addBtn){
       body:JSON.stringify({key:KEY,name:pending.name,set_code:pending.set_code,
         collector_number:pending.collector_number,
         target_price:t&&t.value.trim()!==''?+t.value:null})});
-    if(r.ok)location.reload();
-    else document.getElementById('addErr').textContent='could not add';
+    if(!r.ok){document.getElementById('addErr').textContent='could not add';return}
+    const d=await r.json();
+    if(d.backfilling)document.getElementById('addPreview').innerHTML+=
+      '<p class=sub>added \\u2713 \\u2014 pulling 90 days of history from the '+
+      'cached price data; it appears within a minute or two.</p>';
+    setTimeout(()=>location.reload(),d.backfilling?1800:0);
   };
 }
 // ── alerts (ntfy) explainer ──
@@ -566,7 +570,7 @@ def _card_html(db, entry, s, hit, idx, shop, cur):
         deltas = (f'<div class="deltas">{_delta_pct(s["d7"], s["current"], "7d", cur)}'
                   f'{_delta_pct(s["d30"], s["current"], "30d", cur)}</div>')
     else:
-        price = '<div class="nodata">awaiting first ingest…</div>'
+        price = '<div class="nodata">no prices yet — history is on its way</div>'
         deltas = ""
     target = ""
     if bought_at:

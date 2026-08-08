@@ -37,6 +37,19 @@ async def test_add_with_explicit_passphrase(db_path, a_list, fake_scryfall):
     assert len(entries) == 1 and entries[0]["card_name"] == "Sol Ring"
 
 
+async def test_add_kicks_instant_backfill_when_cache_exists(db_path, a_list,
+                                                            fake_scryfall,
+                                                            monkeypatch):
+    kicked = []
+    monkeypatch.setattr(server, "_schedule_backfill",
+                        lambda name: kicked.append(name) or True)
+    list_id, pp, _ = a_list
+    out = await server.watchlist_add(server.WatchlistAddInput(
+        name="Sol Ring", passphrase=pp))
+    assert kicked == ["Sol Ring"]
+    assert "backfilling now" in out
+
+
 async def test_add_without_identity_errors_helpfully(db_path, fake_scryfall):
     out = await server.watchlist_add(server.WatchlistAddInput(name="Sol Ring"))
     assert "watchlist_create" in out and "passphrase" in out.lower()
