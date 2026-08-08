@@ -145,3 +145,54 @@ def test_identifier_ignores_finish():
     # every finish's price, so finish only affects which column we read later.
     entry = server.DecklistEntry(1, "Counterspell", "dmr", "281", "foil")
     assert server._entry_identifier(entry) == {"set": "dmr", "collector_number": "281"}
+
+
+# ── _price_for_finish ─────────────────────────────────────────────────────────
+
+from decimal import Decimal
+
+FOIL_ONLY = {
+    "name": "Sol Ring",
+    "set": "sld",
+    "collector_number": "2417",
+    "finishes": ["foil"],
+    "prices": {"usd": None, "usd_foil": "48.21", "usd_etched": None},
+}
+
+ALL_FINISHES = {
+    "name": "Arcane Signet",
+    "set": "sld",
+    "collector_number": "589",
+    "finishes": ["nonfoil", "foil", "etched"],
+    "prices": {"usd": "29.04", "usd_foil": None, "usd_etched": "26.31"},
+}
+
+
+def test_price_for_finish_reads_the_matching_column():
+    assert server._price_for_finish(ALL_FINISHES, "nonfoil") == Decimal("29.04")
+    assert server._price_for_finish(ALL_FINISHES, "etched") == Decimal("26.31")
+    assert server._price_for_finish(FOIL_ONLY, "foil") == Decimal("48.21")
+
+
+def test_price_for_finish_defaults_to_nonfoil():
+    assert server._price_for_finish(ALL_FINISHES, None) == Decimal("29.04")
+
+
+def test_price_for_finish_never_falls_back_to_another_finish():
+    # The whole point: a foil-only printing has no nonfoil price, and the old
+    # `usd or usd_foil or usd_etched` chain would have quoted $48.21 here.
+    assert server._price_for_finish(FOIL_ONLY, "nonfoil") is None
+    # And a missing foil price does not silently become the nonfoil price.
+    assert server._price_for_finish(ALL_FINISHES, "foil") is None
+
+
+def test_price_for_finish_handles_missing_and_malformed_data():
+    assert server._price_for_finish({}, "nonfoil") is None
+    assert server._price_for_finish({"prices": None}, "nonfoil") is None
+    assert server._price_for_finish({"prices": {"usd": ""}}, "nonfoil") is None
+    assert server._price_for_finish({"prices": {"usd": "n/a"}}, "nonfoil") is None
+
+
+def test_price_for_finish_returns_decimal_not_float():
+    # Totals sum over ~100 lines; float would accumulate representation error.
+    assert isinstance(server._price_for_finish(ALL_FINISHES, "nonfoil"), Decimal)

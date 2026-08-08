@@ -1537,6 +1537,23 @@ def _entry_identifier(entry: DecklistEntry) -> dict:
     return {"name": entry.name}
 
 
+def _price_for_finish(card: dict, finish: Optional[str]) -> Optional[Decimal]:
+    """USD price of this card in exactly the requested finish, or None.
+
+    Deliberately does NOT fall back to another finish. A missing price is
+    reported as missing; quoting a foil price for a nonfoil request produces a
+    confidently wrong number, which is worse than no number.
+    """
+    key = FINISH_PRICE_KEYS.get(finish or "nonfoil", "usd")
+    raw = (card.get("prices") or {}).get(key)
+    if raw in (None, ""):
+        return None
+    try:
+        return Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return None
+
+
 @mcp.tool(name="validate_decklist")
 async def validate_decklist(params: ValidateDecklistInput) -> str:
     """Validate a Commander decklist for card name accuracy, deck size, and color identity.
