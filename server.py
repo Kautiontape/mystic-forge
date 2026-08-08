@@ -237,6 +237,19 @@ class ScryfallSearchOrder(str, Enum):
     REVIEW = "review"
 
 
+class CardFinish(str, Enum):
+    NONFOIL = "nonfoil"
+    FOIL = "foil"
+    ETCHED = "etched"
+
+
+class PriceOrder(str, Enum):
+    USD = "usd"
+    RELEASED = "released"
+    SET = "set"
+    NAME = "name"
+
+
 class SearchInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     query: str = Field(
@@ -267,7 +280,38 @@ class RandomInput(BaseModel):
 class PriceInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     name: str = Field(..., description="Card name to look up prices for.", min_length=1, max_length=200)
+    set_code: Optional[str] = Field(
+        default=None,
+        description="Restrict to one set, e.g. 'dmr'. Use with collector_number to pin one printing.",
+        min_length=2, max_length=6,
+    )
+    collector_number: Optional[str] = Field(
+        default=None,
+        description=(
+            "Collector number within the set, e.g. '281' or 'IFIYW-10'. "
+            "Requires set_code. With both set, prices exactly one printing."
+        ),
+        max_length=20,
+    )
+    finish: Optional[CardFinish] = Field(
+        default=None,
+        description="Restrict to printings available in this finish, and lead with its price.",
+    )
+    include_digital: bool = Field(
+        default=False,
+        description="Include Arena/MTGO-only printings. They never have paper prices, so off by default.",
+    )
+    order: PriceOrder = Field(default=PriceOrder.USD, description="Sort order requested from Scryfall.")
     limit: int = Field(default=10, description="Max printings to show.", ge=1, le=50)
+
+    @model_validator(mode="after")
+    def _collector_number_requires_set(self):
+        if self.collector_number and not self.set_code:
+            raise ValueError(
+                "collector_number requires set_code — collector numbers are only "
+                "unique within a set."
+            )
+        return self
 
 
 class PriceListInput(BaseModel):
@@ -346,64 +390,163 @@ async def scryfall_random(params: RandomInput) -> str:
         return _scryfall_error(e)
 
 
+def _format_price_columns(card: dict) -> str:
+    """Every price this printing has, as a single display string."""
+    prices = card.get("prices") or {}
+    bits: list[str] = []
+    if prices.get("usd"):
+        bits.append(f"${prices['usd']}")
+    if prices.get("usd_foil"):
+        bits.append(f"Foil: ${prices['usd_foil']}")
+    if prices.get("usd_etched"):
+        bits.append(f"Etched: ${prices['usd_etched']}")
+    if prices.get("eur"):
+        bits.append(f"EUR: €{prices['eur']}")
+    if prices.get("tix"):
+        bits.append(f"MTGO: {prices['tix']} tix")
+    return " | ".join(bits) if bits else "No price data"
+
+
+def _describe_price_filters(params: "PriceInput") -> str:
+    """' (set:dmr, foil)' — states which filters produced this result set."""
+    bits: list[str] = []
+    if params.set_code:
+        bits.append(f"set:{params.set_code}")
+    if params.collector_number:
+        bits.append(f"cn:{params.collector_number}")
+    if params.finish:
+        bits.append(params.finish.value)
+    if params.include_digital:
+        bits.append("including digital")
+    return f" ({', '.join(bits)})" if bits else ""
+
+
+def _format_single_printing(card: dict, finish: Optional[str]) -> str:
+    """Detail view for one pinned printing — enough to identify a physical copy."""
+    parts: list[str] = []
+    parts.append(f"# {card.get('name', '?')}")
+    parts.append(f"**{card.get('set_name', '?')}** "
+                 f"({(card.get('set') or '?').upper()} "
+                 f"#{card.get('collector_number', '?')}, "
+                 f"{card.get('rarity', '?')})")
+    parts.append("")
+    parts.append(f"Prices: {_format_price_columns(card)}")
+    parts.append(f"Available finishes: {_available_finishes(card)}")
+
+    requested = _price_for_finish(card, finish)
+    if finish:
+        if requested is not None:
+            parts.append(f"Requested finish ({finish}): ${requested:.2f}")
+        else:
+            parts.append(f"Requested finish ({finish}): no price for this printing")
+
+    parts.append("")
+    if card.get("artist"):
+        parts.append(f"Artist: {card['artist']}")
+    frame_bits = [card.get("frame", ""), card.get("border_color", "")]
+    frame = ", ".join(b for b in frame_bits if b)
+    if frame:
+        parts.append(f"Frame/border: {frame}")
+    if card.get("promo_types"):
+        parts.append(f"Promo types: {', '.join(card['promo_types'])}")
+    if card.get("released_at"):
+        parts.append(f"Released: {card['released_at']}")
+    if card.get("scryfall_uri"):
+        parts.append(f"Link: {card['scryfall_uri']}")
+
+    return "\n".join(parts)
+
+
+def _price_query(params: "PriceInput") -> str:
+    """Scryfall search query for a price lookup, including printing filters."""
+    bits = [f'!"{params.name}"']
+    if params.set_code:
+        bits.append(f"set:{params.set_code}")
+    if params.collector_number:
+        bits.append(f"cn:{params.collector_number}")
+    if params.finish:
+        bits.append(f"is:{params.finish.value}")
+    if not params.include_digital:
+        bits.append("-is:digital")
+    return " ".join(bits)
+
+
+def _sort_by_price(cards: list[dict], finish: Optional[str]) -> list[dict]:
+    """Cheapest priced printing first, unpriced printings last.
+
+    Scryfall's own order=usd&dir=asc sorts null prices FIRST, which meant this
+    tool's top rows were routinely printings with no price at all.
+    """
+    def sort_key(card: dict):
+        price = _price_for_finish(card, finish)
+        return (price is None, price if price is not None else Decimal("0"))
+    return sorted(cards, key=sort_key)
+
+
 @mcp.tool(name="scryfall_price")
 async def scryfall_price(params: PriceInput) -> str:
-    """Get current market prices for a card across all printings.
+    """Get current market prices for a card, optionally for one specific printing.
 
-    Shows USD (TCGPlayer), EUR (Cardmarket), and MTGO tix prices for each
-    printing, sorted cheapest first. Prices updated daily by Scryfall.
+    With no filters, lists printings cheapest first (printings with no price
+    sort last, not first). Pass set_code to restrict to one set, set_code plus
+    collector_number to price exactly one printing, or finish to restrict to
+    printings that come in foil or etched.
+
+    Digital-only (Arena/MTGO) printings are excluded by default because they
+    never carry paper prices. Prices are updated daily by Scryfall.
     """
     try:
         data = await _scryfall_get(
             "/cards/search",
-            params={"q": f'!"{params.name}"', "unique": "prints", "order": "usd", "dir": "asc"},
+            params={
+                "q": _price_query(params),
+                "unique": "prints",
+                "order": params.order.value,
+                "dir": "asc",
+            },
         )
     except Exception as e:
         return _scryfall_error(e)
 
     cards = data.get("data", [])
     if not cards:
-        return f"No printings found for '{params.name}'."
+        return f"No printings found for '{params.name}' with those filters."
+
+    finish = params.finish.value if params.finish else None
+    total = data.get("total_cards", len(cards))
+
+    # One printing pinned exactly — show it in detail instead of as a list row.
+    if params.set_code and params.collector_number and len(cards) == 1:
+        return _format_single_printing(cards[0], finish)
+
+    ordered = _sort_by_price(cards, finish)[:params.limit]
 
     parts: list[str] = []
     parts.append(f"# Prices for {cards[0].get('name', params.name)}")
-    parts.append(f"{data.get('total_cards', len(cards))} printings found")
+    shown = f"Showing {len(ordered)} of {total} printings"
+    filters = _describe_price_filters(params)
+    parts.append(f"{shown}{filters}")
     parts.append("")
 
-    cheapest_usd = None
-    for card in cards[:params.limit]:
-        prices = card.get("prices", {})
-        set_name = card.get("set_name", "?")
-        set_code = card.get("set", "?").upper()
-        rarity = card.get("rarity", "?")
+    for card in ordered:
+        parts.append(f"**{card.get('set_name', '?')}** "
+                     f"({(card.get('set') or '?').upper()} "
+                     f"#{card.get('collector_number', '?')}, "
+                     f"{card.get('rarity', '?')}) — {_format_price_columns(card)}")
 
-        usd = prices.get("usd")
-        usd_foil = prices.get("usd_foil")
-        usd_etched = prices.get("usd_etched")
-        eur = prices.get("eur")
-        tix = prices.get("tix")
-
-        price_parts: list[str] = []
-        if usd:
-            price_parts.append(f"${usd}")
-            if cheapest_usd is None:
-                cheapest_usd = (usd, set_name, set_code)
-        if usd_foil:
-            price_parts.append(f"Foil: ${usd_foil}")
-        if usd_etched:
-            price_parts.append(f"Etched: ${usd_etched}")
-        if eur:
-            price_parts.append(f"EUR: €{eur}")
-        if tix:
-            price_parts.append(f"MTGO: {tix} tix")
-        if not price_parts:
-            price_parts.append("No price data")
-
-        parts.append(f"**{set_name}** ({set_code}, {rarity}) — {' | '.join(price_parts)}")
-
-    if cheapest_usd:
+    cheapest = next(
+        (c for c in ordered if _price_for_finish(c, finish) is not None), None)
+    if cheapest is not None:
+        price = _price_for_finish(cheapest, finish)
         parts.append("")
-        parts.append(f"Cheapest: ${cheapest_usd[0]} ({cheapest_usd[1]}, {cheapest_usd[2]})")
+        parts.append(f"Cheapest {finish or 'nonfoil'}: ${price:.2f} "
+                     f"({cheapest.get('set_name', '?')}, "
+                     f"{(cheapest.get('set') or '?').upper()} "
+                     f"#{cheapest.get('collector_number', '?')})")
+
+    if total > len(ordered):
+        parts.append("")
+        parts.append("Narrow with set_code, or raise limit, to see other printings.")
 
     return "\n".join(parts)
 

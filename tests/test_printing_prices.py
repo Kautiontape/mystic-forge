@@ -429,3 +429,56 @@ def test_unchecked_entries_are_not_reported_as_not_found():
         [{"set": "ltc", "collector_number": "284"}])
     assert result["unchecked"] == ["1x Sol Ring (LTC #284)"]
     assert result["missing"] == ["1x Black Lotus"]
+
+
+# ── scryfall_price query building and sorting ─────────────────────────────────
+
+import pytest
+from pydantic import ValidationError
+
+
+def test_price_query_is_just_the_name_and_a_digital_filter_by_default():
+    params = server.PriceInput(name="Sol Ring")
+    assert server._price_query(params) == '!"Sol Ring" -is:digital'
+
+
+def test_price_query_includes_set_collector_and_finish():
+    params = server.PriceInput(
+        name="Counterspell", set_code="dmr", collector_number="281", finish="foil")
+    assert server._price_query(params) == \
+        '!"Counterspell" set:dmr cn:281 is:foil -is:digital'
+
+
+def test_price_query_can_include_digital_printings():
+    params = server.PriceInput(name="Counterspell", include_digital=True)
+    assert server._price_query(params) == '!"Counterspell"'
+
+
+def test_collector_number_without_set_code_is_rejected():
+    # Collector numbers are only unique within a set, so this is a real error
+    # rather than something to silently ignore.
+    with pytest.raises(ValidationError):
+        server.PriceInput(name="Sol Ring", collector_number="284")
+
+
+def test_sort_puts_priced_printings_first_and_unpriced_last():
+    # The live defect: Scryfall's order=usd&dir=asc sorts nulls FIRST, so the
+    # ten rows this tool displayed for Counterspell were all unpriced.
+    unpriced = {"name": "C", "set": "tpr", "collector_number": "1",
+                "finishes": ["nonfoil"], "prices": {"usd": None}}
+    cheap = {"name": "C", "set": "dmr", "collector_number": "281",
+             "finishes": ["nonfoil"], "prices": {"usd": "2.15"}}
+    dear = {"name": "C", "set": "6ed", "collector_number": "77",
+            "finishes": ["nonfoil"], "prices": {"usd": "2.27"}}
+
+    ordered = server._sort_by_price([unpriced, dear, cheap], None)
+    assert [c["set"] for c in ordered] == ["dmr", "6ed", "tpr"]
+
+
+def test_sort_uses_the_requested_finish_column():
+    a = {"name": "C", "set": "a", "collector_number": "1",
+         "finishes": ["nonfoil", "foil"], "prices": {"usd": "10.00", "usd_foil": "1.00"}}
+    b = {"name": "C", "set": "b", "collector_number": "2",
+         "finishes": ["nonfoil", "foil"], "prices": {"usd": "1.00", "usd_foil": "10.00"}}
+    assert [c["set"] for c in server._sort_by_price([a, b], "foil")] == ["a", "b"]
+    assert [c["set"] for c in server._sort_by_price([a, b], "nonfoil")] == ["b", "a"]
