@@ -1388,8 +1388,12 @@ async def archidekt_user_decks(params: ArchidektUserInput) -> str:
 async def archidekt_export(params: ArchidektDeckInput) -> str:
     """Export an Archidekt deck in Archidekt-compatible import format.
 
-    Uses the full Archidekt import syntax with set codes, categories, and labels:
-      1x Card Name (set) [Category{flags}] ^Label,#hex^
+    Uses the full Archidekt import syntax with set codes, finishes, categories,
+    and labels:
+      1x Card Name (set) 123 *F* [Category{flags}] ^Label,#hex^
+
+    Foil and etched cards keep their finish (*F* / *E*), so the exported list
+    re-imports as the same cards and prices correctly via scryfall_price_list.
 
     Category flags: {top} for commander, {noDeck}{noPrice} for maybeboard.
     Output can be pasted directly into Archidekt's import dialog.
@@ -1416,14 +1420,7 @@ async def archidekt_export(params: ArchidektDeckInput) -> str:
         entry_cats = entry.get("categories", [])
         labels = entry.get("labels") or []
 
-        # Build the line: 1x Card Name (set) collector [Category{flags}] ^label^
-        line = f"{qty}x {card_name}"
-
-        if set_code:
-            line += f" ({set_code})"
-
-        if collector:
-            line += f" {collector}"
+        modifier = entry.get("modifier", "")
 
         # Determine category annotation and deck inclusion
         cat_annotation = ""
@@ -1441,7 +1438,15 @@ async def archidekt_export(params: ArchidektDeckInput) -> str:
         if is_in_deck:
             total_in_deck += qty
 
-        line += cat_annotation
+        line = _archidekt_line(
+            quantity=qty,
+            name=card_name,
+            set_code=set_code,
+            collector=collector,
+            finish=MODIFIER_FINISHES.get(modifier),
+            category=cat_annotation,
+            labels="",
+        )
 
         # Labels
         for label in labels:

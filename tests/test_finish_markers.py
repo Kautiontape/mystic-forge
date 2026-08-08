@@ -103,3 +103,69 @@ async def test_format_archidekt_places_the_marker_after_the_collector_number(mon
     assert "1x Counterspell (dmr) 281 *F* [Draw]" in lines
     assert "1x Arcane Signet (dmr) 281 *E* [Ramp]" in lines
     assert "1x Sol Ring (dmr) 281 [Ramp]" in lines     # no finish, no marker
+
+
+def test_modifier_finishes_maps_archidekt_values():
+    assert server.MODIFIER_FINISHES["Foil"] == "foil"
+    assert server.MODIFIER_FINISHES["Etched"] == "etched"
+    assert server.MODIFIER_FINISHES["Normal"] == "nonfoil"
+
+
+def test_export_line_carries_the_modifier_as_a_marker():
+    assert server._archidekt_line(
+        quantity=1, name="Sol Ring", set_code="ltc", collector="284",
+        finish=server.MODIFIER_FINISHES.get("Foil"),
+        category=" [Ramp]", labels="") == "1x Sol Ring (ltc) 284 *F* [Ramp]"
+
+
+def test_export_line_has_no_marker_for_normal_or_unknown_modifiers():
+    for modifier in ("Normal", "", "Something Else"):
+        line = server._archidekt_line(
+            quantity=1, name="Sol Ring", set_code="ltc", collector="284",
+            finish=server.MODIFIER_FINISHES.get(modifier),
+            category=" [Ramp]", labels="")
+        assert line == "1x Sol Ring (ltc) 284 [Ramp]"
+
+
+async def test_archidekt_export_preserves_foil_and_etched_modifiers(monkeypatch):
+    """Archidekt gives us the modifier; we must hand it back.
+
+    Dropping it is why a foil deck exported through this server used to come
+    back all-nonfoil and then price at nonfoil prices.
+    """
+    deck = {
+        "categories": [
+            {"name": "Commander", "isPremier": True, "includedInDeck": True},
+            {"name": "Ramp", "isPremier": False, "includedInDeck": True},
+            {"name": "Maybeboard", "isPremier": False, "includedInDeck": False},
+        ],
+        "cards": [
+            {"quantity": 1, "modifier": "Foil", "categories": ["Ramp"], "labels": [],
+             "card": {"oracleCard": {"name": "Sol Ring"},
+                      "edition": {"editioncode": "ltc"}, "collectorNumber": "284"}},
+            {"quantity": 1, "modifier": "Etched", "categories": ["Ramp"], "labels": [],
+             "card": {"oracleCard": {"name": "Arcane Signet"},
+                      "edition": {"editioncode": "sld"}, "collectorNumber": "589"}},
+            {"quantity": 1, "modifier": "Normal", "categories": ["Commander"], "labels": [],
+             "card": {"oracleCard": {"name": "Atraxa"},
+                      "edition": {"editioncode": "cmr"}, "collectorNumber": "1"}},
+            {"quantity": 1, "categories": ["Maybeboard"], "labels": [],
+             "card": {"oracleCard": {"name": "Rhystic Study"},
+                      "edition": {"editioncode": "j22"}, "collectorNumber": "114"}},
+        ],
+    }
+
+    async def fake_archidekt_get(path, params=None):
+        return deck
+    monkeypatch.setattr(server, "_archidekt_get", fake_archidekt_get)
+
+    out = await server.archidekt_export(server.ArchidektDeckInput(deck="123"))
+    lines = out.splitlines()
+
+    assert "1x Sol Ring (ltc) 284 *F* [Ramp]" in lines
+    assert "1x Arcane Signet (sld) 589 *E* [Ramp]" in lines
+    assert "1x Atraxa (cmr) 1 [Commander{top}]" in lines
+    # A card with no modifier key at all must not gain a marker.
+    assert "1x Rhystic Study (j22) 114 [Maybeboard{noDeck}{noPrice}]" in lines
+    # Maybeboard is excluded from the deck total.
+    assert "# Total in deck: 3" in lines
