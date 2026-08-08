@@ -1435,6 +1435,52 @@ def _archidekt_in_deck_cards(data: dict) -> dict[str, int]:
     return counts
 
 
+def _archidekt_type_line(oracle: dict) -> str:
+    """'Legendary Creature — Human Warlock' from Archidekt's split type fields."""
+    left = " ".join([*(oracle.get("superTypes") or []), *(oracle.get("types") or [])])
+    subs = " ".join(oracle.get("subTypes") or [])
+    return f"{left} — {subs}" if subs else left
+
+
+def _archidekt_face_lines(face: dict) -> list[str]:
+    """Type/PT/loyalty line, then rules text, for one oracleCard or face dict.
+
+    Archidekt reports absent power/toughness as '' (Vehicles do carry real
+    values despite not being creatures), and absent loyalty as None.
+    """
+    lines: list[str] = []
+    header = _archidekt_type_line(face)
+    power, toughness = face.get("power"), face.get("toughness")
+    if power not in (None, "") and toughness not in (None, ""):
+        header = f"{header} {power}/{toughness}".strip()
+    if face.get("loyalty"):
+        header = f"{header} [Loyalty {face['loyalty']}]".strip()
+    if header:
+        lines.append(header)
+    text = (face.get("text") or "").strip()
+    if text:
+        lines.extend(text.split("\n"))
+    return lines
+
+
+def _archidekt_card_detail(oracle: dict) -> list[str]:
+    """Detail lines for include_text; face-by-face for multi-faced cards.
+
+    Multi-faced cards carry empty top-level text and a combined manaCost —
+    the real data lives in `faces`.
+    """
+    faces = oracle.get("faces") or []
+    if not faces:
+        return _archidekt_face_lines(oracle)
+    lines: list[str] = []
+    for i, face in enumerate(faces):
+        if i:
+            lines.append("//")
+        lines.append(f"{face.get('name', '?')} {face.get('manaCost') or ''}".strip())
+        lines.extend(_archidekt_face_lines(face))
+    return lines
+
+
 def _parse_deck_id(deck_ref: str) -> str:
     """Extract deck ID from an Archidekt URL or raw ID."""
     match = re.search(r"archidekt\.com/decks/(\d+)", deck_ref)
@@ -1464,6 +1510,14 @@ class ArchidektDeckInput(BaseModel):
         ...,
         description="Archidekt deck ID or full URL (e.g., '365563' or 'https://archidekt.com/decks/365563').",
         min_length=1,
+    )
+    include_text: bool = Field(
+        default=False,
+        description=(
+            "Include mana cost, type line, and full oracle text for every "
+            "card. Set true whenever you will discuss what cards do — never "
+            "rely on memory for card text."
+        ),
     )
 
 
@@ -1521,7 +1575,14 @@ async def archidekt_deck(params: ArchidektDeckInput) -> str:
                 prefix = "[CMDR] "
             elif not included:
                 prefix = "[MB] "
-            cards_by_cat[cat_name].append(f"{qty} {prefix}{card_name}")
+            line = f"{qty} {prefix}{card_name}"
+            if params.include_text:
+                if oracle.get("manaCost"):
+                    line += f" {oracle['manaCost']}"
+                detail = _archidekt_card_detail(oracle)
+                if detail:
+                    line += "\n" + "\n".join(f"   {d}" for d in detail)
+            cards_by_cat[cat_name].append(line)
 
             if included:
                 total_in_deck += qty
