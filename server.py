@@ -2363,6 +2363,215 @@ async def precon_diff(params: PreconDiffInput) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# WATCHLIST — Passphrase-named price watchlists (spec 2026-08-08)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class WatchlistCreateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: Optional[str] = Field(None, description="Optional list label, e.g. 'Cloud deck upgrades'")
+
+
+class WatchlistAddInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(..., description="Card name (fuzzy-matched via Scryfall)")
+    set_code: Optional[str] = Field(None, description="Pin a specific printing: set code")
+    collector_number: Optional[str] = Field(None, description="Pin a specific printing: collector number")
+    target_price: Optional[float] = Field(None, description="Alert threshold in USD")
+    note: Optional[str] = Field(None, description="Free-form note, e.g. deck/batch")
+    passphrase: Optional[str] = Field(None, description="List passphrase (omit when using a personal connector URL)")
+
+
+class WatchlistRemoveInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: Optional[str] = Field(None, description="Card name to remove")
+    entry_id: Optional[int] = Field(None, description="Entry id (from watchlist_list/history)")
+    passphrase: Optional[str] = Field(None, description="List passphrase (omit when using a personal connector URL)")
+
+
+class WatchlistListInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    passphrase: Optional[str] = Field(None, description="List passphrase (omit when using a personal connector URL)")
+
+
+class _NoIdentity(Exception):
+    pass
+
+
+NO_IDENTITY_MSG = (
+    "No watchlist identity. Pass your `passphrase`, use your personal "
+    "connector URL, or create a list with `watchlist_create`."
+)
+
+
+def _wl_db():
+    db = watchlist_db.connect()
+    watchlist_db.init_db(db)
+    return db
+
+
+def _resolve_list_row(db, passphrase: Optional[str]):
+    """Explicit passphrase param wins over URL context (spec)."""
+    if passphrase:
+        row = watchlist_db.get_list_by_passphrase(db, passphrase)
+        if row is None:
+            raise _NoIdentity("That passphrase is not recognized. Check for "
+                              "typos, or create a list with `watchlist_create`.")
+        return row
+    list_id = _current_list.get()
+    if list_id is not None:
+        return watchlist_db.get_list(db, list_id)
+    raise _NoIdentity(NO_IDENTITY_MSG)
+
+
+def _supersession_warning(db, row) -> str:
+    if row["superseded_by"] is None:
+        return ""
+    succ = watchlist_db.get_list(db, row["superseded_by"])
+    return (f"⚠️ This list was **superseded** by a recovery clone "
+            f"(share code `{succ['share_code']}`, created {succ['created_at']}). "
+            f"You are editing the old copy — switch to the new passphrase/URL "
+            f"if that was unintended.\n\n")
+
+
+def _fmt_price(v) -> str:
+    return f"${v:.2f}" if v is not None else "—"
+
+
+def _fmt_delta(v) -> str:
+    if v is None:
+        return "—"
+    return f"{'▼' if v < 0 else '▲' if v > 0 else '·'}{abs(v):.2f}"
+
+
+@mcp.tool(name="watchlist_create")
+async def watchlist_create(params: WatchlistCreateInput) -> str:
+    """Create a new price watchlist. Returns its passphrase (SHOWN ONLY ONCE —
+    offer to remember it for the user), personal connector URL, and read-only
+    share code."""
+    db = _wl_db()
+    try:
+        _, pp, sc = watchlist_db.create_list(db, label=params.label)
+    finally:
+        db.close()
+    return (
+        f"# Watchlist created{': ' + params.label if params.label else ''}\n\n"
+        f"**Passphrase (save this — shown only once):** `{pp}`\n\n"
+        f"- Personal connector URL: `{PUBLIC_BASE}/mcp/{pp}`\n"
+        f"- History page: {PUBLIC_BASE}/w/{pp}\n"
+        f"- Read-only share code: `{sc}` (viewable at {PUBLIC_BASE}/s/{sc})\n\n"
+        f"Add this server with the personal URL for automatic identity, or "
+        f"give the passphrase in chat. Share the share code (not the "
+        f"passphrase) with friends."
+    )
+
+
+@mcp.tool(name="watchlist_add")
+async def watchlist_add(params: WatchlistAddInput) -> str:
+    """Add a card to a watchlist (or update its target/note if already
+    watched). Tracks the cheapest printing unless set_code+collector_number
+    pin one."""
+    db = _wl_db()
+    try:
+        try:
+            row = _resolve_list_row(db, params.passphrase)
+        except _NoIdentity as e:
+            return str(e)
+        warning = _supersession_warning(db, row)
+
+        name = params.name
+        current_usd = None
+        try:
+            card = await _scryfall_get("/cards/named", {"fuzzy": params.name})
+            name = card.get("name", params.name)
+            current_usd = (card.get("prices") or {}).get("usd")
+        except Exception:
+            pass  # offline/unknown: keep the user's spelling
+
+        _, entry = watchlist_db.add_card(
+            db, row["id"], name, set_code=params.set_code,
+            collector_number=params.collector_number,
+            target_price=params.target_price, note=params.note)
+        uuids = watchlist_db.uuids_for_entry(db, entry)
+        summary = watchlist_db.price_summary(db, uuids) if uuids else None
+        backfill = ("history ready" if summary
+                    else "history pending next nightly ingest")
+        lines = [warning + f"Added **{name}** (entry #{entry['entry_id']}) — {backfill}."]
+        if current_usd:
+            lines.append(f"Scryfall market price now: ${current_usd}")
+        if entry.get("target_price") is not None:
+            lines.append(f"Target: {_fmt_price(entry['target_price'])}")
+        if uuids:
+            lines.append(f"Tracking {len(uuids)} printing(s).")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+@mcp.tool(name="watchlist_remove")
+async def watchlist_remove(params: WatchlistRemoveInput) -> str:
+    """Remove a card from a watchlist by name or entry id."""
+    if params.name is None and params.entry_id is None:
+        return "Give a card `name` or an `entry_id` to remove."
+    db = _wl_db()
+    try:
+        try:
+            row = _resolve_list_row(db, params.passphrase)
+        except _NoIdentity as e:
+            return str(e)
+        warning = _supersession_warning(db, row)
+        try:
+            removed = watchlist_db.remove_entry(
+                db, row["id"], entry_id=params.entry_id, name=params.name)
+        except watchlist_db.NotFound as e:
+            return warning + str(e)
+        return warning + f"Removed **{removed['card_name']}** (entry #{removed['entry_id']})."
+    finally:
+        db.close()
+
+
+def _render_entries(db, list_id: int) -> list[str]:
+    lines = ["| # | Card | Price | Δ7d | Δ30d | Target | Note |",
+             "|---|------|-------|-----|------|--------|------|"]
+    entries = watchlist_db.current_entries(db, list_id)
+    rows = []
+    for e in entries:
+        s = watchlist_db.price_summary(db, watchlist_db.uuids_for_entry(db, e))
+        rows.append((e, s))
+    rows.sort(key=lambda t: (t[1] is None,
+                             t[1]["d30"] if t[1] and t[1]["d30"] is not None else 0))
+    for e, s in rows:
+        printing = f" [{e['set_code']} {e['collector_number']}]" \
+            if e.get("set_code") else ""
+        lines.append(
+            f"| {e['entry_id']} | {e['card_name']}{printing} "
+            f"| {_fmt_price(s['current']) if s else '—'} "
+            f"| {_fmt_delta(s['d7']) if s else '—'} "
+            f"| {_fmt_delta(s['d30']) if s else '—'} "
+            f"| {_fmt_price(e['target_price'])} | {e['note'] or ''} |")
+    if not entries:
+        lines = ["*(empty list)*"]
+    return lines
+
+
+@mcp.tool(name="watchlist_list")
+async def watchlist_list(params: WatchlistListInput) -> str:
+    """Show a watchlist: current price (cheapest normal-finish tcgplayer),
+    7/30-day movement, targets, notes. Sorted by 30-day movement."""
+    db = _wl_db()
+    try:
+        try:
+            row = _resolve_list_row(db, params.passphrase)
+        except _NoIdentity as e:
+            return str(e)
+        header = f"# Watchlist{': ' + row['label'] if row['label'] else ''}\n"
+        return _supersession_warning(db, row) + header + \
+            "\n".join(_render_entries(db, row["id"]))
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ENTRYPOINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
