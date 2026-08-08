@@ -1,0 +1,69 @@
+Magic: The Gathering Comprehensive Rules
+
+These rules are effective as of August 7, 2026.
+
+Introduction
+
+This document is the ultimate authority for Magic: The Gathering® competitive game play.
+
+Contents
+
+1. Game Concepts
+100. General
+7. Additional Rules
+702. Keyword Abilities
+704. State-Based Actions
+
+Glossary
+
+Credits
+
+1. Game Concepts
+
+100. General
+
+100.1. These Magic rules apply to any Magic game with two or more players, including two-player games and multiplayer games.
+
+100.1a A two-player game is a game that begins with only two players.
+
+100.1b A multiplayer game is a game that begins with more than two players. See section 8, “Multiplayer Rules.”
+
+7. Additional Rules
+
+702. Keyword Abilities
+
+702.1. Most abilities describe things that happen, not characteristics a card has.
+Example: “Flying” is a keyword ability.
+
+702.2. Deathtouch
+
+702.2a Deathtouch is a static ability.
+
+702.2b A creature with toughness 0 or less that’s been dealt damage by a source with deathtouch since the last time state-based actions were checked is destroyed as a state-based action. See rule 704.
+
+702.2c Any nonzero amount of combat damage assigned to a creature by a source with deathtouch is considered to be lethal damage, regardless of that creature’s toughness. See rules 510.1c–d.
+
+704. State-Based Actions
+
+704.5. The state-based actions are as follows:
+
+704.5k If a creature has toughness greater than 0, it has been dealt damage, and the total damage marked on it is greater than or equal to its toughness, that creature has been dealt lethal damage and is destroyed.
+
+704.5m If a creature has toughness greater than 0 and it’s been dealt damage by a source with deathtouch since the last time state-based actions were checked, that creature is destroyed.
+
+Glossary
+
+Deathtouch
+A keyword ability that causes damage dealt by an object to be especially effective. See rule 702.2, “Deathtouch.”
+
+Destroy
+To move a permanent from the battlefield to its owner’s graveyard. See rule 701.7, “Destroy.”
+
+Dies
+A creature or planeswalker “dies” if it’s put into a graveyard from the battlefield.
+
+It is used interchangeably with “is put into a graveyard from the battlefield.”
+
+Credits
+
+Original game design by Richard Garfield.
