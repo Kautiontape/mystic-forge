@@ -14,8 +14,7 @@ from goldfish.engine import (
     new_game,
     step,
 )
-from tests.goldfish.test_cards import make_data  # reuse the factory
-from tests.goldfish.test_engine import mini_cards
+from tests.goldfish.helpers import make_data, mini_cards
 
 
 def test_keep_decision_pins():

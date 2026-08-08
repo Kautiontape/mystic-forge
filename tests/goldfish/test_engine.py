@@ -21,10 +21,6 @@ from goldfish.engine import (
     step,
     untapped_producers,
 )
-
-# Definitions moved to tests/goldfish/helpers.py (Task 15 consolidation).
-# These imports double as temporary aliases so any straggler
-# `from tests.goldfish.test_engine import ...` keeps working.
 from tests.goldfish.helpers import annotated, make_data, mini_cards, started
 
 

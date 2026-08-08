@@ -1,5 +1,5 @@
 import httpx
-import pytest
+
 import server
 
 # ── Fixtures: real-shaped EDHREC precon JSON (trimmed) ────────────────────────

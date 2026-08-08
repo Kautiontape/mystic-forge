@@ -9,9 +9,6 @@ from goldfish.cards import (
     parse_cost,
     validate_annotations,
 )
-
-# make_data moved to tests/goldfish/helpers.py (Task 15 consolidation); the
-# re-import keeps `from tests.goldfish.test_cards import make_data` working.
 from tests.goldfish.helpers import make_data
 
 

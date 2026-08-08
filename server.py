@@ -2770,7 +2770,13 @@ def _goldfish_persist_report(run_id: str, entry: dict) -> str | None:
     paths = [os.path.join(GOLDFISH_REPORT_DIR, name)
              for name in os.listdir(GOLDFISH_REPORT_DIR)
              if name.endswith(".html")]
-    paths.sort(key=os.path.getmtime, reverse=True)      # newest first
+
+    def _mtime(p: str) -> float:
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return 0.0        # concurrently removed: sorts oldest, prune skips
+    paths.sort(key=_mtime, reverse=True)                # newest first
     for stale in paths[GOLDFISH_REPORT_FILE_CAP:]:
         try:
             os.remove(stale)

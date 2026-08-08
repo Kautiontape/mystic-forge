@@ -2,8 +2,7 @@
 from goldfish.cards import SimCard, parse_cost
 from goldfish.engine import IllegalAction, new_game, step
 from goldfish.policy import choose_action
-from tests.goldfish.test_cards import make_data
-from tests.goldfish.test_engine import annotated, mini_cards, started
+from tests.goldfish.helpers import annotated, make_data, mini_cards, started
 
 
 def drive_main(g, max_actions=30):

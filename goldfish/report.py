@@ -144,7 +144,7 @@ def _svg_bars(cls: str, labels: list, values: list, title: str,
         cx = _ML + i * slot + slot / 2
         if i % label_step == 0:
             parts.append(f'<text class="ax" x="{cx:.1f}" y="{base + 14}" '
-                         f'text-anchor="middle">{label}</text>')
+                         f'text-anchor="middle">{_esc(label)}</text>')
         v = values[i]
         if v is None or v <= 0:
             continue
@@ -156,8 +156,8 @@ def _svg_bars(cls: str, labels: list, values: list, title: str,
             f'Q{x0:.1f} {y0:.1f} {x0 + r:.1f} {y0:.1f} '
             f'L{x1 - r:.1f} {y0:.1f} Q{x1:.1f} {y0:.1f} '
             f'{x1:.1f} {y0 + r:.1f} L{x1:.1f} {base} Z">'
-            f'<title>{x_title} {label}: {value_fmt.format(v)} '
-            f'{y_title.lower()}</title></path>')
+            f'<title>{_esc(x_title)} {_esc(label)}: {_esc(value_fmt.format(v))} '
+            f'{_esc(y_title.lower())}</title></path>')
         if i == tallest:
             parts.append(f'<text class="lbl" x="{cx:.1f}" y="{y0 - 6:.1f}" '
                          f'text-anchor="middle">{value_fmt.format(v)}</text>')
@@ -462,9 +462,10 @@ def render_report(result: dict, inputs: dict, kind: str = "run") -> str:
     return _render_run(result, inputs, code)
 
 
-def _common_rows(inputs: dict, code: str) -> list[tuple[str, str]]:
+def _common_rows(inputs: dict, code: str,
+                 games: str | None = None) -> list[tuple[str, str]]:
     return [
-        ("Games", str(inputs.get("n", "?"))),
+        ("Games", games if games is not None else str(inputs.get("n", "?"))),
         ("Seed", str(inputs.get("seed", "?"))),
         ("Simulated through", f"turn {inputs.get('until_turn', '?')}"),
         ("Engine version",
@@ -528,8 +529,8 @@ def _render_ab(result: dict, inputs: dict, code: str) -> str:
     deck_b = (f"{len(inputs.get('library_b', ())) + 1} cards — "
               f"{inputs.get('commander_b', '(unknown)')}")
     rows = [("Deck A", deck_a), ("Deck B", deck_b),
-            *_common_rows(inputs, code)]
-    rows[2] = ("Games", f"{inputs.get('n', '?')} (paired)")
+            *_common_rows(inputs, code,
+                          games=f"{inputs.get('n', '?')} (paired)")]
     delta_rows = []
     for name, d in deltas.items():
         sig = "YES" if d["significant"] else "no"
