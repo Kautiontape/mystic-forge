@@ -1110,29 +1110,31 @@ async def scryfall_price_list(params: PriceListInput) -> str:
     if len(entries) > 500:
         return f"Too many lines ({len(entries)}). Maximum is 500."
 
-    # De-duplicate identifiers; several lines may name the same printing.
-    identifiers: list[dict] = []
-    seen: set[str] = set()
-    for entry in entries:
-        identifier = _entry_identifier(entry)
-        key = repr(sorted(identifier.items()))
-        if key not in seen:
-            seen.add(key)
-            identifiers.append(identifier)
+    identifiers = _dedupe_identifiers(entries)
 
     found_cards: list[dict] = []
     not_found: list[dict] = []
-    for i in range(0, len(identifiers), 75):   # Scryfall's hard per-request cap
-        batch = identifiers[i:i + 75]
+    unchecked: list[dict] = []
+    errors: list[str] = []
+
+    for batch in _chunk(identifiers, 75):   # Scryfall's hard per-request cap
         try:
             data = await _scryfall_post("/cards/collection", {"identifiers": batch})
         except Exception as e:
-            return _scryfall_error(e)
+            # Keep what other batches returned. These identifiers are unchecked,
+            # NOT missing — reporting them as "not found" would tell the user a
+            # real card does not exist because of a transient API failure.
+            unchecked.extend(batch)
+            errors.append(_scryfall_error(e))
+            continue
         found_cards.extend(data.get("data", []))
         not_found.extend(data.get("not_found", []))
 
+    if unchecked and not found_cards:
+        return errors[0]
+
     sections = _build_price_sections(
-        entries, _index_collection_results(found_cards), not_found)
+        entries, _index_collection_results(found_cards), not_found, unchecked)
 
     total_cards = sum(e.quantity for e in entries)
     parts: list[str] = []
@@ -1152,6 +1154,12 @@ async def scryfall_price_list(params: PriceListInput) -> str:
     if sections["no_price"]:
         parts.append("**No price in the requested finish (excluded from total):**")
         parts.extend(f"- {line}" for line in sections["no_price"])
+        parts.append("")
+
+    if sections["unchecked"]:
+        parts.append("**Could not be checked — Scryfall request failed (excluded from total):**")
+        parts.extend(f"- {line}" for line in sections["unchecked"])
+        parts.append(f"  ({errors[0]})")
         parts.append("")
 
     if sections["missing"]:

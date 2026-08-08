@@ -287,6 +287,19 @@ twice costs one slot rather than two.
 **Batching.** Requests are chunked at 75 identifiers. The `max_length=75` input cap
 is removed; a per-request cap on total lines (500) replaces it as a sanity bound.
 
+**A failed batch does not fail the request.** Batching creates a failure mode the
+single-request version could not have: with up to seven requests behind one call, a
+transient 429 on the last one would discard six batches of good results. Batches are
+therefore caught individually and the surviving results still render.
+
+This forces a distinction that matters more than the resilience does. Entries from a
+failed batch are **unchecked**, not **missing** — nothing was ever indexed for them,
+so they would otherwise fall through the lookup and print under "Not found on
+Scryfall," telling the user a real card does not exist because a request timed out.
+They get their own output section, excluded from the total, naming the error. Only
+when no batch at all succeeded does the tool return a bare error, since there are no
+partial results worth rendering.
+
 **Matching results to lines.** Responses are keyed into a lookup dict — by
 `(set, collector_number)` and by `(name.lower(), set)` and by `name.lower()` — and
 each line looks itself up. No positional assumptions.
@@ -366,6 +379,9 @@ New pure helpers, all independently testable without network access:
 |---|---|
 | `_parse_decklist_entries` | text → `list[DecklistEntry]` |
 | `_entry_identifier` | `DecklistEntry` → Scryfall identifier dict |
+| `_identifier_key` | identifier → stable comparable string, order-independent |
+| `_dedupe_identifiers` | entries → unique identifiers, first-seen order |
+| `_chunk` | list + size → batches, so the 75-cap loop is testable |
 | `_price_for_finish` | `(card, finish)` → `Decimal \| None`, no cross-finish fallback |
 | `_index_collection_results` | response → lookup dict |
 | `_printing_label` | card + finish → `Counterspell (DMR #281, foil)` |
