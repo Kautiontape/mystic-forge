@@ -79,6 +79,9 @@ class Game:
                                          # replay or next turn)
     mulligans_taken: int = 0
     free_mulligan_used: bool = False
+    kept_hand_size: int | None = None    # set at keep time; None before then (Task 13)
+    kept_hand_lands: int | None = None
+    kept_hand_sources: int | None = None
     won_turn: int | None = None
     life_gained: int = 0              # opponents never attack in goldfish games, so
                                       # gained life has no total to raise; it
@@ -146,6 +149,9 @@ class Game:
             "attacked_this_combat": self.attacked_this_combat,
             "mulligans_taken": self.mulligans_taken,
             "free_mulligan_used": self.free_mulligan_used,
+            "kept_hand_size": self.kept_hand_size,
+            "kept_hand_lands": self.kept_hand_lands,
+            "kept_hand_sources": self.kept_hand_sources,
             "life_gained": self.life_gained,
             "trigger_fires": dict(self.trigger_fires),
             "static_active_turn": dict(self.static_active_turn),
@@ -183,6 +189,9 @@ class Game:
                 attacked_this_combat=d["attacked_this_combat"],
                 mulligans_taken=d["mulligans_taken"],
                 free_mulligan_used=d["free_mulligan_used"],
+                kept_hand_size=d["kept_hand_size"],
+                kept_hand_lands=d["kept_hand_lands"],
+                kept_hand_sources=d["kept_hand_sources"],
                 life_gained=d["life_gained"],
                 trigger_fires=dict(d["trigger_fires"]),
                 static_active_turn=dict(d["static_active_turn"]),
@@ -719,6 +728,126 @@ def _spell_filter_ok(g: Game, f, spell_card: SimCard) -> bool:
     return False
 
 
+# -- Mulligan (spec §Engine (Mulligan)) --------------------------------------
+
+@dataclass
+class MulliganRules:
+    min_sources: int = 3
+    max_sources: int = 5
+    lands_only: bool = False
+    free_first: bool = True          # EDH free mulligan
+    min_real_lands: int = 2
+
+
+def _count_sources(hand: list, cards: dict, rules: MulliganRules) -> tuple:
+    """(mana sources, actual lands) in `hand`. Sources are lands plus, unless
+    `rules.lands_only`, auto-classified mana rocks — nonland permanents that
+    produce mana at MV <= 2 (rocks need lands to actually get cast, hence the
+    separate `min_real_lands` floor kept alongside)."""
+    lands = sum(1 for n in hand if cards[n].is_land)
+    if rules.lands_only:
+        return lands, lands
+    rocks = sum(1 for n in hand
+                if not cards[n].is_land and cards[n].data.produces
+                and cards[n].mv <= 2)
+    return lands + rocks, lands
+
+
+def keep_decision(hand: list, cards: dict, rules: MulliganRules, hand_size: int) -> bool:
+    """London keep rule: hands of <= 5 cards are always kept. Otherwise keep
+    iff mana sources land within [min_sources, max_sources] AND at least
+    min_real_lands actual lands are present. `hand` is judged as given — under
+    London it may still hold more cards than `hand_size` names (the would-be
+    kept size); callers bottom the difference separately via bottom_order()."""
+    if hand_size <= 5:
+        return True
+    sources, lands = _count_sources(hand, cards, rules)
+    return (rules.min_sources <= sources <= rules.max_sources
+            and lands >= rules.min_real_lands)
+
+
+def bottom_order(hand: list, cards: dict, rules: MulliganRules, n_bottom: int) -> list:
+    """Pinned, deterministic bottoming order (required for byte-identical
+    golden logs): bottom excess mana sources above max_sources first (lands
+    before rocks — rocks are kept preferentially since they're colorless-
+    agnostic value), then highest-MV spells, then any remaining lands as a
+    last resort. Ties are broken by name throughout."""
+    hand = list(hand)
+    to_bottom: list = []
+    sources, _ = _count_sources(hand, cards, rules)
+    excess = max(0, sources - rules.max_sources)
+    lands_sorted = sorted(n for n in hand if cards[n].is_land)
+    for n in lands_sorted[:excess]:
+        if len(to_bottom) < n_bottom:
+            to_bottom.append(n)
+            hand.remove(n)
+    spells = sorted((n for n in hand if not cards[n].is_land),
+                    key=lambda n: (-cards[n].mv, n))
+    for n in spells:
+        if len(to_bottom) < n_bottom:
+            to_bottom.append(n)
+            hand.remove(n)
+    for n in sorted(hand):                        # lands as last resort
+        if len(to_bottom) < n_bottom:
+            to_bottom.append(n)
+            hand.remove(n)
+    return to_bottom
+
+
+def _effective_mulls(g: Game, rules: MulliganRules) -> int:
+    """Mulligans that count toward the London bottom count: the first
+    mulligan is free (EDH) when `rules.free_first` and it has been used."""
+    used_free = rules.free_first and g.free_mulligan_used
+    return g.mulligans_taken - (1 if used_free else 0)
+
+
+def _apply_mulligan(g: Game, rules: MulliganRules) -> None:
+    """Shuffle the current hand back into the library, draw a fresh 7
+    (London), and record the free first mulligan (EDH) when configured."""
+    g.library.extend(g.hand)
+    g.hand.clear()
+    g.rng.shuffle(g.library)
+    g.mulligans_taken += 1
+    if rules.free_first and g.mulligans_taken == 1:
+        g.free_mulligan_used = True
+    execute_verb(g, None, "draw", count=7)
+    g.emit(f"mulligan to {7 - _effective_mulls(g, rules)}")
+
+
+def _apply_keep(g: Game, bottoms: list, hand_size: int, rules: MulliganRules) -> None:
+    """Move `bottoms` to the bottom of the library in order, record kept-hand
+    stats (Task 13 metrics), and log the keep."""
+    for name in bottoms:
+        g.hand.remove(name)
+        g.library.append(name)
+    sources, lands = _count_sources(g.hand, g.cards, rules)
+    g.kept_hand_size = hand_size
+    g.kept_hand_lands = lands
+    g.kept_hand_sources = sources
+    if bottoms:
+        g.emit(f"kept {hand_size} (bottomed: {', '.join(bottoms)})")
+    else:
+        g.emit(f"kept {hand_size}")
+
+
+def auto_mulligan(g: Game, rules: MulliganRules, max_mulls: int = 3) -> None:
+    """London mulligan loop, then enter turn 1 main1 via the same turn-begin
+    path every other turn uses (_begin_new_turn). `max_mulls` bounds effective
+    mulligans taken defensively — the pinned keep rule (hands of <= 5 are
+    always kept) already guarantees a keep within it for any deck under
+    default rules, so this floor is normally not the reason the loop exits."""
+    while True:
+        eff = _effective_mulls(g, rules)
+        hand_size = 7 - eff
+        if (keep_decision(g.hand, g.cards, rules, hand_size)
+                or hand_size <= 4 or eff >= max_mulls):
+            bottoms = bottom_order(g.hand, g.cards, rules, len(g.hand) - hand_size)
+            _apply_keep(g, bottoms, hand_size, rules)
+            break
+        _apply_mulligan(g, rules)
+    _begin_new_turn(g)
+
+
 # -- Actions: play_land / cast / pass + turn engine --------------------------
 
 def check_combos(g: Game) -> None:
@@ -870,10 +999,13 @@ def step(g: Game, action: dict) -> None:
         _step_activate(g, action)
     elif kind == "attack":
         _step_attack(g, action)
+    elif kind == "mulligan":
+        _step_mulligan(g)
+    elif kind == "keep":
+        _step_keep(g, action)
     elif kind == "pass":
         _step_pass(g)
     else:
-        # mulligan/keep arrive in Task 10.
         raise IllegalAction(f"unknown or unsupported action type {kind!r}")
     # A turn-advancing pass already recorded inside _begin_new_turn; this
     # second call is deliberate and idempotent (setdefault) — do not "fix" it.
@@ -1114,6 +1246,49 @@ def _step_attack(g: Game, action: dict):
     _check_table_win(g)
 
 
+def _step_mulligan(g: Game) -> None:
+    """Interactive mulligan (spec §Interactive mode): legal only in the
+    mulligan phase, and only while the effective hand size is still above the
+    forced-keep floor. Uses the default MulliganRules (EDH free-first on) —
+    the action schema carries no rules override."""
+    if g.phase != "mulligan":
+        raise IllegalAction(f"cannot mulligan during {g.phase}")
+    rules = MulliganRules()
+    hand_size = 7 - _effective_mulls(g, rules)
+    if hand_size <= 4:
+        raise IllegalAction("mulligan floor reached — keep is the only legal action")
+    # --- all checks passed; mutation begins ---
+    _apply_mulligan(g, rules)
+
+
+def _step_keep(g: Game, action: dict) -> None:
+    """Interactive keep (spec §Interactive mode): the bottom count is fixed
+    by London + EDH free-first (effective mulligans taken); the player picks
+    which names to bottom. Duplicates are multiset-checked against the hand.
+    Validate-first: nothing mutates until the whole `bottom` list is proven
+    legal."""
+    if g.phase != "mulligan":
+        raise IllegalAction(f"cannot keep during {g.phase}")
+    bottom = action.get("bottom", [])
+    if not isinstance(bottom, list) or not all(isinstance(n, str) for n in bottom):
+        raise IllegalAction(f"keep needs a list of card names to bottom, got {bottom!r}")
+    rules = MulliganRules()
+    hand_size = 7 - _effective_mulls(g, rules)
+    required = len(g.hand) - hand_size
+    if len(bottom) != required:
+        raise IllegalAction(
+            f"keep requires bottoming exactly {required} card(s), got {len(bottom)}")
+    remaining = list(g.hand)
+    for name in bottom:
+        try:
+            remaining.remove(name)
+        except ValueError:
+            raise IllegalAction(f"{name!r} is not in hand (or not enough copies)")
+    # --- all checks passed; mutation begins ---
+    _apply_keep(g, list(bottom), hand_size, rules)
+    _begin_new_turn(g)
+
+
 def _step_pass(g: Game):
     if g.phase not in ("main1", "combat", "main2", "end"):
         raise IllegalAction(f"cannot pass during {g.phase}")
@@ -1184,10 +1359,20 @@ def legal_actions(g: Game) -> list:
     pass. Combat is factored, never combinatorial (spec §Interactive mode):
     one {"type": "attack", "eligible": [ids]} entry — the ELIGIBLE ATTACKER
     SET, never 2^C subsets — while this combat's attack is still available
-    and at least one attacker is eligible. Mulligan-phase actions arrive in
-    Task 10."""
+    and at least one attacker is eligible. In the mulligan phase: `mulligan`
+    (offered only while the effective hand size is still above the
+    forced-keep floor) and `keep` with the informational bottom count London
+    + EDH free-first fixes for a keep right now (default MulliganRules — the
+    action schema carries no rules override)."""
     if g.phase == "mulligan":
-        return []
+        rules = MulliganRules()
+        eff = _effective_mulls(g, rules)
+        hand_size = 7 - eff
+        actions = []
+        if hand_size > 4:
+            actions.append({"type": "mulligan"})
+        actions.append({"type": "keep", "bottom_count": len(g.hand) - hand_size})
+        return actions
     actions = []
     if g.phase in ("main1", "main2"):
         if g.land_drops_remaining > 0:
