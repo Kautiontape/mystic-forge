@@ -482,3 +482,53 @@ def test_sort_uses_the_requested_finish_column():
          "finishes": ["nonfoil", "foil"], "prices": {"usd": "1.00", "usd_foil": "10.00"}}
     assert [c["set"] for c in server._sort_by_price([a, b], "foil")] == ["a", "b"]
     assert [c["set"] for c in server._sort_by_price([a, b], "nonfoil")] == ["b", "a"]
+
+
+# ── single-printing detail view ───────────────────────────────────────────────
+
+DMR_COUNTERSPELL = {
+    "name": "Counterspell", "set": "dmr", "collector_number": "281",
+    "set_name": "Dominaria Remastered", "rarity": "common",
+    "finishes": ["nonfoil", "foil"],
+    "prices": {"usd": "2.15", "usd_foil": "2.17", "eur": "2.83", "tix": "0.35"},
+    "artist": "Zack Stella", "frame": "1997", "border_color": "black",
+    "promo_types": ["boosterfun"], "released_at": "2023-01-13",
+    "scryfall_uri": "https://scryfall.com/card/dmr/281/counterspell",
+}
+
+
+def test_printing_header_is_shared_by_both_views():
+    assert server._printing_header(DMR_COUNTERSPELL) == \
+        "**Dominaria Remastered** (DMR #281, common)"
+
+
+def test_single_printing_view_identifies_the_physical_copy():
+    out = server._format_single_printing(DMR_COUNTERSPELL, "foil")
+    assert "# Counterspell" in out
+    assert "**Dominaria Remastered** (DMR #281, common)" in out
+    assert "Available finishes: nonfoil $2.15, foil $2.17" in out
+    assert "Requested finish (foil): $2.17" in out
+    # The fields that let someone confirm which copy they are holding.
+    assert "Artist: Zack Stella" in out
+    assert "Frame/border: 1997, black" in out
+    assert "Promo types: boosterfun" in out
+
+
+def test_single_printing_view_says_so_when_the_requested_finish_has_no_price():
+    out = server._format_single_printing(ALL_FINISHES, "foil")
+    assert "Requested finish (foil): no price for this printing" in out
+    # And still shows what the printing does cost, so the user learns why.
+    assert "nonfoil $29.04" in out
+
+
+def test_single_printing_view_omits_the_requested_finish_line_when_none_asked():
+    out = server._format_single_printing(DMR_COUNTERSPELL, None)
+    assert "Requested finish" not in out
+
+
+def test_single_printing_view_tolerates_a_sparse_card():
+    out = server._format_single_printing(
+        {"name": "X", "prices": {}}, None)
+    assert "# X" in out
+    assert "No price data" in out
+    assert "Artist:" not in out

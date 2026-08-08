@@ -243,13 +243,6 @@ class CardFinish(str, Enum):
     ETCHED = "etched"
 
 
-class PriceOrder(str, Enum):
-    USD = "usd"
-    RELEASED = "released"
-    SET = "set"
-    NAME = "name"
-
-
 class SearchInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     query: str = Field(
@@ -301,7 +294,6 @@ class PriceInput(BaseModel):
         default=False,
         description="Include Arena/MTGO-only printings. They never have paper prices, so off by default.",
     )
-    order: PriceOrder = Field(default=PriceOrder.USD, description="Sort order requested from Scryfall.")
     limit: int = Field(default=10, description="Max printings to show.", ge=1, le=50)
 
     @model_validator(mode="after")
@@ -390,6 +382,14 @@ async def scryfall_random(params: RandomInput) -> str:
         return _scryfall_error(e)
 
 
+def _printing_header(card: dict) -> str:
+    """'**Dominaria Remastered** (DMR #281, common)' — shared by both views."""
+    return (f"**{card.get('set_name', '?')}** "
+            f"({(card.get('set') or '?').upper()} "
+            f"#{card.get('collector_number', '?')}, "
+            f"{card.get('rarity', '?')})")
+
+
 def _format_price_columns(card: dict) -> str:
     """Every price this printing has, as a single display string."""
     prices = card.get("prices") or {}
@@ -425,10 +425,7 @@ def _format_single_printing(card: dict, finish: Optional[str]) -> str:
     """Detail view for one pinned printing — enough to identify a physical copy."""
     parts: list[str] = []
     parts.append(f"# {card.get('name', '?')}")
-    parts.append(f"**{card.get('set_name', '?')}** "
-                 f"({(card.get('set') or '?').upper()} "
-                 f"#{card.get('collector_number', '?')}, "
-                 f"{card.get('rarity', '?')})")
+    parts.append(_printing_header(card))
     parts.append("")
     parts.append(f"Prices: {_format_price_columns(card)}")
     parts.append(f"Available finishes: {_available_finishes(card)}")
@@ -501,7 +498,11 @@ async def scryfall_price(params: PriceInput) -> str:
             params={
                 "q": _price_query(params),
                 "unique": "prints",
-                "order": params.order.value,
+                # Results are re-sorted client-side by price with unpriced
+                # printings last (Scryfall sorts nulls first), so the requested
+                # order only decides which page-1 slice we get for cards with
+                # more printings than one page holds.
+                "order": "usd",
                 "dir": "asc",
             },
         )
@@ -529,10 +530,7 @@ async def scryfall_price(params: PriceInput) -> str:
     parts.append("")
 
     for card in ordered:
-        parts.append(f"**{card.get('set_name', '?')}** "
-                     f"({(card.get('set') or '?').upper()} "
-                     f"#{card.get('collector_number', '?')}, "
-                     f"{card.get('rarity', '?')}) — {_format_price_columns(card)}")
+        parts.append(f"{_printing_header(card)} — {_format_price_columns(card)}")
 
     cheapest = next(
         (c for c in ordered if _price_for_finish(c, finish) is not None), None)
