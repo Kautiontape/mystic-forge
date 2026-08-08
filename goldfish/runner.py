@@ -24,6 +24,7 @@ imputation).
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 from dataclasses import asdict
 from typing import Any
@@ -366,6 +367,25 @@ _AB_SEQUENCING_CAVEAT = (
 )
 
 
+# Semantically-binary A/B delta metrics (0/1 per game): McNemar display in
+# the tools layer keys off THIS naming, never off mcnemar_p presence (a
+# non-binary metric can be all-0/1 by coincidence). Combo metrics are
+# dynamically named — is_binary_ab_metric covers the pattern.
+AB_BINARY_METRICS: frozenset = frozenset({
+    "commander_cast_by_t4", "commander_cast_by_t5", "commander_cast_by_t6",
+    "kill_by_until_turn", "cmdr21_by_until_turn", "on_curve_through_t5",
+})
+
+_AB_COMBO_BINARY_RE = re.compile(r"combo\d+_(assembled|castable)_by_t6\Z")
+
+
+def is_binary_ab_metric(name: str) -> bool:
+    """True when the named A/B delta metric is semantically binary — a fixed
+    AB_BINARY_METRICS member or a dynamic combo{i}_{assembled,castable}_by_t6
+    scalar."""
+    return name in AB_BINARY_METRICS or _AB_COMBO_BINARY_RE.match(name) is not None
+
+
 def align_decks(deck_a: list, deck_b: list) -> tuple[list, list]:
     """Position-stable A/B alignment (spec §Statistics): shared cards occupy
     identical indices; swapped cards fill the leftover tail slots. Both the
@@ -503,6 +523,7 @@ def run_ab(
     return {
         "n": n,
         "seed": seed,
+        "until_turn": until_turn,
         "deltas": deltas,
         "pair_correlation": _pearson(
             scalars_a["total_damage"], scalars_b["total_damage"]
