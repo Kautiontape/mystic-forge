@@ -11,13 +11,15 @@ configure Archidekt credentials for private deck access.
 
 import re
 import time
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Optional, Dict, Any
 from enum import Enum
 from collections import Counter
 from difflib import SequenceMatcher
 
 import httpx
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 from mcp.server.fastmcp import FastMCP
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -34,6 +36,30 @@ REQUEST_TIMEOUT = 15.0
 # Precon name → slug fuzzy-match gate (Decision D3). Tunable.
 MATCH_THRESHOLD = 0.72   # min difflib ratio to accept a match
 MATCH_MARGIN = 0.08      # min lead over the runner-up to accept without ambiguity
+
+# ── Card finishes ────────────────────────────────────────────────────────────
+# Archidekt's own text export writes the finish as a marker after the collector
+# number and before the category annotation, e.g.
+#   1x Sephiroth, Fabled SOLDIER // Sephiroth, One-Winged Angel (fin) 382 *F* [Commander{top}]
+# Verified against the live site 2026-08-08. Moxfield uses the same markers.
+
+FINISH_MARKERS = {"foil": "*F*", "etched": "*E*"}
+MARKER_FINISHES = {"F": "foil", "E": "etched"}
+
+# Archidekt's deck API reports the finish as a per-card `modifier` field.
+MODIFIER_FINISHES = {"Normal": "nonfoil", "Foil": "foil", "Etched": "etched"}
+
+# Which Scryfall price column corresponds to each finish.
+FINISH_PRICE_KEYS = {"nonfoil": "usd", "foil": "usd_foil", "etched": "usd_etched"}
+
+
+def _finish_marker(finish: Optional[str]) -> str:
+    """Archidekt finish marker for a finish name; '' when there is nothing to mark.
+
+    Inverse of the marker step in _parse_decklist_entries. Shared by
+    format_archidekt and archidekt_export so the two emitters cannot drift.
+    """
+    return FINISH_MARKERS.get(finish or "", "")
 
 # ── Server ───────────────────────────────────────────────────────────────────
 
