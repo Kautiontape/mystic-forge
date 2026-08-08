@@ -95,10 +95,10 @@ cp .env.example .env
 
 Personal MTG price watchlists with ~90 days of MTGJSON daily history.
 Lists are identified by a passphrase (shown once at `watchlist_create`):
-use it in a personal connector URL (`https://kautiontape.com/mtg/mcp/<passphrase>`)
+use it in a personal connector URL (`https://mcp.kautiontape.com/mtg/mcp/<passphrase>`)
 or pass it to tools in chat. Share codes (`SC-…`) grant read-only viewing at
-`https://kautiontape.com/mtg/s/<code>`. Every change is an append-only event —
-see the full chain at `https://kautiontape.com/mtg/w/<passphrase>` and recover
+`https://mcp.kautiontape.com/mtg/s/<code>`. Every change is an append-only event —
+see the full chain at `https://mcp.kautiontape.com/mtg/w/<passphrase>` and recover
 any revision with `watchlist_clone(at_seq=N)` (mints a new passphrase).
 Prices ingest nightly from MTGJSON (tcgplayer/cardkingdom/cardmarket retail).
 Health: `GET /health`.

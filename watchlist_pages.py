@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from html import escape as esc
 
 import watchlist_db
+import watchlist_ingest
 
 EVENTS_PER_PAGE = 15
 CARDS_PER_PAGE = 24
@@ -70,6 +71,7 @@ h1 .rune{color:var(--mauve)}
 #theme{margin-left:auto;font-size:1.2rem}
 .meta{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;color:var(--sub);
   font-size:.85rem;margin-bottom:1.1rem}
+.meta .mright{margin-left:auto;display:flex;gap:.5rem;align-items:center}
 .chip{font-family:var(--font-data);font-size:.75rem;background:var(--mantle);
   border:1px solid var(--surface0);border-radius:999px;padding:.15rem .6rem;
   color:var(--sub);text-decoration:none;display:inline-block}
@@ -104,6 +106,9 @@ button.chip{cursor:pointer}
 .card.hit{border-color:var(--green);background:linear-gradient(var(--hitbg),var(--hitbg)),var(--card);
   box-shadow:0 0 0 1px var(--green),0 0 18px var(--hitglow)}
 .card.hit:hover{box-shadow:0 0 0 1px var(--green),0 8px 26px var(--hitglow)}
+.card.bought{opacity:.72;filter:saturate(.45);border-color:var(--surface1)}
+.card.bought .price{color:var(--sub)}
+.boughtnote{font-size:.75rem;color:var(--lavender);font-family:var(--font-data)}
 @keyframes rise{from{opacity:0;transform:translateY(10px)}}
 .card h3{font-size:1.02rem;font-weight:600;line-height:1.25}
 .badge{font-family:var(--font-data);font-size:.7rem;color:var(--sub);
@@ -168,7 +173,18 @@ table.snap td.num{font-family:var(--font-data)}
 button.act{font-family:inherit;font-size:.88rem;border-radius:.6rem;cursor:pointer;
   padding:.45rem 1rem;border:1px solid var(--surface1);background:var(--mantle);color:var(--text)}
 button.act.primary{background:var(--mauve);border-color:var(--mauve);color:var(--base)}
+button.act.danger{color:var(--red);border-color:var(--red)}
 button.act:hover{filter:brightness(1.08)}
+.xclose{position:absolute;top:.55rem;right:.75rem;background:none;border:none;
+  color:var(--sub);font-size:1.15rem;cursor:pointer;line-height:1;padding:.2rem .4rem;
+  border-radius:.4rem}
+.xclose:hover{background:var(--mantle);color:var(--text)}
+dialog{position:relative}
+.modalend{display:flex;gap:.6rem;margin-top:.9rem;justify-content:flex-end;
+  align-items:center;flex-wrap:wrap}
+#addInput{font-family:var(--font-data);font-size:.85rem;width:100%;margin:.5rem 0;
+  background:var(--mantle);color:var(--text);border:1px solid var(--surface1);
+  border-radius:.45rem;padding:.35rem .5rem}
 .secret{font-family:var(--font-data);background:var(--mantle);border:1px dashed var(--peach);
   border-radius:.5rem;padding:.5rem .7rem;margin:.5rem 0;word-break:break-all}
 footer{margin-top:2.5rem;text-align:center;color:var(--sub);font-size:.75rem}
@@ -192,10 +208,15 @@ themeBtn.onclick=()=>{const h=document.documentElement;
 themeGlyph();
 document.querySelectorAll('[data-copy]').forEach(c=>c.onclick=e=>{
   e.stopPropagation();navigator.clipboard.writeText(c.dataset.copy);
+  if(!c.style.minWidth){c.style.minWidth=c.getBoundingClientRect().width+'px';
+    c.style.textAlign='center'}       // lock width so the row never reflows
   if(!c.dataset.orig)c.dataset.orig=c.textContent;
   c.textContent='copied \\u2713';clearTimeout(c._t);
   c._t=setTimeout(()=>{c.textContent=c.dataset.orig},900);
 });
+const enterClicks=(inputId,btnId)=>{const i=document.getElementById(inputId);
+  if(i)i.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();
+    document.getElementById(btnId).click()}}};
 document.querySelectorAll('dialog').forEach(d=>
   d.addEventListener('click',e=>{if(e.target===d)d.close()}));
 const keyable=el=>{el.setAttribute('tabindex','0');el.setAttribute('role','button');
@@ -212,7 +233,51 @@ if(renameBtn&&renameDlg){
     if(r.ok)location.reload();
     else document.getElementById('renameErr').textContent='could not rename';
   };
+  enterClicks('renameInput','renameSave');
 }
+// ── add a card from a Scryfall link or name ──
+const addBtn=document.getElementById('addCard');
+if(addBtn){
+  const addDlg=document.getElementById('addDlg');
+  addBtn.onclick=()=>{document.getElementById('addPreview').innerHTML='';
+    document.getElementById('addErr').textContent='';
+    document.getElementById('addGo').style.display='none';
+    document.getElementById('addInput').value='';addDlg.showModal();
+    document.getElementById('addInput').focus();};
+  let pending=null;
+  document.getElementById('addLookup').onclick=async()=>{
+    const q=document.getElementById('addInput').value.trim();if(!q)return;
+    document.getElementById('addErr').textContent='';
+    document.getElementById('addPreview').innerHTML='<p class=sub>consulting Scryfall\\u2026</p>';
+    const r=await fetch('/api/resolve',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:KEY,query:q})});
+    if(!r.ok){document.getElementById('addPreview').innerHTML='';
+      document.getElementById('addErr').textContent=(await r.json()).error||'not found';return}
+    pending=await r.json();
+    const printing=pending.set_code?` <span class=badge>${X(pending.set_code.toUpperCase())} #${X(pending.collector_number)}</span>`:'';
+    document.getElementById('addPreview').innerHTML=
+      `<h3>${X(pending.name)}${printing}</h3>`+
+      (pending.usd?`<div class=price>$${(+pending.usd).toFixed(2)}</div>`:'')+
+      (pending.chart||'<p class=nodata>Local history arrives after tonight\\u2019s ingest.</p>')+
+      (pending.sites||'')+
+      `<div class=tgtedit><label>target price ($)</label>`+
+      `<input id=addTarget type=number step=0.01 min=0 placeholder=none></div>`;
+    document.getElementById('addGo').style.display='';
+  };
+  enterClicks('addInput','addLookup');
+  document.getElementById('addGo').onclick=async()=>{
+    const t=document.getElementById('addTarget');
+    const r=await fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:KEY,name:pending.name,set_code:pending.set_code,
+        collector_number:pending.collector_number,
+        target_price:t&&t.value.trim()!==''?+t.value:null})});
+    if(r.ok)location.reload();
+    else document.getElementById('addErr').textContent='could not add';
+  };
+}
+// ── alerts (ntfy) explainer ──
+const alertsBtn=document.getElementById('alerts');
+if(alertsBtn)alertsBtn.onclick=()=>document.getElementById('alertsDlg').showModal();
 // ── claim: start your own list from a shared one ──
 const claimBtn=document.getElementById('claim');
 if(claimBtn)claimBtn.onclick=async()=>{
@@ -243,11 +308,37 @@ if(cardDlg)document.querySelectorAll('.card[data-name]').forEach(card=>{
     if(te){te.dataset.entry=card.dataset.entry;
       document.getElementById('tgtInput').value=card.dataset.target||'';
       document.getElementById('tgtErr').textContent='';}
+    const bb=document.getElementById('boughtBtn'),rb=document.getElementById('removeBtn');
+    if(bb){bb.dataset.entry=card.dataset.entry;
+      bb.textContent=card.dataset.bought?'Not bought after all':'Bought \\u2713';
+      bb.dataset.bought=card.dataset.bought||'';}
+    if(rb){rb.dataset.entry=card.dataset.entry;
+      document.getElementById('rmConfirm').style.display='none';rb.style.display='';}
     const pts=card.dataset.pts?JSON.parse(card.dataset.pts):[];
     if(pts.length)armCrosshair(pts);
     cardDlg.showModal();
   };
 });
+const boughtBtn=document.getElementById('boughtBtn');
+if(boughtBtn)boughtBtn.onclick=async()=>{
+  const r=await fetch('/api/bought',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key:KEY,entry_id:+boughtBtn.dataset.entry,
+                         bought:!boughtBtn.dataset.bought})});
+  if(r.ok)location.reload();
+};
+const removeBtn=document.getElementById('removeBtn');
+if(removeBtn){
+  removeBtn.onclick=()=>{removeBtn.style.display='none';
+    document.getElementById('rmConfirm').style.display='';};
+  document.getElementById('rmNo').onclick=()=>{
+    document.getElementById('rmConfirm').style.display='none';
+    removeBtn.style.display='';};
+  document.getElementById('rmYes').onclick=async()=>{
+    const r=await fetch('/api/remove',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:KEY,entry_id:+removeBtn.dataset.entry})});
+    if(r.ok)location.reload();
+  };
+}
 function armCrosshair(pts){
   const svg=document.querySelector('#chartHost svg');if(!svg)return;
   const tip=document.getElementById('tip');
@@ -286,6 +377,9 @@ if(tgtSave)tgtSave.onclick=async()=>{
   if(r.ok)location.reload();
   else document.getElementById('tgtErr').textContent='could not save target';
 };
+if(tgtSave)enterClicks('tgtInput','tgtSave');
+document.querySelectorAll('dialog .xclose').forEach(b=>
+  b.onclick=()=>b.closest('dialog').close());
 // ── revision modal (history view) ── all interpolated data goes through X()
 const revDlg=document.getElementById('revDlg');
 if(revDlg){
@@ -357,13 +451,22 @@ def _spark_svg(points, name, color="var(--blue)"):
         f'</svg>')
 
 
-def _big_svg(points, name, cur, target=None):
+def _big_svg(points, name, cur, target=None, bought_at=None):
     if len(points) < 2:
         return "<p class=nodata>Not enough history yet.</p>"
     xy, lo, hi = _coords(points, CW, CH, CPAD)
     pl = " ".join(f"{x},{y}" for x, y in xy)
     grid = "".join(f'<line class="gridline" x1="{CPAD}" y1="{y}" x2="{CW - CPAD}" y2="{y}"/>'
                    for y in (CPAD, CH / 2, CH - CPAD))
+    bline = ""
+    if bought_at and points[0][0] <= bought_at <= points[-1][0]:
+        # nearest point index for the purchase date → vertical marker
+        bi = max(i for i, (d, _) in enumerate(points) if d <= bought_at)
+        bx = xy[bi][0]
+        bline = (f'<line x1="{bx}" y1="{CPAD}" x2="{bx}" y2="{CH - CPAD}"'
+                 f' stroke="var(--lavender)" stroke-width="1.5" stroke-dasharray="2 4"/>'
+                 f'<text class="axis" x="{bx + 4}" y="{CPAD + 12}"'
+                 f' fill="var(--lavender)">bought {esc(bought_at)}</text>')
     tline = ""
     if target is not None and lo <= target <= hi:
         rng = (hi - lo) or 1.0
@@ -374,7 +477,7 @@ def _big_svg(points, name, cur, target=None):
                  f' text-anchor="end" fill="var(--peach)">target {cur}{target:.2f}</text>')
     return (
         f'<svg viewBox="0 0 {CW} {CH}" style="width:100%;height:auto;touch-action:none" role="img">'
-        f'<title>{esc(name)} — 90 day price history</title>{grid}{tline}'
+        f'<title>{esc(name)} — 90 day price history</title>{grid}{tline}{bline}'
         f'<text class="axis" x="{CPAD}" y="{CPAD - 6}">{cur}{hi:.2f}</text>'
         f'<text class="axis" x="{CPAD}" y="{CH - CPAD + 14}">{cur}{lo:.2f}</text>'
         f'<text class="axis" x="{CW - CPAD}" y="{CPAD - 6}" text-anchor="end">now {cur}{points[-1][1]:.2f}</text>'
@@ -452,6 +555,7 @@ def _card_html(db, entry, s, hit, idx, shop, cur):
             finish=s.get("finish", "normal"))
         points = series["points"] if series else []
     name = esc(entry["card_name"])
+    bought_at = entry.get("bought_at")
     badge = (f'<span class="badge">{esc(entry["set_code"])} '
              f'#{esc(entry["collector_number"] or "")}</span>'
              if entry.get("set_code") else "")
@@ -465,7 +569,9 @@ def _card_html(db, entry, s, hit, idx, shop, cur):
         price = '<div class="nodata">awaiting first ingest…</div>'
         deltas = ""
     target = ""
-    if entry.get("target_price") is not None:
+    if bought_at:
+        target = f'<div class="boughtnote">✓ bought {esc(bought_at)}</div>'
+    elif entry.get("target_price") is not None:
         usd_hint = " (USD)" if cur != "$" else ""
         if hit:
             target = (f'<div class="target hit">🎯 at target '
@@ -474,18 +580,23 @@ def _card_html(db, entry, s, hit, idx, shop, cur):
             gap = (f' · ${s["current"] - entry["target_price"]:.2f} above'
                    if s and shop == "tcgplayer" else "")
             target = f'<div class="target">target ${entry["target_price"]:.2f}{usd_hint}{gap}</div>'
-    spark = _spark_svg(points, entry["card_name"],
-                       "var(--green)" if hit else "var(--blue)") if points else ""
+    spark_color = ("var(--overlay)" if bought_at
+                   else "var(--green)" if hit else "var(--blue)")
+    spark = _spark_svg(points, entry["card_name"], spark_color) if points else ""
     sub = (f'{entry["set_code"]} #{entry["collector_number"]}'
            if entry.get("set_code") else "cheapest printing") + f" · {shop}"
+    tgt_attr = (f'{entry["target_price"]:.2f}'
+                if entry.get("target_price") is not None else "")
     data = (f' data-name="{name}" data-sub="{esc(sub)}"'
             f' data-entry="{entry["entry_id"]}"'
-            f' data-target="{entry["target_price"] if entry.get("target_price") is not None else ""}"'
+            f' data-target="{tgt_attr}"'
+            f' data-bought="{esc(bought_at) if bought_at else ""}"'
             f' data-sites="{esc(_site_links(entry))}"'
             f' data-pts="{esc(json.dumps(points))}"'
-            f' data-chart="{esc(_big_svg(points, entry["card_name"], cur, entry.get("target_price") if shop == "tcgplayer" else None))}"'
+            f' data-chart="{esc(_big_svg(points, entry["card_name"], cur, entry.get("target_price") if shop == "tcgplayer" and not bought_at else None, bought_at))}"'
             f' data-tail="{esc(_tail_table(points, cur))}"')
-    return (f'<article class="card{" hit" if hit else ""}" '
+    cls = "card bought" if bought_at else ("card hit" if hit else "card")
+    return (f'<article class="{cls}" '
             f'aria-label="{name} details" style="animation-delay:{idx * 45}ms"{data}>'
             f'<h3>{name}{badge}</h3>{note}{price}{deltas}{target}{spark}</article>')
 
@@ -570,18 +681,21 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
     qshop = f"?shop={shop}" if shop != "tcgplayer" else ""
     entries = watchlist_db.current_entries(db, row["id"])
 
-    # tcgplayer basis for hits/verdict (targets are USD); display shop for prices
+    # tcgplayer basis for hits/verdict (targets are USD); display shop for
+    # prices. Bought cards keep their spot in history but leave the math.
     pairs = []
     for e in entries:
         base_s = watchlist_db.entry_price_summary(db, e, provider="tcgplayer")
         disp_s = (base_s if shop == "tcgplayer"
                   else watchlist_db.entry_price_summary(db, e, provider=shop))
-        pairs.append((e, base_s, disp_s, _hit(e, base_s)))
-    pairs.sort(key=lambda t: not t[3])          # buy windows first, stable
+        bought = bool(e.get("bought_at"))
+        pairs.append((e, base_s, disp_s, _hit(e, base_s) and not bought, bought))
+    pairs.sort(key=lambda t: (t[4], not t[3]))  # buy windows first, bought last
 
-    total_val = sum(s["current"] for _, _, s, _ in pairs if s)
-    net7 = sum(s["d7"] for _, _, s, _ in pairs if s and s["d7"] is not None)
-    hits = sum(1 for _, _, _, h in pairs if h)
+    active = [(e, bs, ds, h) for e, bs, ds, h, b in pairs if not b]
+    total_val = sum(s["current"] for _, _, s, _ in active if s)
+    net7 = sum(s["d7"] for _, _, s, _ in active if s and s["d7"] is not None)
+    hits = sum(1 for _, _, _, h in active if h)
     through = db.execute("SELECT MAX(date) FROM prices WHERE provider=?",
                          (shop,)).fetchone()[0]
     last_ingest = db.execute(
@@ -590,8 +704,8 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
 
     page = pairs[(cp - 1) * CARDS_PER_PAGE: cp * CARDS_PER_PAGE]
     cards = "".join(_card_html(db, e, disp_s, h, i, shop, cur)
-                    for i, (e, _, disp_s, h) in enumerate(page)) or \
-        '<p class="nodata">Nothing watched yet — ask Claude to <code>watchlist_add</code> a card.</p>'
+                    for i, (e, _, disp_s, h, _b) in enumerate(page)) or \
+        '<p class="nodata">Nothing watched yet — use “+ add card” or ask Claude.</p>'
 
     shop_links = "".join(
         f'<a href="{base}?shop={s}" class="{"on" if s == shop else ""}">{s}</a>'
@@ -606,38 +720,69 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer") -
                   'is historical.</p>' if row["superseded_by"] else "")
 
     tgt_edit = ""
+    modal_actions = ""
     if editable:
         tgt_edit = ('<div class="tgtedit" id="tgtEdit"><label for="tgtInput">'
                     'target price ($)</label><input id="tgtInput" type="number" '
                     'step="0.01" min="0" placeholder="none">'
                     '<button class="act" id="tgtSave">Save</button>'
                     '<span class="err" id="tgtErr"></span></div>')
-    dialogs = (f'<dialog id="cardDlg"><h3 id="cardTitle"></h3><p class="sub" id="cardSub"></p>'
+        modal_actions = (
+            '<div class="modalend">'
+            '<button class="act" id="boughtBtn">Bought ✓</button>'
+            '<button class="act danger" id="removeBtn">Remove</button>'
+            '<span id="rmConfirm" style="display:none">Really remove? '
+            '<button class="act danger" id="rmYes">Yes, remove</button> '
+            '<button class="act" id="rmNo">Keep</button></span></div>')
+    xbtn = '<button class="xclose" aria-label="Close">×</button>'
+    dialogs = (f'<dialog id="cardDlg">{xbtn}<h3 id="cardTitle"></h3><p class="sub" id="cardSub"></p>'
                f'<div class="chart-wrap"><div id="chartHost"></div><div class="tip" id="tip"></div></div>'
                f'<div id="siteHost"></div>{tgt_edit}<div id="snapHost"></div>'
-               f'<div class="btnrow"><button class="act close">Close</button></div></dialog>')
+               f'{modal_actions}</dialog>')
+    topic = watchlist_ingest.ntfy_topic(row["share_code"])
+    dialogs += (f'<dialog id="alertsDlg">{xbtn}<h3>Buy-window alerts</h3>'
+                f'<p class="sub">When a card first drops to its target, this list '
+                f'pings a push topic after the nightly price update.</p>'
+                f'<p>Install the free <a href="https://ntfy.sh" target="_blank" '
+                f'rel="noopener">ntfy</a> app and subscribe to '
+                f'<button class="chip" data-copy="{esc(topic)}">{esc(topic)} ⧉</button>'
+                f'<br>or watch it in a browser: '
+                f'<a href="{esc(watchlist_ingest.NTFY_BASE)}/{esc(topic)}" '
+                f'target="_blank" rel="noopener">{esc(watchlist_ingest.NTFY_BASE)}/{esc(topic)}</a></p>'
+                f'</dialog>')
     if editable:
-        dialogs += ('<dialog id="renameDlg"><h3>Rename list</h3>'
+        dialogs += (f'<dialog id="renameDlg">{xbtn}<h3>Rename list</h3>'
                     '<input id="renameInput" maxlength="80">'
                     '<span class="err" id="renameErr"></span>'
                     '<div class="btnrow"><button class="act primary" id="renameSave">Save</button>'
                     '<button class="act close">Cancel</button></div></dialog>')
+        dialogs += (f'<dialog id="addDlg">{xbtn}<h3>Add a card</h3>'
+                    '<p class="sub">Paste a Scryfall link to pin that exact printing, '
+                    'or type a card name to track its cheapest printing.</p>'
+                    '<input id="addInput" placeholder="https://scryfall.com/card/c21/263/sol-ring — or just: Sol Ring">'
+                    '<span class="err" id="addErr"></span>'
+                    '<div id="addPreview"></div>'
+                    '<div class="btnrow"><button class="act" id="addLookup">Preview</button>'
+                    '<button class="act primary" id="addGo" style="display:none">Add to watchlist</button></div>'
+                    '</dialog>')
     else:
-        dialogs += ('<dialog id="claimDlg"><h3>Your own watchlist</h3>'
-                    '<div id="claimOut"></div>'
-                    '<div class="btnrow"><button class="act close">Close</button></div></dialog>')
+        dialogs += (f'<dialog id="claimDlg">{xbtn}<h3>Your own watchlist</h3>'
+                    '<div id="claimOut"></div></dialog>')
 
+    add_chip = ('<button class="chip" id="addCard">+ add card</button>'
+                if editable else "")
     freshness = (f'<span title="last ingest: {esc(last_ingest)}">prices through '
                  f'{esc(through)}</span>' if through
                  else '<span>no price data yet — first ingest tonight</span>')
     body = f"""
-<div class="meta">{share}{claim}
-<a class="chip" href="{base}/history{qshop}" title="Every change ever made to this list — inspect or restore any point">⟲ history</a>
+<div class="meta">{share}{add_chip}{claim}
 <span class="shops">{shop_links}</span>
 <span title="These are buy prices — falling (▼, green) is good news">▼ = getting cheaper</span>
-{freshness}</div>
+{freshness}
+<span class="mright"><button class="chip" id="alerts">🔔 alerts</button>
+<a class="chip" href="{base}/history{qshop}" title="Every change ever made to this list — inspect or restore any point">history</a></span></div>
 {superseded}
-{_verdict([(e, bs, h) for e, bs, _, h in pairs])}
+{_verdict([(e, bs, h) for e, bs, _, h, b in pairs if not b])}
 <div class="stats">
 <div class="stat"><b>{hits}</b><span>buy windows</span></div>
 <div class="stat"><b>{"▼" if net7 < 0 else "▲" if net7 > 0 else "·"}{cur}{abs(net7):.2f}</b><span>7-day net</span></div>
@@ -655,6 +800,8 @@ _ACTION_LABELS = {"create": ("forged", "var(--mauve)"),
                   "set_target": ("target set", "var(--yellow)"),
                   "set_note": ("note set", "var(--yellow)"),
                   "set_label": ("renamed", "var(--yellow)"),
+                  "bought": ("bought", "var(--lavender)"),
+                  "unbought": ("unbought", "var(--yellow)"),
                   "clone_init": ("cloned from", "var(--mauve)")}
 
 

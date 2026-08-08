@@ -318,6 +318,122 @@ def test_cards_are_keyboard_accessible(db_path):
     assert "keyable(card)" in page and ":focus-visible" in page
 
 
+def _seeded_list(db_path, **card_kwargs):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, sc = watchlist_db.create_list(db)
+    seq, _ = watchlist_db.add_card(db, list_id, "Sol Ring", **card_kwargs)
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Sol Ring','u1')")
+    watchlist_db.upsert_price(db, "u1", "2026-08-08", "tcgplayer", "normal", 7.0)
+    db.close()
+    return list_id, pp, sc, seq
+
+
+def test_api_bought_mutes_card_and_leaves_math(db_path):
+    list_id, pp, sc, seq = _seeded_list(db_path, target_price=10.0)
+    with client() as c:
+        r = c.post("/api/bought", json={"key": pp, "entry_id": seq})
+        assert r.status_code == 200 and r.json()["bought_at"]
+        assert c.post("/api/bought",
+                      json={"key": sc, "entry_id": seq}).status_code == 403
+        page = c.get(f"/w/{pp}").text
+    assert 'class="card bought"' in page
+    assert "✓ bought" in page
+    assert "<b>0</b><span>buy windows</span>" in page   # bought leaves the math
+    assert 'class="verdict"' not in page or "BUY" not in page
+    with client() as c:                                  # and it's reversible
+        c.post("/api/bought", json={"key": pp, "entry_id": seq, "bought": False})
+        page = c.get(f"/w/{pp}").text
+    assert 'class="card hit"' in page
+
+
+def test_bought_replay_and_history(db_path):
+    list_id, pp, sc, seq = _seeded_list(db_path)
+    db = watchlist_db.connect(db_path)
+    watchlist_db.set_bought(db, list_id, seq)
+    replayed = watchlist_db.replay_state(db, list_id)
+    assert replayed[seq]["bought_at"] is not None
+    db.close()
+    with client() as c:
+        hist = c.get(f"/w/{pp}/history").text
+    assert ">bought</span>" in hist or "bought</span>" in hist
+
+
+def test_bought_sorts_last(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    s1, _ = watchlist_db.add_card(db, list_id, "Bought One")
+    watchlist_db.add_card(db, list_id, "Active One")
+    watchlist_db.set_bought(db, list_id, s1)
+    db.close()
+    with client() as c:
+        page = c.get(f"/w/{pp}").text
+    assert page.index("Active One") < page.index("Bought One")
+
+
+def test_api_remove_from_page(db_path):
+    list_id, pp, sc, seq = _seeded_list(db_path)
+    with client() as c:
+        assert c.post("/api/remove",
+                      json={"key": sc, "entry_id": seq}).status_code == 403
+        r = c.post("/api/remove", json={"key": pp, "entry_id": seq})
+        assert r.status_code == 200 and r.json()["removed"] == "Sol Ring"
+        assert c.post("/api/remove",
+                      json={"key": pp, "entry_id": 999}).status_code == 404
+
+
+def test_api_resolve_and_add_flow(db_path, monkeypatch):
+    import server as srv
+
+    async def fake_scryfall(endpoint, params=None):
+        import httpx
+        if endpoint == "/cards/c21/263":
+            return {"name": "Sol Ring", "set": "c21", "collector_number": "263",
+                    "prices": {"usd": "2.50"}}
+        if endpoint == "/cards/named":
+            return {"name": "Rhystic Study", "prices": {"usd": "40.00"}}
+        req = httpx.Request("GET", "x://x")
+        raise httpx.HTTPStatusError("404", request=req,
+                                    response=httpx.Response(404, request=req))
+    monkeypatch.setattr(srv, "_scryfall_get", fake_scryfall)
+
+    db = watchlist_db.connect(db_path)
+    list_id, pp, sc = watchlist_db.create_list(db)
+    db.close()
+    with client() as c:
+        r = c.post("/api/resolve", json={
+            "key": pp, "query": "https://scryfall.com/card/c21/263/sol-ring"})
+        assert r.status_code == 200
+        d = r.json()
+        assert d["name"] == "Sol Ring" and d["set_code"] == "C21"
+        assert "scryfall.com" in d["sites"]
+        r = c.post("/api/resolve", json={"key": pp, "query": "rhystic stud"})
+        assert r.json()["name"] == "Rhystic Study"
+        r = c.post("/api/add", json={"key": pp, "name": "Sol Ring",
+                                     "set_code": "C21",
+                                     "collector_number": "263",
+                                     "target_price": 2.0})
+        assert r.status_code == 200
+        assert c.post("/api/add", json={"key": sc, "name": "X"}).status_code == 403
+    db = watchlist_db.connect(db_path)
+    entries = watchlist_db.current_entries(db, list_id)
+    db.close()
+    assert entries[0]["set_code"] == "C21" and entries[0]["target_price"] == 2.0
+
+
+def test_board_ui_affordances(db_path):
+    list_id, pp, sc, seq = _seeded_list(db_path, target_price=2.5)
+    with client() as c:
+        own = c.get(f"/w/{pp}").text
+        share = c.get(f"/s/{sc}").text
+    assert 'id="addCard"' in own and 'id="addCard"' not in share
+    assert 'id="boughtBtn"' in own and 'id="boughtBtn"' not in share
+    assert 'id="removeBtn"' in own and "Really remove?" in own
+    assert own.count('class="xclose"') >= 3          # × on every dialog
+    assert 'data-target="2.50"' in own               # two-decimal target
+    assert 'id="alerts"' in own and "mystic-forge-sc-" in own.lower()
+    assert 'class="mright"' in own                   # history demoted to right
+
+
 def test_card_modal_payload_has_site_links(db_path):
     db = watchlist_db.connect(db_path)
     list_id, pp, _ = watchlist_db.create_list(db)

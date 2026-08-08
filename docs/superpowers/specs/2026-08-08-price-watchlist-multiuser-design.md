@@ -47,7 +47,7 @@ There is no user table and no auth system. The unit of identity is the
   committed to the repo as `watchlist_words.txt`) + a 2-digit number
   (e.g. `crimson-otter-codex-dome-42`), ≈ 48 bits. Human-typeable because it
   doubles as a chat credential. Shown once at mint time; stored as SHA-256 hash.
-- **Transport 1 — personal connector URL:** `https://kautiontape.com/mtg/mcp/<passphrase>`
+- **Transport 1 — personal connector URL:** `https://mcp.kautiontape.com/mtg/mcp/<passphrase>`
   (the shared Caddy in the parent `mcp-servers` repo strips `/mtg` before
   proxying to this server, so the server itself sees `/mcp/<passphrase>`).
   ASGI middleware peels the passphrase off the path, resolves the list into
@@ -171,9 +171,9 @@ Served via FastMCP `custom_route` alongside the MCP mount:
 - `GET /w/<passphrase>` — full view: label, stat tiles, card grid with 90-day
   sparklines (click a card for a crosshair detail chart), and a paginated
   revision rail; revision modal shows the snapshot with Fork / Restore.
-  Public URL: `https://kautiontape.com/mtg/w/<passphrase>`.
+  Public URL: `https://mcp.kautiontape.com/mtg/w/<passphrase>`.
 - `GET /s/<share_code>` — same page, read-only framing, no passphrase shown,
-  fork allowed but no restore. Public URL: `https://kautiontape.com/mtg/s/<code>`.
+  fork allowed but no restore. Public URL: `https://mcp.kautiontape.com/mtg/s/<code>`.
 - Catppuccin Latte/Macchiato themes (prefers-color-scheme + toggle), inline
   CSS/JS only — no external assets.
 - `GET /api/revision/<key>/<seq>` (snapshot JSON) and `POST /api/fork`
@@ -199,7 +199,7 @@ Idempotent (PK upsert). Log to stdout; docker captures it.
 
 Mystic Forge deploys as one service of the parent `mcp-servers` repo
 (`/opt/services/mcp-servers` on the ktn box, this repo as a git submodule),
-behind a shared Caddy that routes `kautiontape.com/mtg/mcp*` to it with the
+behind a shared Caddy that routes `mcp.kautiontape.com/mtg/mcp*` to it with the
 `/mtg` prefix stripped. CI: parent-repo pushes build GHCR images and
 `docker compose up -d` via a self-hosted runner; pushes to this submodule's
 main trigger an on-box `compose build mystic-forge && up -d mystic-forge`.
@@ -227,7 +227,7 @@ the pattern:
   container orchestration doesn't restart-loop a healthy server.
 - `docker-compose` healthcheck (python urllib probe, no curl in slim image)
   in both parent and dev compose files.
-- `https://kautiontape.com/mtg/health` is the surface for any future external
+- `https://mcp.kautiontape.com/mtg/health` is the surface for any future external
   uptime monitor (none exists yet; nothing to wire beyond exposing it).
 
 ## Acceptance criteria

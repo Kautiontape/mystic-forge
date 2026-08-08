@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+import urllib.parse
 from contextvars import ContextVar
 from typing import Optional, Dict, Any
 from enum import Enum
@@ -87,7 +88,7 @@ _current_list: ContextVar[Optional[int]] = ContextVar("_current_list", default=N
 _PP_RE = re.compile(r"^/mcp/(?P<pp>[a-z0-9][a-z0-9-]{6,})/?$")
 
 PUBLIC_BASE = os.environ.get("MYSTIC_FORGE_PUBLIC_BASE",
-                             "https://kautiontape.com/mtg")
+                             "https://mcp.kautiontape.com/mtg")
 
 
 class PassphraseMiddleware:
@@ -2949,6 +2950,145 @@ async def api_target(request: Request):
             return JSONResponse({"error": str(e)}, status_code=404)
         return JSONResponse({"entry_id": entry["entry_id"],
                              "target_price": entry["target_price"]})
+    finally:
+        db.close()
+
+
+_SCRYFALL_URL_RE = re.compile(
+    r"scryfall\.com/card/(?P<set>[a-z0-9]+)/(?P<cn>[^/?#]+)", re.I)
+
+
+@mcp.custom_route("/api/resolve", methods=["POST"])
+async def api_resolve(request: Request):
+    """Preview a card for the page's add flow: Scryfall URL → that printing;
+    plain text → fuzzy name. Returns display data + local history if any."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, _ = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        query = str(body.get("query", "")).strip()
+        if not query:
+            return JSONResponse({"error": "empty query"}, status_code=400)
+        m = _SCRYFALL_URL_RE.search(query)
+        try:
+            if m:
+                card = await _scryfall_get(
+                    f"/cards/{m['set'].lower()}/{urllib.parse.quote(m['cn'])}")
+            else:
+                card = await _scryfall_get("/cards/named", {"fuzzy": query})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return JSONResponse({"error": "Scryfall doesn't know that one — "
+                                     "check the link or spelling"},
+                                    status_code=404)
+            return JSONResponse({"error": "Scryfall is unreachable"},
+                                status_code=502)
+        except Exception:
+            return JSONResponse({"error": "Scryfall is unreachable"},
+                                status_code=502)
+        name = card.get("name", query)
+        set_code = card.get("set", "").upper() if m else None
+        cn = card.get("collector_number") if m else None
+        entry = {"card_name": name, "set_code": set_code,
+                 "collector_number": cn, "uuid": None}
+        series = watchlist_db.price_series(
+            db, watchlist_db.uuids_for_entry(db, entry), days=90)
+        points = series["points"] if series else []
+        return JSONResponse({
+            "name": name, "set_code": set_code, "collector_number": cn,
+            "usd": (card.get("prices") or {}).get("usd"),
+            "chart": watchlist_pages._big_svg(points, name, "$") if points else "",
+            "sites": watchlist_pages._site_links(entry),
+        })
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/add", methods=["POST"])
+async def api_add(request: Request):
+    """Add a card from the page. Passphrase key only; the /api/resolve step
+    already validated the printing against Scryfall."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return JSONResponse({"error": "missing name"}, status_code=400)
+        tp = body.get("target_price")
+        if tp is not None and (not isinstance(tp, (int, float)) or tp < 0):
+            return JSONResponse({"error": "bad target_price"}, status_code=400)
+        _, entry = watchlist_db.add_card(
+            db, row["id"], name,
+            set_code=body.get("set_code") or None,
+            collector_number=body.get("collector_number") or None,
+            target_price=tp)
+        return JSONResponse({"entry_id": entry["entry_id"]})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/remove", methods=["POST"])
+async def api_remove(request: Request):
+    """Remove an entry from the page (the UI confirms first). Passphrase only."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        try:
+            removed = watchlist_db.remove_entry(
+                db, row["id"], entry_id=int(body.get("entry_id", -1)))
+        except watchlist_db.NotFound as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        return JSONResponse({"removed": removed["card_name"]})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/bought", methods=["POST"])
+async def api_bought(request: Request):
+    """Mark an entry bought (kept, muted, annotated) or un-mark it."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        try:
+            entry = watchlist_db.set_bought(
+                db, row["id"], int(body.get("entry_id", -1)),
+                bought=bool(body.get("bought", True)))
+        except watchlist_db.NotFound as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        return JSONResponse({"entry_id": entry["entry_id"],
+                             "bought_at": entry["bought_at"]})
     finally:
         db.close()
 

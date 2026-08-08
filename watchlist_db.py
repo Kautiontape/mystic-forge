@@ -78,6 +78,9 @@ def connect(path: str | None = None) -> sqlite3.Connection:
 
 def init_db(db: sqlite3.Connection) -> None:
     db.executescript(SCHEMA)
+    cols = [r[1] for r in db.execute("PRAGMA table_info(watchlist_current)")]
+    if "bought_at" not in cols:  # migration for pre-"bought" databases
+        db.execute("ALTER TABLE watchlist_current ADD COLUMN bought_at TEXT")
     db.commit()
 
 
@@ -249,7 +252,11 @@ def state_at(db, list_id: int, seq: int | None = None) -> dict[int, dict]:
             entries[payload["entry_id"]]["target_price"] = payload["target_price"]
         elif ev["action"] == "set_note":
             entries[payload["entry_id"]]["note"] = payload["note"]
-        # create / clone_init carry no state
+        elif ev["action"] == "bought":
+            entries[payload["entry_id"]]["bought_at"] = payload["date"]
+        elif ev["action"] == "unbought":
+            entries[payload["entry_id"]]["bought_at"] = None
+        # create / clone_init / set_label carry no entry state
     return entries
 
 
@@ -414,6 +421,27 @@ def set_entry_target(db, list_id: int, entry_id: int, target_price):
                   "target_price": target_price})
     db.execute("UPDATE watchlist_current SET target_price=?"
                " WHERE list_id=? AND entry_id=?", (target_price, list_id, entry_id))
+    db.commit()
+    return dict(_find_entry(db, list_id, entry_id=entry_id))
+
+
+def set_bought(db, list_id: int, entry_id: int, bought: bool = True) -> dict:
+    """Mark an entry bought (kept, muted, chart-annotated) or un-mark it."""
+    row = _find_entry(db, list_id, entry_id=entry_id)
+    if row is None:
+        raise NotFound(f"No entry #{entry_id}")
+    if bought:
+        date = _now()[:10]
+        append_event(db, list_id, "bought",
+                     {"entry_id": entry_id, "card_name": row["card_name"],
+                      "date": date})
+        db.execute("UPDATE watchlist_current SET bought_at=?"
+                   " WHERE list_id=? AND entry_id=?", (date, list_id, entry_id))
+    else:
+        append_event(db, list_id, "unbought",
+                     {"entry_id": entry_id, "card_name": row["card_name"]})
+        db.execute("UPDATE watchlist_current SET bought_at=NULL"
+                   " WHERE list_id=? AND entry_id=?", (list_id, entry_id))
     db.commit()
     return dict(_find_entry(db, list_id, entry_id=entry_id))
 

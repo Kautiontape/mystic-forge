@@ -5,6 +5,7 @@ AllPrices/AllPricesToday are stream-parsed with ijson — the whole file is
 never decoded into memory (spec acceptance criterion)."""
 
 import gzip
+import json
 import logging
 import os
 import sqlite3
@@ -20,6 +21,52 @@ log = logging.getLogger("mystic_forge.ingest")
 
 MTGJSON = "https://mtgjson.com/api/v5"
 PROVIDERS = ("tcgplayer", "cardkingdom", "cardmarket")
+NTFY_BASE = os.environ.get("MYSTIC_FORGE_NTFY", "https://ntfy.sh")
+
+
+def ntfy_topic(share_code: str) -> str:
+    """Push topic per list. Derived from the share code — subscribing reveals
+    only what the share code already grants (read access to buy windows)."""
+    return f"mystic-forge-{share_code.lower()}"
+
+
+def notify_hits(db) -> int:
+    """ntfy push for cards that newly entered their buy window.
+
+    State lives in meta (notified:<list_id>) so a hit is announced once, not
+    nightly forever. Returns number of messages posted."""
+    if os.environ.get("MYSTIC_FORGE_NTFY_OFF"):
+        return 0
+    sent = 0
+    for lst in db.execute("SELECT * FROM lists WHERE superseded_by IS NULL"):
+        # State tracks every entry at/below target — bought ones included, so
+        # un-marking a purchase doesn't re-announce an old buy window.
+        hits = []
+        for e in watchlist_db.current_entries(db, lst["id"]):
+            if e.get("target_price") is None:
+                continue
+            s = watchlist_db.entry_price_summary(db, e)
+            if s and s["current"] <= e["target_price"]:
+                hits.append((e["entry_id"], e["card_name"], s["current"],
+                             e["target_price"], bool(e.get("bought_at"))))
+        key = f"notified:{lst['id']}"
+        prev = set(json.loads(_get_meta(db, key) or "[]"))
+        fresh = [h for h in hits if h[0] not in prev and not h[4]]
+        if fresh:
+            body = " · ".join(f"{n} ${c:.2f} (target ${t:.2f})"
+                              for _, n, c, t, _b in fresh)
+            try:
+                httpx.post(
+                    f"{NTFY_BASE}/{ntfy_topic(lst['share_code'])}",
+                    content=f"Buy window: {body}",
+                    headers={"Title": lst["label"] or "Mystic Forge watchlist",
+                             "Tags": "dart"},
+                    timeout=10.0)
+                sent += 1
+            except Exception:
+                log.exception("ntfy push failed for list %s", lst["id"])
+        _set_meta(db, key, json.dumps([h[0] for h in hits]))
+    return sent
 
 
 def _data_dir() -> str:
@@ -161,5 +208,6 @@ def run_ingest(db_path: str, data_dir: str | None = None) -> None:
         n = ingest_prices_file(db, p)
         log.info("daily: %d rows", n)
         _set_meta(db, "last_ingest", date.today().isoformat())
+        notify_hits(db)
     finally:
         db.close()

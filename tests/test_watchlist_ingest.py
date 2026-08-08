@@ -97,6 +97,40 @@ def test_streaming_never_loads_whole_file(db, tmp_path):
     assert peak < 20 * 1024 * 1024      # far below the ~15MB decoded JSON
 
 
+def test_notify_hits_pushes_once_per_new_hit(db, monkeypatch):
+    posts = []
+    monkeypatch.setattr(watchlist_ingest.httpx, "post",
+                        lambda url, **kw: posts.append((url, kw)))
+    list_id, _, sc = watchlist_db.create_list(db, label="Alerts")
+    seq, _ = watchlist_db.add_card(db, list_id, "Sol Ring", target_price=10.0)
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Sol Ring','u1')")
+    watchlist_db.upsert_price(db, "u1", "2026-08-08", "tcgplayer", "normal", 7.0)
+
+    assert watchlist_ingest.notify_hits(db) == 1
+    url, kw = posts[0]
+    assert watchlist_ingest.ntfy_topic(sc) in url
+    assert "Sol Ring $7.00" in kw["content"]
+    assert kw["headers"]["Title"] == "Alerts"
+
+    assert watchlist_ingest.notify_hits(db) == 0     # same hit: no re-ping
+    watchlist_db.set_bought(db, list_id, seq)
+    assert watchlist_ingest.notify_hits(db) == 0     # bought never pings
+    watchlist_db.set_bought(db, list_id, seq, bought=False)
+    assert watchlist_ingest.notify_hits(db) == 0     # still not NEW
+
+
+def test_notify_hits_respects_off_switch(db, monkeypatch):
+    monkeypatch.setenv("MYSTIC_FORGE_NTFY_OFF", "1")
+    posts = []
+    monkeypatch.setattr(watchlist_ingest.httpx, "post",
+                        lambda url, **kw: posts.append(url))
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring", target_price=10.0)
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Sol Ring','u1')")
+    watchlist_db.upsert_price(db, "u1", "2026-08-08", "tcgplayer", "normal", 7.0)
+    assert watchlist_ingest.notify_hits(db) == 0 and posts == []
+
+
 def test_run_ingest_records_last_ingest(db, db_path, tmp_path, monkeypatch):
     ap = make_allprintings(tmp_path)
     gz_all = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
