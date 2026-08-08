@@ -266,6 +266,63 @@ def _parse_static(card, raw) -> Static:
     return s
 
 
+@dataclass(frozen=True)
+class CardData:
+    name: str
+    cost: Cost | None
+    types: frozenset          # lowercase: land creature artifact equipment enchantment
+                              # instant sorcery planeswalker commander legendary
+    power: int | None
+    toughness: int | None
+    keywords: frozenset       # lowercase: haste flying ...
+    produces: dict | None     # {"W": 1} / {"C": 2}; None = not a producer
+    enters_tapped: bool
+    equip_cost: Cost | None
+    oracle: str
+
+
+@dataclass
+class SimCard:
+    data: CardData
+    ann: Annotation | None
+    scope_class: str | None       # D9 class, or None
+
+    @property
+    def name(self): return self.data.name
+    @property
+    def mv(self): return self.data.cost.mv if self.data.cost else 0
+    @property
+    def is_land(self): return "land" in self.data.types
+    @property
+    def is_creature(self): return "creature" in self.data.types
+    @property
+    def is_equipment(self): return "equipment" in self.data.types
+    @property
+    def is_artifact(self): return "artifact" in self.data.types
+    @property
+    def inert_reason(self):
+        """Scope class when the card has no effect model. Annotation overrides."""
+        if self.ann is not None and not self.ann.inert:
+            return None
+        if self.ann is not None and self.ann.inert:
+            return "annotated_inert"
+        return self.scope_class
+
+    def triggers_for(self, event: str):
+        if self.ann is None or self.inert_reason:
+            return []
+        return [t for t in self.ann.triggers if t.on == event]
+
+    def statics(self):
+        if self.ann is None or self.inert_reason:
+            return []
+        return self.ann.statics
+
+
+def merge_card(data: CardData, ann: Annotation | None, scope_class: str | None) -> SimCard:
+    return SimCard(data=data, ann=ann, scope_class=scope_class)
+
+
 def validate_annotations(raw_list: list) -> dict:
     """[dict, ...] -> {card_name: Annotation}. Raises AnnotationError."""
     out = {}

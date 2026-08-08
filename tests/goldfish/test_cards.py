@@ -1,11 +1,23 @@
 import pytest
 
 from goldfish.cards import (
+    Annotation,
     AnnotationError,
+    CardData,
     CostParseError,
+    SimCard,
+    merge_card,
     parse_cost,
     validate_annotations,
 )
+
+
+def make_data(name, **kw):
+    base = {"name": name, "cost": None, "types": frozenset(), "power": None,
+            "toughness": None, "keywords": frozenset(), "produces": None,
+            "enters_tapped": False, "equip_cost": None, "oracle": ""}
+    base.update(kw)
+    return CardData(**base)
 
 
 def test_parse_simple_cost():
@@ -218,3 +230,20 @@ def test_activated_bad_cost_reraised_as_annotation_error():
             {"cost": "{X}", "do": "extra_combat"}]}])
     msg = str(ei.value)
     assert "Krenko, Mob Boss" in msg
+
+
+# -- CardData / SimCard merge -------------------------------------------------
+
+def test_land_card():
+    c = SimCard(data=make_data("Plains", types=frozenset({"land"}),
+                               produces={"W": 1}), ann=None, scope_class=None)
+    assert c.is_land and not c.is_creature and c.mv == 0
+
+
+def test_merge_annotation_and_scope():
+    data = make_data("Cait Sith", cost=parse_cost("{1}{W}"),
+                     types=frozenset({"creature"}), power=2, toughness=2)
+    c = merge_card(data, ann=None, scope_class="unmodeled_other")
+    assert c.inert_reason == "unmodeled_other"
+    c2 = merge_card(data, ann=Annotation(name="Cait Sith"), scope_class="unmodeled_other")
+    assert c2.inert_reason is None   # explicit annotation overrides the scope class
