@@ -120,9 +120,11 @@ tool descriptions even when server instructions are truncated.
 
 ## Error handling
 
-- Scryfall HTTP failures → existing `_scryfall_error` strings. A chunk
-  failure fails the whole call with that message (matches
-  `scryfall_price_list` behavior).
+- Scryfall HTTP failures → existing `_scryfall_error` strings. A failed
+  chunk keeps the other chunks' results; its identifiers are reported in an
+  explicit "could not be checked" section, never as "not found" (matches
+  `scryfall_price_list` behavior). Only when every chunk fails does the call
+  return the error alone.
 - Archidekt failures → existing `_archidekt_error` (unchanged path).
 - Empty parse (no valid lines) → explicit "No card names found in input."
 
