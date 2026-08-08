@@ -101,6 +101,10 @@ button.chip:hover{border-color:var(--overlay)}
   color:var(--sub);text-align:center;margin-bottom:.6rem}
 .sortbar{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;
   margin:-.5rem 0 .9rem}
+.filterbox{font-family:var(--font-ui);font-size:.85rem;background:var(--mantle);
+  color:var(--text);border:1px solid var(--surface0);border-radius:.45rem;
+  padding:.3rem .55rem;width:11rem}
+.filterbox:focus{outline:2px solid var(--lavender);outline-offset:1px}
 .shops{display:inline-flex;gap:.1rem}           /* view tabs, not buttons */
 .shops a{font-family:var(--font-ui);font-size:.82rem;padding:.3rem .55rem;
   color:var(--sub);text-decoration:none;border-bottom:2px solid transparent}
@@ -170,10 +174,15 @@ dialog h3{font-family:var(--font-display)}
 .rev .dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;margin-right:.3rem}
 .rev .d{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rev .t{color:var(--sub);font-size:.72rem;white-space:nowrap}
-.pager{display:flex;justify-content:center;gap:.8rem;margin-top:.7rem;
-  font-family:var(--font-data);font-size:.8rem}
-.pager a{color:var(--blue);text-decoration:none;padding:.3rem .5rem}
-.pager span{color:var(--sub)}
+.pager{display:flex;justify-content:center;align-items:center;gap:.35rem;
+  margin-top:1rem;font-family:var(--font-ui);font-size:.85rem;flex-wrap:wrap}
+.pnum{padding:.4rem .75rem;border-radius:.45rem;color:var(--text);
+  text-decoration:none;border:1px solid var(--surface0);background:var(--mantle)}
+a.pnum:hover{border-color:var(--lavender)}
+.pnum.cur{background:var(--mauve);border-color:var(--mauve);color:var(--base);
+  font-weight:600}
+.pnum.dis{opacity:.4;border-color:transparent;background:none}
+.gap{padding:.4rem .15rem;color:var(--sub)}
 dialog{border:1px solid var(--surface1);border-radius:1rem;background:var(--base);
   color:var(--text);max-width:44rem;width:92vw;padding:1.3rem;margin:auto;
   max-height:90vh;overflow:auto;box-shadow:0 20px 60px var(--shadow)}
@@ -195,6 +204,7 @@ dialog .sub{color:var(--sub);font-size:.8rem;margin-bottom:.8rem}
   background:var(--mantle);color:var(--text);border:1px solid var(--surface1);
   border-radius:.45rem;padding:.3rem .5rem}
 .tgtedit input{width:6.5rem}
+#noteInput{width:14rem;flex:1 1 10rem}
 #renameInput{width:100%;margin:.5rem 0}
 .err{color:var(--red);font-family:var(--font-data);font-size:.75rem}
 table.snap{width:100%;border-collapse:collapse;font-size:.84rem;margin:.5rem 0}
@@ -237,13 +247,13 @@ footer a{color:var(--sub)}
   .shops{display:flex;flex:1}
   .shops a{flex:1;text-align:center;justify-content:center}
   /* 44px-rule tap targets: height, not font inflation */
-  .chip,.shops a,.pager a,.textlink{min-height:2.75rem;display:inline-flex;align-items:center}
+  .chip,.shops a,.pnum,.textlink{min-height:2.75rem;display:inline-flex;align-items:center}
   .shops a{display:flex}
   button.act{min-height:2.75rem;padding:.65rem 1.1rem}
   .xclose{padding:.6rem .8rem}
   .rev{padding:.75rem .3rem;flex-wrap:wrap}
   .rev .d{flex:1 1 100%;white-space:normal;order:9;padding-left:1.15rem}
-  .pager a{padding:.6rem .8rem}
+  .filterbox{width:100%;font-size:1rem;padding:.5rem .6rem}
   .stats{grid-template-columns:repeat(2,1fr);gap:.6rem}
   .stat{padding:.55rem .7rem}
   .stat b{font-size:1.1rem}
@@ -339,6 +349,22 @@ function wire(){
     document.querySelectorAll('.card[data-name]').forEach(wireCard);
   if(document.getElementById('revDlg'))
     document.querySelectorAll('.rev').forEach(wireRev);
+  const fl=document.getElementById('filter');
+  if(fl){
+    fl.oninput=()=>{clearTimeout(fl._t);fl._t=setTimeout(()=>{
+      const u=new URL(location.href);
+      if(fl.value.trim())u.searchParams.set('q',fl.value.trim());
+      else u.searchParams.delete('q');
+      u.searchParams.delete('cp');
+      window._refocusFilter=true;
+      morphNavigate(u.pathname+u.search);
+    },250)};
+    fl.onkeydown=e=>{if(e.key==='Escape'){fl.value='';fl.oninput()}};
+    if(window._refocusFilter){
+      fl.focus();fl.setSelectionRange(fl.value.length,fl.value.length);
+      window._refocusFilter=false;
+    }
+  }
 }
 // ── wireDialogs(): bindings inside <dialog>s — rerun when dialogs are swapped ──
 function wireDialogs(){
@@ -371,16 +397,20 @@ function wireDialogs(){
         (pending.chart||'<p class=nodata>Local history arrives after tonight\u2019s ingest.</p>')+
         (pending.sites||'')+
         `<div class=tgtedit><label>target price ($)</label>`+
-        `<input id=addTarget type=number step=0.01 min=0 placeholder=none></div>`;
+        `<input id=addTarget type=number step=0.01 min=0 placeholder=none>`+
+        `<label>note</label><input id=addNote type=text maxlength=200 `+
+        `placeholder="e.g. deck name"></div>`;
       document.getElementById('addGo').style.display='';
     };
     enterClicks('addInput','addLookup');
     document.getElementById('addGo').onclick=async()=>{
       const t=document.getElementById('addTarget');
+      const n=document.getElementById('addNote');
       const r=await fetch(U('/api/add'),{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({key:KEY,name:pending.name,set_code:pending.set_code,
           collector_number:pending.collector_number,
-          target_price:t&&t.value.trim()!==''?+t.value:null})});
+          target_price:t&&t.value.trim()!==''?+t.value:null,
+          note:n&&n.value.trim()!==''?n.value.trim():null})});
       if(!r.ok){document.getElementById('addErr').textContent='could not add';return}
       const d=await r.json();
       if(d.backfilling)document.getElementById('addPreview').innerHTML+=
@@ -412,13 +442,24 @@ function wireDialogs(){
   }
   const tgtSave=document.getElementById('tgtSave');
   if(tgtSave){tgtSave.onclick=async()=>{
-    const v=document.getElementById('tgtInput').value.trim();
-    const r=await fetch(U('/api/target'),{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({key:KEY,entry_id:+document.getElementById('tgtEdit').dataset.entry,
-                           target_price:v===''?null:+v})});
-    if(r.ok){document.getElementById('cardDlg').close();refresh()}
-    else document.getElementById('tgtErr').textContent='could not save target';
-  };enterClicks('tgtInput','tgtSave');}
+    const te=document.getElementById('tgtEdit'),eid=+te.dataset.entry;
+    const tv=document.getElementById('tgtInput').value.trim();
+    const nv=document.getElementById('noteInput').value.trim();
+    const calls=[];                       // only send what actually changed
+    if(tv!==(te.dataset.target||''))
+      calls.push(['/api/target',{key:KEY,entry_id:eid,
+                                 target_price:tv===''?null:+tv}]);
+    if(nv!==(te.dataset.note||''))
+      calls.push(['/api/note',{key:KEY,entry_id:eid,note:nv}]);
+    if(!calls.length){document.getElementById('cardDlg').close();return}
+    for(const [ep,payload] of calls){
+      const r=await fetch(U(ep),{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(payload)});
+      if(!r.ok){document.getElementById('tgtErr').textContent='could not save';return}
+    }
+    document.getElementById('cardDlg').close();refresh();
+  };enterClicks('tgtInput','tgtSave');enterClicks('noteInput','tgtSave');}
   const forkBtn=document.getElementById('forkBtn');
   if(forkBtn){
     forkBtn.onclick=e=>doFork('fork',e.target.dataset.seq);
@@ -451,7 +492,10 @@ function wireCard(card){
     document.getElementById('siteHost').innerHTML=card.dataset.sites||'';
     const te=document.getElementById('tgtEdit');
     if(te){te.dataset.entry=card.dataset.entry;
+      te.dataset.target=card.dataset.target||'';
+      te.dataset.note=card.dataset.note||'';
       document.getElementById('tgtInput').value=card.dataset.target||'';
+      document.getElementById('noteInput').value=card.dataset.note||'';
       document.getElementById('tgtErr').textContent='';}
     const bb=document.getElementById('boughtBtn'),rb=document.getElementById('removeBtn');
     if(bb){bb.dataset.entry=card.dataset.entry;
@@ -711,6 +755,7 @@ def _card_html(db, entry, s, hit, idx, shop, cur, filling=False):
     data = (f' data-name="{name}" data-sub="{esc(sub)}"'
             f' data-entry="{entry["entry_id"]}"'
             f' data-target="{tgt_attr}"'
+            f' data-note="{esc(entry["note"] or "")}"'
             f' data-bought="{esc(bought_at) if bought_at else ""}"'
             f' data-sites="{esc(_site_links(entry))}"'
             f' data-pts="{esc(json.dumps(points))}"'
@@ -756,14 +801,34 @@ def _verdict(pairs) -> str:
 
 
 def _pager(base, param, page, total, per, keep=""):
+    """Numbered pager with windowing: ‹ Prev 1 … 4 [5] 6 … 12 Next ›.
+
+    Sort-agnostic labels — under "cheapest" or "7d drop", page 2 isn't
+    "older", it's just the next page."""
     pages = max(1, -(-total // per))
     if pages == 1:
         return ""
-    prev = (f'<a href="{base}?{param}={page - 1}{keep}">‹ newer</a>'
-            if page > 1 else "<span>‹</span>")
-    nxt = (f'<a href="{base}?{param}={page + 1}{keep}">older ›</a>'
-           if page < pages else "<span>›</span>")
-    return f'<nav class="pager">{prev}<span>{page}/{pages}</span>{nxt}</nav>'
+    page = min(max(1, page), pages)
+
+    def link(p, label=None):
+        return (f'<a class="pnum" href="{base}?{param}={p}{keep}">'
+                f'{label or p}</a>')
+
+    shown = sorted({1, pages, page - 1, page, page + 1}
+                   & set(range(1, pages + 1)))
+    nums, last = [], 0
+    for p in shown:
+        if p - last > 1:
+            nums.append('<span class="gap">…</span>')
+        nums.append(f'<span class="pnum cur" aria-current="page">{p}</span>'
+                    if p == page else link(p))
+        last = p
+    prev = (link(page - 1, "‹ Prev") if page > 1
+            else '<span class="pnum dis">‹ Prev</span>')
+    nxt = (link(page + 1, "Next ›") if page < pages
+           else '<span class="pnum dis">Next ›</span>')
+    return (f'<nav class="pager" aria-label="Pages">{prev}{"".join(nums)}'
+            f'{nxt}</nav>')
 
 
 def _shell(row, editable, body, dialogs, cur="$", subtitle="", rightnav=""):
@@ -813,6 +878,12 @@ SORTS = (("target", "near target"), ("age", "newest"), ("price", "cheapest"),
 _INF = float("inf")
 
 
+def _norm(s: str) -> str:
+    """Match-normalization: case- and punctuation-blind ("sram senior"
+    matches "Sram, Senior Edificer")."""
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+
 def _sort_key(sort, e, base_s, disp_s):
     """Ordering value, smaller first. No-signal entries sink (never above
     priced/targeted ones); bought partitioning happens outside."""
@@ -833,7 +904,7 @@ def _sort_key(sort, e, base_s, disp_s):
 
 def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
                 filling: bool = False, sort: str = "target",
-                show_bought: bool = True) -> str:
+                show_bought: bool = True, q: str = "") -> str:
     """The board: verdict + stat tiles + card grid, buy windows first."""
     key = row["_key"]
     shop = shop if shop in SHOPS else "tcgplayer"
@@ -841,17 +912,21 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
     base = (f"{PREFIX}/w/{esc(key)}" if editable
             else f"{PREFIX}/s/{esc(key)}")
     sort = sort if sort in dict(SORTS) else "target"
+    q = (q or "").strip()[:80]
+    qq = urllib.parse.quote(q)
     # view-state query string, minus defaults; cp handled by the pager
     state = [p for p in (
         f"sort={sort}" if sort != "target" else "",
         f"shop={shop}" if shop != "tcgplayer" else "",
-        "" if show_bought else "bought=hide") if p]
+        "" if show_bought else "bought=hide",
+        f"q={qq}" if q else "") if p]
 
     def _url(**over):
         parts = [p for p in (
             f"sort={over.get('sort', sort)}" if over.get('sort', sort) != "target" else "",
             f"shop={over.get('shop', shop)}" if over.get('shop', shop) != "tcgplayer" else "",
-            "" if over.get('show_bought', show_bought) else "bought=hide") if p]
+            "" if over.get('show_bought', show_bought) else "bought=hide",
+            f"q={qq}" if q else "") if p]
         return base + ("?" + "&".join(parts) if parts else "")
 
     keep = "".join(f"&{p}" for p in state)
@@ -870,10 +945,11 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
     # chosen ordering; bought always last regardless of sort
     pairs.sort(key=lambda t: (t[4], _sort_key(sort, t[0], t[1], t[2])))
     bought_n = sum(1 for t in pairs if t[4])
-    if not show_bought:
-        grid_pairs = [t for t in pairs if not t[4]]
-    else:
-        grid_pairs = pairs
+    grid_pairs = pairs if show_bought else [t for t in pairs if not t[4]]
+    if q:
+        nq = _norm(q)
+        grid_pairs = [t for t in grid_pairs
+                      if nq in _norm(t[0]["card_name"])]
 
     active = [(e, bs, ds, h) for e, bs, ds, h, b in pairs if not b]
     total_val = sum(s["current"] for _, _, s, _ in active if s)
@@ -886,9 +962,11 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
     last_ingest = last_ingest["value"] if last_ingest else "never"
 
     page = grid_pairs[(cp - 1) * CARDS_PER_PAGE: cp * CARDS_PER_PAGE]
+    empty_msg = (f'No cards match “{esc(q)}”.' if q else
+                 'Nothing watched yet — use “Add card” or ask Claude.')
     cards = "".join(_card_html(db, e, disp_s, h, i, shop, cur, filling)
                     for i, (e, _, disp_s, h, _b) in enumerate(page)) or \
-        '<p class="nodata">Nothing watched yet — use “Add card” or ask Claude.</p>'
+        f'<p class="nodata">{empty_msg}</p>'
 
     shop_names = {"tcgplayer": "TCGplayer", "cardkingdom": "Card Kingdom",
                   "cardmarket": "Cardmarket"}
@@ -902,8 +980,12 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
     if bought_n:
         bought_toggle = (f'<a class="textlink mla" href="{_url(show_bought=not show_bought)}">'
                          f'{"hide" if show_bought else "show"} bought ({bought_n})</a>')
+    filterbox = (f'<input id="filter" class="filterbox mla" type="search" '
+                 f'placeholder="filter cards…" value="{esc(q)}" '
+                 f'aria-label="Filter cards by name">')
     sortbar = (f'<div class="sortbar"><span class="shoplbl">sort:</span>'
-               f'<span class="shops">{sort_links}</span>{bought_toggle}</div>')
+               f'<span class="shops">{sort_links}</span>'
+               f'{filterbox}{bought_toggle.replace(" mla", "") if bought_toggle else ""}</div>')
     share_path = f"{PREFIX}/s/{esc(row['share_code'])}"
     share = (f'<button class="textlink" data-copy="{share_path}" '
              f'title="Copy the read-only link (code {esc(row["share_code"])})">'
@@ -919,6 +1001,9 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
         tgt_edit = ('<div class="tgtedit" id="tgtEdit"><label for="tgtInput">'
                     'target price ($)</label><input id="tgtInput" type="number" '
                     'step="0.01" min="0" placeholder="none">'
+                    '<label for="noteInput">note</label>'
+                    '<input id="noteInput" type="text" maxlength="200" '
+                    'placeholder="e.g. Cloud deck, batch 2">'
                     '<button class="act" id="tgtSave">Save</button>'
                     '<span class="err" id="tgtErr"></span></div>')
         modal_actions = (

@@ -356,6 +356,96 @@ def test_sort_state_survives_shop_switch(db_path):
     assert f"/w/{pp}?sort=d7&shop=cardkingdom&bought=hide" in page
 
 
+def test_pager_numbered_and_sort_agnostic(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    for i in range(30 * 5):                       # 150 cards → 7 pages of 24
+        watchlist_db.add_card(db, list_id, f"Bulk Card {i:03d}")
+    db.close()
+    with client() as c:
+        p1 = c.get(f"/w/{pp}").text
+        p4 = c.get(f"/w/{pp}?cp=4").text
+    assert "older ›" not in p1 and "‹ newer" not in p1  # sort-agnostic labels
+    assert "Next ›" in p1 and 'class="pnum dis">‹ Prev' in p1
+    assert 'class="pnum cur" aria-current="page">4' in p4
+    assert p4.count('class="gap"') == 2                # 1 … 3 4 5 … 7
+    assert f'href="/w/{pp}?cp=7"' in p4                # last page reachable
+
+
+def test_api_note_set_clear_and_share_forbidden(db_path):
+    list_id, pp, sc, seq = _seeded_list(db_path)
+    with client() as c:
+        r = c.post("/api/note", json={"key": pp, "entry_id": seq,
+                                      "note": "Cloud deck, batch 2"})
+        assert r.status_code == 200 and r.json()["note"] == "Cloud deck, batch 2"
+        page = c.get(f"/w/{pp}").text
+        assert "Cloud deck, batch 2" in page
+        assert 'data-note="Cloud deck, batch 2"' in page
+        r = c.post("/api/note", json={"key": pp, "entry_id": seq, "note": ""})
+        assert r.status_code == 200 and r.json()["note"] is None
+        assert c.post("/api/note", json={"key": sc, "entry_id": seq,
+                                         "note": "x"}).status_code == 403
+    db = watchlist_db.connect(db_path)
+    actions = [x["action"] for x in db.execute(
+        "SELECT action FROM events WHERE list_id=? ORDER BY seq", (list_id,))]
+    db.close()
+    assert actions == ["create", "add", "set_note", "set_note"]
+
+
+def test_note_editor_in_modals_editable_only(db_path):
+    list_id, pp, sc, seq = _seeded_list(db_path)
+    with client() as c:
+        own = c.get(f"/w/{pp}").text
+        share = c.get(f"/s/{sc}").text
+    assert 'id="noteInput"' in own and 'id="noteInput"' not in share
+    assert "addNote" in own                      # add-card flow asks for a note
+
+
+def test_api_add_accepts_note(db_path, monkeypatch):
+    import server as srv
+
+    async def fake(endpoint, params=None):
+        return {"name": "Cultivate", "prices": {"usd": "1.00"}}
+    monkeypatch.setattr(srv, "_scryfall_get", fake)
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    db.close()
+    with client() as c:
+        r = c.post("/api/add", json={"key": pp, "name": "Cultivate",
+                                     "note": "ramp package"})
+    assert r.status_code == 200
+    db = watchlist_db.connect(db_path)
+    assert watchlist_db.current_entries(db, list_id)[0]["note"] == "ramp package"
+    db.close()
+
+
+def test_filter_normalizes_names(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sram, Senior Edificer")
+    watchlist_db.add_card(db, list_id, "Sword of Hearth and Home")
+    db.close()
+    with client() as c:
+        hit = c.get(f"/w/{pp}?q=sram senior").text     # comma+case ignored
+        miss = c.get(f"/w/{pp}?q=zzz").text
+        clear = c.get(f"/w/{pp}").text
+    assert "<h3>Sram" in hit and "<h3>Sword" not in hit
+    assert "<article" not in miss and "No cards match" in miss
+    assert "<h3>Sram" in clear and "<h3>Sword" in clear
+    assert 'id="filter"' in clear
+    assert 'value="sram senior"' in hit               # box keeps the query
+
+
+def test_filter_state_preserved_in_view_links(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sram, Senior Edificer")
+    db.close()
+    with client() as c:
+        page = c.get(f"/w/{pp}?q=sram&sort=price").text
+    assert "sort=price" in page and "q=sram" in page   # both survive in links
+
+
 def test_mint_throttle_limits_new_lists(db_path, monkeypatch):
     """Spec mitigation: a public no-auth URL can't be farmed for lists."""
     import server as srv

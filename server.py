@@ -3043,7 +3043,8 @@ async def watch_page(request: Request):
             shop=request.query_params.get("shop", "tcgplayer"),
             filling=filling,
             sort=request.query_params.get("sort", "target"),
-            show_bought=request.query_params.get("bought") != "hide"))
+            show_bought=request.query_params.get("bought") != "hide",
+            q=request.query_params.get("q", "")))
     finally:
         db.close()
 
@@ -3120,7 +3121,8 @@ async def share_page(request: Request):
             shop=request.query_params.get("shop", "tcgplayer"),
             filling=filling,
             sort=request.query_params.get("sort", "target"),
-            show_bought=request.query_params.get("bought") != "hide"))
+            show_bought=request.query_params.get("bought") != "hide",
+            q=request.query_params.get("q", "")))
     finally:
         db.close()
 
@@ -3248,7 +3250,8 @@ async def api_add(request: Request):
             db, row["id"], name,
             set_code=body.get("set_code") or None,
             collector_number=body.get("collector_number") or None,
-            target_price=tp)
+            target_price=tp,
+            note=str(body.get("note") or "").strip()[:200] or None)
         backfilling = (not watchlist_db.entry_price_summary(db, entry)
                        and _schedule_backfill(entry["card_name"]))
         return JSONResponse({"entry_id": entry["entry_id"],
@@ -3305,6 +3308,33 @@ async def api_bought(request: Request):
             return JSONResponse({"error": str(e)}, status_code=404)
         return JSONResponse({"entry_id": entry["entry_id"],
                              "bought_at": entry["bought_at"]})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/note", methods=["POST"])
+async def api_note(request: Request):
+    """Set or clear an entry's note from the page. Passphrase key only."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        note = str(body.get("note") or "").strip()[:200] or None
+        try:
+            entry = watchlist_db.set_entry_note(
+                db, row["id"], int(body.get("entry_id", -1)), note)
+        except watchlist_db.NotFound as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        return JSONResponse({"entry_id": entry["entry_id"],
+                             "note": entry["note"]})
     finally:
         db.close()
 

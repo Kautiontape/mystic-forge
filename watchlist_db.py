@@ -446,6 +446,20 @@ def set_bought(db, list_id: int, entry_id: int, bought: bool = True) -> dict:
     return dict(_find_entry(db, list_id, entry_id=entry_id))
 
 
+def set_entry_note(db, list_id: int, entry_id: int, note) -> dict:
+    """Set (or clear, with None) an entry's note; appends a set_note event."""
+    row = _find_entry(db, list_id, entry_id=entry_id)
+    if row is None:
+        raise NotFound(f"No entry #{entry_id}")
+    append_event(db, list_id, "set_note",
+                 {"entry_id": entry_id, "card_name": row["card_name"],
+                  "note": note})
+    db.execute("UPDATE watchlist_current SET note=?"
+               " WHERE list_id=? AND entry_id=?", (note, list_id, entry_id))
+    db.commit()
+    return dict(_find_entry(db, list_id, entry_id=entry_id))
+
+
 def set_label(db, list_id: int, label):
     """Rename a list; recorded as a set_label event (ignored by entry replay)."""
     append_event(db, list_id, "set_label", {"label": label})
