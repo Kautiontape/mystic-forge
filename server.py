@@ -13,13 +13,14 @@ import asyncio
 import json
 import re
 import time
+import uuid
 from typing import Optional, Dict, Any
 from enum import Enum
 from collections import Counter, OrderedDict
 from difflib import SequenceMatcher
 
 import httpx
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 from mcp.server.fastmcp import FastMCP
 
 from goldfish import ENGINE_VERSION, autoderive, metrics, report
@@ -27,8 +28,11 @@ from goldfish.cards import (CONDITIONS, COST_REDUCTION_FILTERS, DAMAGE_TARGETS,
                             GLOBAL_EVENTS, SELF_EVENTS, SPELL_CAST_FILTERS,
                             STATIC_KINDS, SYMBOLIC_COUNTS, TUTOR_FILTERS, VERBS,
                             SimCard, merge_card, validate_annotations)
-from goldfish.engine import MulliganRules
+from goldfish.engine import (Game, IllegalAction, MulliganRules,
+                             _SYNTHETIC_CARDS, _synth_card, auto_mulligan,
+                             effective_power, legal_actions, new_game, step)
 from goldfish.odds import odds_at_least, odds_groups
+from goldfish.policy import choose_action
 from goldfish.runner import is_binary_ab_metric, run_ab, run_batch
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -3176,6 +3180,423 @@ async def goldfish_ab(params: GoldfishAbInput) -> str:
     parts += ["", "## Deltas JSON", "```json", json.dumps(payload), "```"]
     parts += ["", f'Full report: goldfish_report("{run_id}")']
     return "\n".join(parts)
+
+
+# ── Goldfish interactive mode (spec §Interactive mode, D3, D10) ──────────────
+
+
+GOLDFISH_MAX_GAMES = 100
+GOLDFISH_GAME_TTL = 24 * 3600
+_GOLDFISH_ATTACH_TARGET_CAP = 8
+#: Fast-forward step budget: the runner's per-turn livelock guard times the
+#: engine's turn horizon (until only accepts turn:1-30 / "end" stops past 30).
+_GOLDFISH_UNTIL_GUARD = 500 * 30
+_GOLDFISH_UNTIL_TURN_CAP = 30
+
+#: gid -> {"game": Game, "cards": pool, "meta": {deck, annotations, combos},
+#: "touched": last access}. LRU cap + idle TTL (spec §Concurrency); eviction
+#: is non-destructive — every response echoes the full resume blob (D3).
+_GOLDFISH_GAMES: "OrderedDict[str, dict]" = OrderedDict()
+
+#: Every key Game.from_dict reads, plus the tool-layer "resume" meta.
+_GOLDFISH_RESUME_KEYS = (
+    "turn", "phase", "mana_pool", "land_drops_used", "spells_cast_this_turn",
+    "combats_done", "extra_combats", "attacked_this_combat",
+    "mulligans_taken", "free_mulligan_used", "kept_hand_size",
+    "kept_hand_lands", "kept_hand_sources", "life_gained", "trigger_fires",
+    "static_active_turn", "zones", "commander", "opponents", "won_turn",
+    "combos", "combo_wins", "combo_assembled_turn", "combo_castable_turn",
+    "rng_state", "log", "next_id", "resume")
+
+
+def _games_evict() -> None:
+    """TTL sweep then LRU cap, called on every store and access."""
+    now = time.time()
+    for gid in [gid for gid, v in _GOLDFISH_GAMES.items()
+                if now - v["touched"] > GOLDFISH_GAME_TTL]:
+        del _GOLDFISH_GAMES[gid]
+    while len(_GOLDFISH_GAMES) > GOLDFISH_MAX_GAMES:
+        _GOLDFISH_GAMES.popitem(last=False)
+
+
+def _games_store(gid: str, game: Game, cards: dict, meta: dict) -> None:
+    _GOLDFISH_GAMES[gid] = {"game": game, "cards": cards, "meta": meta,
+                            "touched": time.time()}
+    _GOLDFISH_GAMES.move_to_end(gid)
+    _games_evict()
+
+
+def _games_get(gid: str) -> dict | None:
+    """Store access: evict first, then refresh the hit's LRU position."""
+    _games_evict()
+    entry = _GOLDFISH_GAMES.get(gid)
+    if entry is not None:
+        entry["touched"] = time.time()
+        _GOLDFISH_GAMES.move_to_end(gid)
+    return entry
+
+
+def _goldfish_unknown_game(gid: str) -> str:
+    return json.dumps({"error": (
+        f"unknown game_id {gid!r} — the game may have been evicted (LRU cap "
+        f"{GOLDFISH_MAX_GAMES} games, idle TTL 24h). Eviction is "
+        "non-destructive: every response echoed the full state blob, so "
+        'restart with goldfish_start(resume_state=<last echoed "state">) '
+        "and the game continues with identical future draws.")})
+
+
+def _goldfish_validate_resume(blob: dict) -> str | None:
+    """Structural sanity for a resume blob BEFORE Game.from_dict (Task 8
+    M3): required keys present, zone lists are lists of card names,
+    battlefield attachment ids resolve within the blob, and the "resume"
+    meta is usable for re-preparing the card pool. Returns the first
+    problem found (None when sound) — a malformed blob must fail here with
+    a named problem, never as a mid-step crash later."""
+    missing = [k for k in _GOLDFISH_RESUME_KEYS if k not in blob]
+    if missing:
+        return "resume_state is missing key(s): " + ", ".join(missing)
+    resume = blob["resume"]
+    if not isinstance(resume, dict) or not isinstance(resume.get("deck"), str):
+        return ('resume_state["resume"] must be the echoed {"deck": str, '
+                '"annotations": list, "combos": list}')
+    if not isinstance(resume.get("annotations"), list):
+        return 'resume_state["resume"]["annotations"] must be a list'
+    if not isinstance(resume.get("combos"), list):
+        return 'resume_state["resume"]["combos"] must be a list'
+    zones = blob["zones"]
+    if not isinstance(zones, dict):
+        return 'resume_state["zones"] must be a dict'
+    for zone in ("library", "hand", "graveyard", "command"):
+        names = zones.get(zone)
+        if (not isinstance(names, list)
+                or not all(isinstance(n, str) for n in names)):
+            return (f'resume_state["zones"]["{zone}"] must be a list of '
+                    "card names")
+    battlefield = zones.get("battlefield")
+    if (not isinstance(battlefield, list)
+            or not all(isinstance(p, dict) for p in battlefield)):
+        return ('resume_state["zones"]["battlefield"] must be a list of '
+                "permanent dicts")
+    ids = {p.get("id") for p in battlefield}
+    for p in battlefield:
+        pid = p.get("id")
+        if not isinstance(pid, str) or not isinstance(p.get("name"), str):
+            return ("every battlefield permanent needs string id and name "
+                    "fields")
+        attached = p.get("attached", [])
+        if not isinstance(attached, list):
+            return f"battlefield {pid}: attached must be a list of ids"
+        for eq_id in attached:
+            if eq_id not in ids:
+                return (f"battlefield {pid}: attached id {eq_id!r} does not "
+                        "resolve to any battlefield permanent in the blob")
+        attached_to = p.get("attached_to")
+        if attached_to is not None and attached_to not in ids:
+            return (f"battlefield {pid}: attached_to id {attached_to!r} does "
+                    "not resolve to any battlefield permanent in the blob")
+    commander = blob["commander"]
+    if (not isinstance(commander, dict)
+            or not isinstance(commander.get("name"), str)):
+        return ('resume_state["commander"] must be {"name": str, '
+                '"cast_count": int}')
+    opponents = blob["opponents"]
+    if not isinstance(opponents, list) or not all(
+            isinstance(o, dict) and "life" in o and "cmdr_dmg" in o
+            for o in opponents):
+        return ('resume_state["opponents"] must be a list of '
+                '{"life", "cmdr_dmg"} dicts')
+    rng_state = blob["rng_state"]
+    if not isinstance(rng_state, list) or len(rng_state) != 3:
+        return ('resume_state["rng_state"] must be the echoed 3-part list — '
+                "it cannot be hand-written")
+    return None
+
+
+def _goldfish_compose_state(g: Game, meta: dict) -> dict:
+    """The tool-layer state (spec §Interactive state schema): the engine's
+    to_dict() plus the "resume" meta the engine deliberately doesn't carry
+    (deck text, annotations, combos), so every echoed state is a complete
+    goldfish_start(resume_state=...) input (D3)."""
+    state = g.to_dict()
+    state["resume"] = {"deck": meta["deck"],
+                       "annotations": list(meta["annotations"]),
+                       "combos": list(meta["combos"])}
+    return state
+
+
+def _goldfish_group_attach(g: Game, actions: list) -> list:
+    """Response formatting ONLY (Task 8 review: pairwise attach entries hit
+    124KB on token boards): collapse the engine's per-pair entries to one
+    per equipment — {"type": "attach", "card": eq_id, "targets": [ids]} with
+    targets capped at 8 by descending effective_power then id, plus
+    "more_targets": N for the overflow. Every other action type passes
+    through unchanged, in place. The engine's legal_actions stays the pinned
+    ground truth, and step() still takes the engine shape
+    {"type": "attach", "card": ..., "target": ...}."""
+    grouped: list = []
+    emitted: set[str] = set()
+    for a in actions:
+        if a.get("type") != "attach":
+            grouped.append(a)
+            continue
+        eq_id = a["card"]
+        if eq_id in emitted:
+            continue
+        emitted.add(eq_id)
+        targets = [b["target"] for b in actions
+                   if b.get("type") == "attach" and b["card"] == eq_id]
+        targets.sort(key=lambda pid: (-effective_power(g, g.perm(pid)),
+                                      int(pid[1:])))
+        entry: dict = {"type": "attach", "card": eq_id,
+                       "targets": targets[:_GOLDFISH_ATTACH_TARGET_CAP]}
+        if len(targets) > _GOLDFISH_ATTACH_TARGET_CAP:
+            entry["more_targets"] = len(targets) - _GOLDFISH_ATTACH_TARGET_CAP
+        grouped.append(entry)
+    return grouped
+
+
+def _goldfish_game_payload(g: Game, meta: dict) -> dict:
+    return {"state": _goldfish_compose_state(g, meta),
+            "legal_actions": _goldfish_group_attach(g, legal_actions(g))}
+
+
+class GoldfishStartInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    deck: str | None = Field(
+        default=None, min_length=1,
+        description="Archidekt deck ID/URL, or decklist text ('1 Card Name' "
+                    "per line, commander first or marked ' *CMDR*'). "
+                    "Exactly one of deck/resume_state.")
+    annotations: list[dict] = Field(
+        default_factory=list,
+        description="Card annotations (goldfish_annotate's DSL) for cards "
+                    "the engine can't auto-derive.")
+    combos: list = Field(
+        default_factory=list,
+        description="Declared combos: each a list of card names or "
+                    '{"cards": [...], "wins": bool}.')
+    seed: int = Field(default=42, description="RNG seed for the shuffle.")
+    opponents: int = Field(default=1, ge=1, le=5,
+                           description="Goldfish opponents (life totals).")
+    interactive_mulligan: bool = Field(
+        default=False,
+        description="Start in the mulligan phase (legal actions: mulligan / "
+                    "keep) instead of resolving mulligans automatically.")
+    resume_state: dict | None = Field(
+        default=None,
+        description='A previously echoed "state" blob: restores an evicted '
+                    "game, or rewinds to any earlier point with identical "
+                    "future draws. Exactly one of deck/resume_state.")
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self):
+        if (self.deck is None) == (self.resume_state is None):
+            raise ValueError("Provide exactly one of deck or resume_state.")
+        return self
+
+
+class GoldfishStepInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    game_id: str = Field(..., min_length=1,
+                         description="Game id from goldfish_start.")
+    action: dict | None = Field(
+        default=None,
+        description="One engine-shape action to apply, e.g. "
+                    '{"type": "cast", "card": "..."} or {"type": "attach", '
+                    '"card": "b1", "target": "b3"}. Omit both action and '
+                    "until to let the policy choose one step.")
+    until: str | None = Field(
+        default=None,
+        description='Fast-forward the policy to a boundary: "turn:N" (stop '
+                    'at the start of turn N), "phase:main1|combat|main2", or '
+                    '"end" (win or past turn 30). Mutually exclusive with '
+                    "action.")
+
+    @model_validator(mode="after")
+    def _action_xor_until(self):
+        if self.action is not None and self.until is not None:
+            raise ValueError(
+                "action and until are mutually exclusive — pass one.")
+        return self
+
+
+class GoldfishStateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    game_id: str = Field(..., min_length=1,
+                         description="Game id from goldfish_start.")
+
+
+def _goldfish_parse_until(until: str):
+    """"turn:N" | "phase:X" | "end" -> (kind, value); error string otherwise."""
+    if until == "end":
+        return ("end", None)
+    kind, sep, val = until.partition(":")
+    if sep and kind == "turn":
+        if val.isdigit() and 1 <= int(val) <= _GOLDFISH_UNTIL_TURN_CAP:
+            return ("turn", int(val))
+        return f"until turn must be 1-{_GOLDFISH_UNTIL_TURN_CAP}, got {val!r}"
+    if sep and kind == "phase":
+        if val in ("main1", "combat", "main2"):
+            return ("phase", val)
+        return ('until phase must be main1, combat, or main2 ("mulligan" '
+                f'and "end" are never resting phases), got {val!r}')
+    return ('until must be "turn:N", "phase:main1|combat|main2", or "end", '
+            f"got {until!r}")
+
+
+def _goldfish_until_done(g: Game, kind: str, value) -> bool:
+    if g.won_turn is not None:
+        return True
+    if kind == "turn":
+        return g.turn >= value        # stop at the START of turn N
+    if kind == "phase":
+        return g.phase == value
+    return g.turn > _GOLDFISH_UNTIL_TURN_CAP       # "end" hard stop
+
+
+@mcp.tool(name="goldfish_start")
+async def goldfish_start(params: GoldfishStartInput) -> str:
+    """Start (or resume) an interactive goldfish game. Returns JSON
+    {"game_id", "state", "legal_actions"} (interactive tools return JSON,
+    D4); "warnings" appears when annotations matched no deck card or names
+    were not recognized by Scryfall.
+
+    One step = one atomic action (D10): drive the game with goldfish_step,
+    inspect it with goldfish_state. Every response echoes the full
+    resumable state — pass it back as resume_state to restore an evicted
+    game, or to rewind to any earlier point with identical future draws
+    (D3): counterfactuals hold the deck order constant.
+
+    Mulligans use the DEFAULT MulliganRules (pinned v1 — no interactive
+    override): keep 7 with 3-5 mana sources (rocks count) and at least 2
+    real lands, EDH free first mulligan. interactive_mulligan=true starts
+    in the mulligan phase instead, with mulligan/keep as the legal actions
+    (the same rules fix each keep's required bottom count).
+    """
+    if params.resume_state is not None:
+        blob = params.resume_state
+        err = _goldfish_validate_resume(blob)
+        if err:
+            return json.dumps({"error": err})
+        resume = blob["resume"]
+        try:
+            (cards_pool, _library, _commander, _cmdr_note, _scopes, _approx,
+             not_found, unmatched_anns) = await _goldfish_prepare(
+                resume["deck"], resume["annotations"])
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+        for name, types, produces in _SYNTHETIC_CARDS:
+            cards_pool.setdefault(name, _synth_card(name, types, produces))
+        zones = blob["zones"]
+        state_names = (set(zones["library"]) | set(zones["hand"])
+                       | set(zones["graveyard"]) | set(zones["command"])
+                       | {p["name"] for p in zones["battlefield"]}
+                       | {blob["commander"]["name"]})
+        unknown = sorted(n for n in state_names if n not in cards_pool)
+        if unknown:
+            return json.dumps({"error": (
+                "resume_state references card(s) the rebuilt pool does not "
+                "contain: " + ", ".join(unknown) + ' — resume["deck"] must '
+                "be the deck this game was started from.")})
+        try:
+            g = Game.from_dict(blob, cards_pool)
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            return json.dumps(
+                {"error": f"resume_state could not be rebuilt: {e!r}"})
+        meta = {"deck": resume["deck"],
+                "annotations": list(resume["annotations"]),
+                "combos": list(resume["combos"])}
+    else:
+        try:
+            (cards_pool, library, commander, _cmdr_note, _scopes, _approx,
+             not_found, unmatched_anns) = await _goldfish_prepare(
+                params.deck, params.annotations)
+        except ValueError as e:
+            return json.dumps({"error": str(e)})   # AnnotationError verbatim
+        combo_err = _goldfish_check_combos(
+            params.combos, set(library) | {commander})
+        if combo_err:
+            return json.dumps({"error": combo_err})
+        g = new_game(cards_pool, library, commander, seed=params.seed,
+                     opponents=params.opponents, combos=params.combos)
+        if not params.interactive_mulligan:
+            auto_mulligan(g, MulliganRules())      # pinned defaults (v1)
+        meta = {"deck": params.deck,
+                "annotations": list(params.annotations),
+                "combos": list(params.combos)}
+    warnings = []
+    if unmatched_anns:
+        warnings.append("Annotations for cards not in deck (check "
+                        "spelling): " + ", ".join(unmatched_anns))
+    if not_found:
+        warnings.append("Not recognized by Scryfall, skipped: "
+                        + ", ".join(not_found))
+    game_id = str(uuid.uuid4())
+    _games_store(game_id, g, cards_pool, meta)
+    payload = {"game_id": game_id, **_goldfish_game_payload(g, meta)}
+    if warnings:
+        payload["warnings"] = warnings
+    return json.dumps(payload)
+
+
+@mcp.tool(name="goldfish_step")
+async def goldfish_step(params: GoldfishStepInput) -> str:
+    """Advance an interactive goldfish game by atomic actions (D10): yours
+    (`action`, engine shape), or the policy's (no arguments = one step;
+    `until` = fast-forward to "turn:N" / "phase:X" / "end").
+
+    Returns JSON {"applied", "state", "legal_actions", "log_delta"} —
+    applied is one {"action", "reason"} (reason null for user actions, the
+    fired policy rule otherwise) or a list of them under until; log_delta
+    is only the log lines this call added. An illegal action returns
+    {"error", "state", "legal_actions"} and the game is guaranteed
+    unmutated. An unknown game_id names the recovery:
+    goldfish_start(resume_state=...).
+    """
+    entry = _games_get(params.game_id)
+    if entry is None:
+        return _goldfish_unknown_game(params.game_id)
+    g, meta = entry["game"], entry["meta"]
+    log_before = len(g.log)
+    if params.action is not None:
+        try:
+            step(g, params.action)
+        except IllegalAction as e:
+            return json.dumps({"error": str(e),
+                               **_goldfish_game_payload(g, meta)})
+        applied: dict | list = {"action": params.action, "reason": None}
+    elif params.until is not None:
+        parsed = _goldfish_parse_until(params.until)
+        if isinstance(parsed, str):
+            return json.dumps({"error": parsed})
+        kind, value = parsed
+        applied = []
+        for _ in range(_GOLDFISH_UNTIL_GUARD):
+            if _goldfish_until_done(g, kind, value):
+                break
+            action, reason = choose_action(g)
+            step(g, action)
+            applied.append({"action": action, "reason": reason})
+    else:
+        action, reason = choose_action(g)
+        step(g, action)
+        applied = {"action": action, "reason": reason}
+    return json.dumps({"applied": applied,
+                       **_goldfish_game_payload(g, meta),
+                       "log_delta": g.log[log_before:]})
+
+
+@mcp.tool(name="goldfish_state")
+async def goldfish_state(params: GoldfishStateInput) -> str:
+    """Current full state and legal actions of an interactive goldfish game
+    as JSON {"game_id", "state", "legal_actions"}. The echoed state is the
+    complete resume blob (D3) — keep the latest one to survive eviction."""
+    entry = _games_get(params.game_id)
+    if entry is None:
+        return _goldfish_unknown_game(params.game_id)
+    return json.dumps({"game_id": params.game_id,
+                       **_goldfish_game_payload(entry["game"],
+                                                entry["meta"])})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
