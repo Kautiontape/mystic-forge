@@ -839,6 +839,17 @@ def test_quantity_producer_and_pool_wildcard():
 
 - [ ] **Step 3: Implement (engine.py)**
 
+> **CORRECTED during execution (quality review of fb105ef):** the reference
+> code below has two known defects — do not transcribe it as-is. (1) The
+> colored loop orders pips by demand; it must order by **dynamic scarcity**
+> (fewest remaining candidate sources: matching producers in `avail` +
+> `pool[color]` + `pool["any"]`, recomputed after each payment, ties by need
+> then WUBRG) or overlapping duals produce false "can't pay" verdicts
+> (~0.5–1.2% of payable 3-color checks). (2) The generic phase must bank
+> producer overshoot (`take = min(generic, qty)`, surplus routed like the
+> colored phase) or Sol Ring-class rocks leak mana. Also: a true `{C}` pip is
+> never payable from `pool["any"]`. See the fix commit on branch `goldfish`.
+
 ```python
 def untapped_producers(g: Game):
     """[(perm, colors: frozenset|{'C'}, qty)] for untapped mana permanents,
