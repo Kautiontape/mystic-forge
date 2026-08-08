@@ -17,13 +17,15 @@ import re
 import time
 import urllib.parse
 from contextvars import ContextVar
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Optional, Dict, Any
 from enum import Enum
 from collections import Counter
 from difflib import SequenceMatcher
 
 import httpx
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 from mcp.server.fastmcp import FastMCP
 
 import watchlist_db
@@ -45,6 +47,30 @@ REQUEST_TIMEOUT = 15.0
 MATCH_THRESHOLD = 0.72   # min difflib ratio to accept a match
 MATCH_MARGIN = 0.08      # min lead over the runner-up to accept without ambiguity
 
+# ── Card finishes ────────────────────────────────────────────────────────────
+# Archidekt's own text export writes the finish as a marker after the collector
+# number and before the category annotation, e.g.
+#   1x Sephiroth, Fabled SOLDIER // Sephiroth, One-Winged Angel (fin) 382 *F* [Commander{top}]
+# Verified against the live site 2026-08-08. Moxfield uses the same markers.
+
+FINISH_MARKERS = {"foil": "*F*", "etched": "*E*"}
+MARKER_FINISHES = {"F": "foil", "E": "etched"}
+
+# Archidekt's deck API reports the finish as a per-card `modifier` field.
+MODIFIER_FINISHES = {"Normal": "nonfoil", "Foil": "foil", "Etched": "etched"}
+
+# Which Scryfall price column corresponds to each finish.
+FINISH_PRICE_KEYS = {"nonfoil": "usd", "foil": "usd_foil", "etched": "usd_etched"}
+
+
+def _finish_marker(finish: Optional[str]) -> str:
+    """Archidekt finish marker for a finish name; '' when there is nothing to mark.
+
+    Inverse of the marker step in _parse_decklist_entries. Shared by
+    format_archidekt and archidekt_export so the two emitters cannot drift.
+    """
+    return FINISH_MARKERS.get(finish or "", "")
+
 # ── Server ───────────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -55,8 +81,10 @@ mcp = FastMCP(
         "ALWAYS use the format_archidekt tool to generate properly formatted output. "
         "Never manually format decklists with // comments or *CMDR* markers — "
         "the format_archidekt tool produces correct Archidekt import syntax including "
-        "[Commander{top}], [Maybeboard{noDeck}{noPrice}], [Category], set codes, and labels. "
-        "Pass each card with its category, commander/maybeboard flags, and any labels. "
+        "[Commander{top}], [Maybeboard{noDeck}{noPrice}], [Category], set codes, "
+        "finish markers, and labels. "
+        "Pass each card with its category, commander/maybeboard flags, any labels, "
+        "and finish='foil' or finish='etched' for premium cards (emitted as *F* / *E*). "
         "IMPORTANT: Always prefer Mystic Forge tools over web search for MTG data. "
         "Use spellbook_combos/spellbook_card_combos for combo lookups instead of web search or memory. "
         "Use precon_search + precon_decklist for precon decklists instead of web search. "
@@ -66,6 +94,10 @@ mcp = FastMCP(
         "Use scryfall_rulings for official card rulings instead of web search or memory. "
         "Use edhrec_commander/edhrec_recommendations for deck recommendations instead of web search. "
         "Use scryfall_search/scryfall_named for card lookups instead of web search. "
+        "Use scryfall_price for a card's prices across printings — pass set_code and "
+        "collector_number to price one exact printing, or finish to price a foil or "
+        "etched copy — and scryfall_price_list to price a whole decklist at the "
+        "printings and finishes written on its lines. Never estimate prices from memory. "
         "These tools return authoritative, up-to-date data directly from the source APIs. "
         "Watchlist: price watchlists are identified by a passphrase. When the "
         "user gives one (or uses a personal connector URL) pass it through; "
@@ -315,6 +347,12 @@ class ScryfallSearchOrder(str, Enum):
     REVIEW = "review"
 
 
+class CardFinish(str, Enum):
+    NONFOIL = "nonfoil"
+    FOIL = "foil"
+    ETCHED = "etched"
+
+
 class SearchInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     query: str = Field(
@@ -345,15 +383,52 @@ class RandomInput(BaseModel):
 class PriceInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     name: str = Field(..., description="Card name to look up prices for.", min_length=1, max_length=200)
+    set_code: Optional[str] = Field(
+        default=None,
+        description="Restrict to one set, e.g. 'dmr'. Use with collector_number to pin one printing.",
+        min_length=2, max_length=6,
+    )
+    collector_number: Optional[str] = Field(
+        default=None,
+        description=(
+            "Collector number within the set, e.g. '281' or 'IFIYW-10'. "
+            "Requires set_code. With both set, prices exactly one printing."
+        ),
+        max_length=20,
+    )
+    finish: Optional[CardFinish] = Field(
+        default=None,
+        description="Restrict to printings available in this finish, and lead with its price.",
+    )
+    include_digital: bool = Field(
+        default=False,
+        description="Include Arena/MTGO-only printings. They never have paper prices, so off by default.",
+    )
     limit: int = Field(default=10, description="Max printings to show.", ge=1, le=50)
+
+    @model_validator(mode="after")
+    def _collector_number_requires_set(self):
+        if self.collector_number and not self.set_code:
+            raise ValueError(
+                "collector_number requires set_code — collector numbers are only "
+                "unique within a set."
+            )
+        return self
 
 
 class PriceListInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    cards: list[str] = Field(
+    decklist: str = Field(
         ...,
-        description="List of card names to price (max 75 per request).",
-        min_length=1, max_length=75,
+        description=(
+            "Decklist text, one card per line. Plain names work ('1 Sol Ring'), "
+            "and so do full Archidekt/Moxfield lines naming a printing and "
+            "finish ('1x Sol Ring (ltc) 284 *F* [Ramp]'). Lines with a set code "
+            "are priced at that exact printing; lines without one use Scryfall's "
+            "default printing and are flagged separately in the output. "
+            "Max 500 lines."
+        ),
+        min_length=1, max_length=50000,
     )
 
 
@@ -417,121 +492,255 @@ async def scryfall_random(params: RandomInput) -> str:
         return _scryfall_error(e)
 
 
+def _printing_header(card: dict) -> str:
+    """'**Dominaria Remastered** (DMR #281, common)' — shared by both views."""
+    return (f"**{card.get('set_name', '?')}** "
+            f"({(card.get('set') or '?').upper()} "
+            f"#{card.get('collector_number', '?')}, "
+            f"{card.get('rarity', '?')})")
+
+
+def _format_price_columns(card: dict) -> str:
+    """Every price this printing has, as a single display string."""
+    prices = card.get("prices") or {}
+    bits: list[str] = []
+    if prices.get("usd"):
+        bits.append(f"${prices['usd']}")
+    if prices.get("usd_foil"):
+        bits.append(f"Foil: ${prices['usd_foil']}")
+    if prices.get("usd_etched"):
+        bits.append(f"Etched: ${prices['usd_etched']}")
+    if prices.get("eur"):
+        bits.append(f"EUR: €{prices['eur']}")
+    if prices.get("tix"):
+        bits.append(f"MTGO: {prices['tix']} tix")
+    return " | ".join(bits) if bits else "No price data"
+
+
+def _describe_price_filters(params: "PriceInput") -> str:
+    """' (set:dmr, foil)' — states which filters produced this result set."""
+    bits: list[str] = []
+    if params.set_code:
+        bits.append(f"set:{params.set_code}")
+    if params.collector_number:
+        bits.append(f"cn:{params.collector_number}")
+    if params.finish:
+        bits.append(params.finish.value)
+    if params.include_digital:
+        bits.append("including digital")
+    return f" ({', '.join(bits)})" if bits else ""
+
+
+def _format_single_printing(card: dict, finish: Optional[str]) -> str:
+    """Detail view for one pinned printing — enough to identify a physical copy."""
+    parts: list[str] = []
+    parts.append(f"# {card.get('name', '?')}")
+    parts.append(_printing_header(card))
+    parts.append("")
+    parts.append(f"Prices: {_format_price_columns(card)}")
+    parts.append(f"Available finishes: {_available_finishes(card)}")
+
+    requested = _price_for_finish(card, finish)
+    if finish:
+        if requested is not None:
+            parts.append(f"Requested finish ({finish}): ${requested:.2f}")
+        else:
+            parts.append(f"Requested finish ({finish}): no price for this printing")
+
+    parts.append("")
+    if card.get("artist"):
+        parts.append(f"Artist: {card['artist']}")
+    frame_bits = [card.get("frame", ""), card.get("border_color", "")]
+    frame = ", ".join(b for b in frame_bits if b)
+    if frame:
+        parts.append(f"Frame/border: {frame}")
+    if card.get("promo_types"):
+        parts.append(f"Promo types: {', '.join(card['promo_types'])}")
+    if card.get("released_at"):
+        parts.append(f"Released: {card['released_at']}")
+    if card.get("scryfall_uri"):
+        parts.append(f"Link: {card['scryfall_uri']}")
+
+    return "\n".join(parts)
+
+
+def _price_query(params: "PriceInput") -> str:
+    """Scryfall search query for a price lookup, including printing filters."""
+    bits = [f'!"{params.name}"']
+    if params.set_code:
+        bits.append(f"set:{params.set_code}")
+    if params.collector_number:
+        bits.append(f"cn:{params.collector_number}")
+    if params.finish:
+        bits.append(f"is:{params.finish.value}")
+    if not params.include_digital:
+        bits.append("-is:digital")
+    return " ".join(bits)
+
+
+def _sort_by_price(cards: list[dict], finish: Optional[str]) -> list[dict]:
+    """Cheapest priced printing first, unpriced printings last.
+
+    Scryfall's own order=usd&dir=asc sorts null prices FIRST, which meant this
+    tool's top rows were routinely printings with no price at all.
+    """
+    def sort_key(card: dict):
+        price = _price_for_finish(card, finish)
+        return (price is None, price if price is not None else Decimal("0"))
+    return sorted(cards, key=sort_key)
+
+
 @mcp.tool(name="scryfall_price")
 async def scryfall_price(params: PriceInput) -> str:
-    """Get current market prices for a card across all printings.
+    """Get current market prices for a card, optionally for one specific printing.
 
-    Shows USD (TCGPlayer), EUR (Cardmarket), and MTGO tix prices for each
-    printing, sorted cheapest first. Prices updated daily by Scryfall.
+    With no filters, lists printings cheapest first (printings with no price
+    sort last, not first). Pass set_code to restrict to one set, set_code plus
+    collector_number to price exactly one printing, or finish to restrict to
+    printings that come in foil or etched.
+
+    Digital-only (Arena/MTGO) printings are excluded by default because they
+    never carry paper prices. Prices are updated daily by Scryfall.
     """
     try:
         data = await _scryfall_get(
             "/cards/search",
-            params={"q": f'!"{params.name}"', "unique": "prints", "order": "usd", "dir": "asc"},
+            params={
+                "q": _price_query(params),
+                "unique": "prints",
+                # Results are re-sorted client-side by price with unpriced
+                # printings last (Scryfall sorts nulls first), so the requested
+                # order only decides which page-1 slice we get for cards with
+                # more printings than one page holds.
+                "order": "usd",
+                "dir": "asc",
+            },
         )
     except Exception as e:
         return _scryfall_error(e)
 
     cards = data.get("data", [])
     if not cards:
-        return f"No printings found for '{params.name}'."
+        return f"No printings found for '{params.name}' with those filters."
+
+    finish = params.finish.value if params.finish else None
+    total = data.get("total_cards", len(cards))
+
+    # One printing pinned exactly — show it in detail instead of as a list row.
+    if params.set_code and params.collector_number and len(cards) == 1:
+        return _format_single_printing(cards[0], finish)
+
+    ordered = _sort_by_price(cards, finish)[:params.limit]
 
     parts: list[str] = []
     parts.append(f"# Prices for {cards[0].get('name', params.name)}")
-    parts.append(f"{data.get('total_cards', len(cards))} printings found")
+    shown = f"Showing {len(ordered)} of {total} printings"
+    filters = _describe_price_filters(params)
+    parts.append(f"{shown}{filters}")
     parts.append("")
 
-    cheapest_usd = None
-    for card in cards[:params.limit]:
-        prices = card.get("prices", {})
-        set_name = card.get("set_name", "?")
-        set_code = card.get("set", "?").upper()
-        rarity = card.get("rarity", "?")
+    for card in ordered:
+        parts.append(f"{_printing_header(card)} — {_format_price_columns(card)}")
 
-        usd = prices.get("usd")
-        usd_foil = prices.get("usd_foil")
-        usd_etched = prices.get("usd_etched")
-        eur = prices.get("eur")
-        tix = prices.get("tix")
-
-        price_parts: list[str] = []
-        if usd:
-            price_parts.append(f"${usd}")
-            if cheapest_usd is None:
-                cheapest_usd = (usd, set_name, set_code)
-        if usd_foil:
-            price_parts.append(f"Foil: ${usd_foil}")
-        if usd_etched:
-            price_parts.append(f"Etched: ${usd_etched}")
-        if eur:
-            price_parts.append(f"EUR: €{eur}")
-        if tix:
-            price_parts.append(f"MTGO: {tix} tix")
-        if not price_parts:
-            price_parts.append("No price data")
-
-        parts.append(f"**{set_name}** ({set_code}, {rarity}) — {' | '.join(price_parts)}")
-
-    if cheapest_usd:
+    cheapest = next(
+        (c for c in ordered if _price_for_finish(c, finish) is not None), None)
+    if cheapest is not None:
+        price = _price_for_finish(cheapest, finish)
         parts.append("")
-        parts.append(f"Cheapest: ${cheapest_usd[0]} ({cheapest_usd[1]}, {cheapest_usd[2]})")
+        parts.append(f"Cheapest {finish or 'nonfoil'}: ${price:.2f} "
+                     f"({cheapest.get('set_name', '?')}, "
+                     f"{(cheapest.get('set') or '?').upper()} "
+                     f"#{cheapest.get('collector_number', '?')})")
+
+    if total > len(ordered):
+        parts.append("")
+        parts.append("Narrow with set_code, or raise limit, to see other printings.")
 
     return "\n".join(parts)
 
 
 @mcp.tool(name="scryfall_price_list")
 async def scryfall_price_list(params: PriceListInput) -> str:
-    """Price a list of cards and get the total cost.
+    """Price a decklist and total it, honoring the printing on each line.
 
-    Batch-prices up to 75 cards at once. Shows per-card prices sorted by
-    cost (most expensive first) and a total sum.
+    '1x Sol Ring (ltc) 284 *F*' is priced as that exact printing in that exact
+    finish. Lines naming no set use Scryfall's default printing and are listed
+    separately so the total is honest about what it guessed.
+
+    Never substitutes a different finish: if the requested finish has no price,
+    the line is reported on its own with the finishes that printing does have,
+    rather than being quietly totalled at another finish's price.
     """
-    identifiers = [{"name": name} for name in params.cards]
-    try:
-        data = await _scryfall_post("/cards/collection", {"identifiers": identifiers})
-    except Exception as e:
-        return _scryfall_error(e)
+    entries = _parse_decklist_entries(params.decklist)
+    if not entries:
+        return "No cards found in the decklist."
+    if len(entries) > 500:
+        return f"Too many lines ({len(entries)}). Maximum is 500."
 
-    found = data.get("data", [])
-    not_found = data.get("not_found", [])
+    identifiers = _dedupe_identifiers(entries)
 
-    priced: list[tuple[str, float]] = []
-    no_price: list[str] = []
+    found_cards: list[dict] = []
+    not_found: list[dict] = []
+    unchecked: list[dict] = []
+    errors: list[str] = []
 
-    for card in found:
-        name = card.get("name", "?")
-        prices = card.get("prices", {})
-        usd = prices.get("usd") or prices.get("usd_foil") or prices.get("usd_etched")
-        if usd:
-            priced.append((name, float(usd)))
-        else:
-            no_price.append(name)
+    for batch in _chunk(identifiers, 75):   # Scryfall's hard per-request cap
+        try:
+            data = await _scryfall_post("/cards/collection", {"identifiers": batch})
+        except Exception as e:
+            # Keep what other batches returned. These identifiers are unchecked,
+            # NOT missing — reporting them as "not found" would tell the user a
+            # real card does not exist because of a transient API failure.
+            unchecked.extend(batch)
+            errors.append(_scryfall_error(e))
+            continue
+        found_cards.extend(data.get("data", []))
+        not_found.extend(data.get("not_found", []))
 
-    priced.sort(key=lambda x: x[1], reverse=True)
+    if unchecked and not found_cards:
+        return errors[0]
 
+    sections = _build_price_sections(
+        entries, _index_collection_results(found_cards), not_found, unchecked)
+
+    total_cards = sum(e.quantity for e in entries)
     parts: list[str] = []
-    parts.append(f"# Price List ({len(found)} cards found)")
+    parts.append(f"# Price List ({total_cards} cards)")
     parts.append("")
 
-    total = 0.0
-    for name, val in priced:
-        parts.append(f"- **{name}** — ${val:.2f}")
-        total = round(total + val, 2)
-
-    if no_price:
+    if sections["priced"]:
+        parts.append("**Priced at the printing you named:**")
+        parts.extend(f"- {line}" for line in sections["priced"])
         parts.append("")
-        parts.append("**No USD price available:**")
-        for name in no_price:
-            parts.append(f"- {name}")
 
-    if not_found:
+    if sections["defaulted"]:
+        parts.append("**No printing specified — Scryfall's default printing used:**")
+        parts.extend(f"- {line}" for line in sections["defaulted"])
         parts.append("")
+
+    if sections["no_price"]:
+        parts.append("**No price in the requested finish (excluded from total):**")
+        parts.extend(f"- {line}" for line in sections["no_price"])
+        parts.append("")
+
+    if sections["unchecked"]:
+        parts.append("**Could not be checked — Scryfall request failed (excluded from total):**")
+        parts.extend(f"- {line}" for line in sections["unchecked"])
+        parts.append(f"  ({errors[0]})")
+        parts.append("")
+
+    if sections["missing"]:
         parts.append("**Not found on Scryfall:**")
-        for item in not_found:
-            parts.append(f"- {item.get('name', str(item))}")
+        parts.extend(f"- {line}" for line in sections["missing"])
+        parts.append("")
 
-    parts.append("")
-    parts.append(f"**Total: ${total:.2f}** ({len(priced)} cards priced)")
+    parts.append(
+        f"**Total: ${sections['total']:.2f}** "
+        f"({sections['priced_cards']} of {total_cards} cards priced)"
+    )
+    uncovered = total_cards - sections["priced_cards"]
+    if uncovered:
+        parts.append(f"{uncovered} card(s) are not included in this total — see the sections above.")
 
     return "\n".join(parts)
 
@@ -1289,8 +1498,12 @@ async def archidekt_user_decks(params: ArchidektUserInput) -> str:
 async def archidekt_export(params: ArchidektDeckInput) -> str:
     """Export an Archidekt deck in Archidekt-compatible import format.
 
-    Uses the full Archidekt import syntax with set codes, categories, and labels:
-      1x Card Name (set) [Category{flags}] ^Label,#hex^
+    Uses the full Archidekt import syntax with set codes, finishes, categories,
+    and labels:
+      1x Card Name (set) 123 *F* [Category{flags}] ^Label,#hex^
+
+    Foil and etched cards keep their finish (*F* / *E*), so the exported list
+    re-imports as the same cards and prices correctly via scryfall_price_list.
 
     Category flags: {top} for commander, {noDeck}{noPrice} for maybeboard.
     Output can be pasted directly into Archidekt's import dialog.
@@ -1317,14 +1530,7 @@ async def archidekt_export(params: ArchidektDeckInput) -> str:
         entry_cats = entry.get("categories", [])
         labels = entry.get("labels") or []
 
-        # Build the line: 1x Card Name (set) collector [Category{flags}] ^label^
-        line = f"{qty}x {card_name}"
-
-        if set_code:
-            line += f" ({set_code})"
-
-        if collector:
-            line += f" {collector}"
+        modifier = entry.get("modifier", "")
 
         # Determine category annotation and deck inclusion
         cat_annotation = ""
@@ -1342,7 +1548,15 @@ async def archidekt_export(params: ArchidektDeckInput) -> str:
         if is_in_deck:
             total_in_deck += qty
 
-        line += cat_annotation
+        line = _archidekt_line(
+            quantity=qty,
+            name=card_name,
+            set_code=set_code,
+            collector=collector,
+            finish=MODIFIER_FINISHES.get(modifier),
+            category=cat_annotation,
+            labels="",
+        )
 
         # Labels
         for label in labels:
@@ -1368,11 +1582,45 @@ async def archidekt_export(params: ArchidektDeckInput) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _archidekt_line(
+    quantity: int,
+    name: str,
+    set_code: str,
+    collector: str,
+    finish: Optional[str],
+    category: str,
+    labels: str,
+) -> str:
+    """Build one Archidekt import line.
+
+    Grammar, verified against Archidekt's own text export 2026-08-08:
+      {qty}x {name} ({set}) {collector} *F* [{Category}{flags}] ^{Label},{#hex}^
+
+    `category` and `labels` arrive already formatted with their leading space.
+    """
+    line = f"{quantity}x {name}"
+    if set_code:
+        line += f" ({set_code})"
+    if collector:
+        line += f" {collector}"
+    marker = _finish_marker(finish)
+    if marker:
+        line += f" {marker}"
+    return line + category + labels
+
+
 class DeckCardEntry(BaseModel):
     """A single card entry for deck formatting."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     name: str = Field(..., description="Card name.")
     quantity: int = Field(default=1, ge=1, le=99)
+    finish: Optional[CardFinish] = Field(
+        default=None,
+        description=(
+            "Card finish. 'foil' emits *F* and 'etched' emits *E* on the line, "
+            "which Archidekt imports as that finish. Omit for a normal card."
+        ),
+    )
     category: Optional[str] = Field(default=None, description="Category name (e.g., 'Ramp', 'Draw', 'Removal', 'Lands').")
     commander: bool = Field(default=False, description="True if this is the commander (or partner).")
     maybeboard: bool = Field(default=False, description="True if this should go in the maybeboard.")
@@ -1408,6 +1656,10 @@ async def format_archidekt(params: FormatDeckInput) -> str:
       1x Commander Name [Commander{top}]
       1x Maybe Card [Maybeboard{noDeck}{noPrice}]
       1x Labeled Card [Draw] ^To Buy,#2ccce4^
+      1x Foil Card (dmr) 281 *F* [Ramp]
+
+    Set finish='foil' or finish='etched' on a card to mark it as such (*F* / *E*).
+    Pair it with include_set_codes so the marked line names a printing.
 
     Category examples: Ramp, Draw, Removal, Counters, Evasion, Finisher,
     Sacrifice, Recursion, Lands, Protection, Combo, Tokens, Tribal, etc.
@@ -1443,31 +1695,38 @@ async def format_archidekt(params: FormatDeckInput) -> str:
             card_name = entry.name
             warnings.append(f"# WARNING: '{entry.name}' not found on Scryfall")
 
-        line = f"{entry.quantity}x {card_name}"
-
-        # Set code (only if requested and card was found)
+        set_code = ""
+        collector = ""
         if params.include_set_codes and scryfall_card:
             set_code = scryfall_card.get("set", "")
             collector = scryfall_card.get("collector_number", "")
-            if set_code:
-                line += f" ({set_code})"
-            if collector:
-                line += f" {collector}"
 
         # Category annotation
+        cat_annotation = ""
         if entry.commander:
-            line += " [Commander{top}]"
+            cat_annotation = " [Commander{top}]"
         elif entry.maybeboard:
-            line += " [Maybeboard{noDeck}{noPrice}]"
+            cat_annotation = " [Maybeboard{noDeck}{noPrice}]"
         elif entry.category:
-            line += f" [{entry.category}]"
+            cat_annotation = f" [{entry.category}]"
 
         # Labels
+        label_text = ""
         if entry.label:
             if entry.label_color:
-                line += f" ^{entry.label},{entry.label_color}^"
+                label_text = f" ^{entry.label},{entry.label_color}^"
             else:
-                line += f" ^{entry.label}^"
+                label_text = f" ^{entry.label}^"
+
+        line = _archidekt_line(
+            quantity=entry.quantity,
+            name=card_name,
+            set_code=set_code,
+            collector=collector,
+            finish=entry.finish.value if entry.finish else None,
+            category=cat_annotation,
+            labels=label_text,
+        )
 
         lines.append(line)
 
@@ -1508,40 +1767,341 @@ class ValidateArchidektInput(BaseModel):
     )
 
 
-def _parse_decklist(text: str) -> list[tuple[int, str]]:
-    """Parse a decklist into (quantity, card_name) tuples.
+@dataclass(frozen=True)
+class DecklistEntry:
+    """One parsed decklist line, including the printing it names."""
+    quantity: int
+    name: str
+    set_code: Optional[str] = None
+    collector_number: Optional[str] = None
+    finish: Optional[str] = None
 
-    Handles multiple formats:
-      1 Card Name
-      1x Card Name
-      1x Card Name (set) 123 [Category{flags}] ^Label,#hex^
-      # comments are ignored
+
+_QTY_RE = re.compile(r"^(\d+)x?\s+(.+)$")
+_LABEL_RE = re.compile(r"\s*\^[^^]*\^")
+_CATEGORY_RE = re.compile(r"\s*\[[^\]]*\]")
+_MARKER_RE = re.compile(r"\s*\*([FE])\*", re.IGNORECASE)
+_WORD_FINISH_RE = re.compile(r"\s*[(\[](foil|etched)[)\]]", re.IGNORECASE)
+# Anchored to the end so it can only match a trailing printing suffix, never a
+# card name that happens to contain parentheses (e.g. "B.F.M. (Big Furry
+# Monster)" — the inner text has spaces and cannot match a set token).
+_SET_CN_RE = re.compile(r"\s*\((?P<set>[a-zA-Z0-9]{2,6})\)(?:\s+(?P<cn>[^\s\[\]^*]+))?\s*$")
+
+
+def _parse_decklist_entries(text: str) -> list[DecklistEntry]:
+    """Parse a decklist into entries that keep set, collector number, and finish.
+
+    Handles the Archidekt/Moxfield grammar:
+      [qty][x] Name [(set)] [collector] [*F*|*E*] [[Category{flags}]] [^Label,#hex^]
+
+    Bare names and quantity-only lines still parse; the printing fields are just
+    None. Lines starting with '#' or '//' are comments.
     """
-    cards: list[tuple[int, str]] = []
-    for line in text.strip().splitlines():
-        line = line.strip()
+    entries: list[DecklistEntry] = []
+    for raw_line in text.strip().splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("//") or line.startswith("#"):
             continue
-        # Match: optional quantity (with optional 'x'), then card name,
-        # then strip trailing (set), collector#, [category], ^label^
-        match = re.match(r"^(\d+)x?\s+(.+)$", line)
+
+        match = _QTY_RE.match(line)
         if match:
             qty = int(match.group(1))
-            name = match.group(2).strip()
+            rest = match.group(2).strip()
         else:
             qty = 1
-            name = line
+            rest = line
 
-        # Strip Archidekt suffixes: (set) collector [Cat{flags}] ^label^
-        name = re.sub(r"\s*\^[^^]*\^", "", name)       # ^Label,#hex^
-        name = re.sub(r"\s*\[[^\]]*\]", "", name)       # [Category{flags}]
-        name = re.sub(r"\s+\d+$", "", name)              # trailing collector number
-        name = re.sub(r"\s*\([a-z0-9]+\)$", "", name)   # (set)
+        # Labels and categories carry no pricing information.
+        rest = _LABEL_RE.sub("", rest)
+        rest = _CATEGORY_RE.sub("", rest)
+
+        # Finish marker, before the set suffix so that "(foil)" is consumed here
+        # rather than being mistaken for a 4-character set code below.
+        finish: Optional[str] = None
+        marker = _MARKER_RE.search(rest)
+        if marker:
+            finish = MARKER_FINISHES[marker.group(1).upper()]
+            rest = _MARKER_RE.sub("", rest, count=1)
+        else:
+            worded = _WORD_FINISH_RE.search(rest)
+            if worded:
+                finish = worded.group(1).lower()
+                rest = _WORD_FINISH_RE.sub("", rest, count=1)
+
+        # Set and collector number, anchored at the end of what remains.
+        set_code: Optional[str] = None
+        collector: Optional[str] = None
+        suffix = _SET_CN_RE.search(rest)
+        if suffix:
+            set_code = suffix.group("set").lower()
+            collector = suffix.group("cn")
+            rest = rest[:suffix.start()]
+
+        # Legacy residual strips, kept verbatim so validate_decklist and
+        # precon_diff see the names they have always seen.
+        name = rest
+        name = re.sub(r"\s*\^[^^]*\^", "", name)
+        name = re.sub(r"\s*\[[^\]]*\]", "", name)
+        name = re.sub(r"\s+\d+$", "", name)
+        name = re.sub(r"\s*\([a-z0-9]+\)$", "", name)
         name = name.strip()
 
         if name:
-            cards.append((qty, name))
-    return cards
+            entries.append(DecklistEntry(qty, name, set_code, collector, finish))
+    return entries
+
+
+def _parse_decklist(text: str) -> list[tuple[int, str]]:
+    """Parse a decklist into (quantity, card_name) tuples.
+
+    Thin wrapper over _parse_decklist_entries, kept for validate_decklist and
+    precon_diff, which do not care about printings.
+    """
+    return [(e.quantity, e.name) for e in _parse_decklist_entries(text)]
+
+
+def _entry_identifier(entry: DecklistEntry) -> dict:
+    """Scryfall /cards/collection identifier naming this entry's printing.
+
+    Set plus collector number pins one printing exactly. Set alone lets Scryfall
+    choose within that set. Neither means Scryfall picks the default printing,
+    which the caller is responsible for flagging in its output.
+    """
+    if entry.set_code and entry.collector_number:
+        return {"set": entry.set_code, "collector_number": entry.collector_number}
+    if entry.set_code:
+        return {"name": entry.name, "set": entry.set_code}
+    return {"name": entry.name}
+
+
+def _identifier_key(identifier: dict) -> str:
+    """Stable comparable key for a Scryfall identifier dict.
+
+    Identifier shapes differ ({set,collector_number} / {name,set} / {name}), so
+    sort before repr to get a key that does not depend on construction order.
+    """
+    return repr(sorted(identifier.items()))
+
+
+def _dedupe_identifiers(entries: list[DecklistEntry]) -> list[dict]:
+    """Unique identifiers for these entries, in first-seen order.
+
+    Several lines may name the same printing; each printing only needs asking
+    about once.
+    """
+    identifiers: list[dict] = []
+    seen: set[str] = set()
+    for entry in entries:
+        identifier = _entry_identifier(entry)
+        key = _identifier_key(identifier)
+        if key not in seen:
+            seen.add(key)
+            identifiers.append(identifier)
+    return identifiers
+
+
+def _chunk(items: list, size: int) -> list[list]:
+    """Split items into chunks of at most `size`."""
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def _price_for_finish(card: dict, finish: Optional[str]) -> Optional[Decimal]:
+    """USD price of this card in exactly the requested finish, or None.
+
+    Deliberately does NOT fall back to another finish. A missing price is
+    reported as missing; quoting a foil price for a nonfoil request produces a
+    confidently wrong number, which is worse than no number.
+    """
+    key = FINISH_PRICE_KEYS.get(finish or "nonfoil", "usd")
+    raw = (card.get("prices") or {}).get(key)
+    if raw in (None, ""):
+        return None
+    try:
+        return Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _card_name_aliases(card: dict) -> list[str]:
+    """Lowercased names a decklist line might use for this card.
+
+    Includes each face of a double-faced card, since a list may write only the
+    front face while Scryfall returns 'Front // Back'.
+    """
+    full = (card.get("name") or "").lower().strip()
+    if not full:
+        return []
+    aliases = [full]
+    if "//" in full:
+        aliases.extend(part.strip() for part in full.split("//") if part.strip())
+    return aliases
+
+
+def _index_collection_results(cards: list[dict]) -> dict:
+    """Index collection results for lookup by printing, name+set, or name.
+
+    Scryfall does not guarantee that response order matches request order, and
+    omits not-found entries, so results must be matched explicitly rather than
+    by position. First card wins on any given key.
+    """
+    index: dict = {}
+    for card in cards:
+        set_code = (card.get("set") or "").lower()
+        collector = card.get("collector_number") or ""
+        if set_code and collector:
+            index.setdefault(("printing", set_code, collector), card)
+        for alias in _card_name_aliases(card):
+            if set_code:
+                index.setdefault(("name_set", alias, set_code), card)
+            index.setdefault(("name", alias), card)
+    return index
+
+
+def _lookup_entry(index: dict, entry: DecklistEntry) -> Optional[dict]:
+    """Find the card matching this entry, most specific key first.
+
+    An entry that names a collector number is asking for one exact printing, so
+    a miss there is a miss — degrading to another printing of the same card
+    would report someone else's price as the user's. Entries that named only a
+    set, or only a name, do degrade.
+    """
+    name = entry.name.lower().strip()
+    set_code = (entry.set_code or "").lower()
+
+    if set_code and entry.collector_number:
+        return index.get(("printing", set_code, entry.collector_number))
+    if set_code:
+        hit = index.get(("name_set", name, set_code))
+        if hit is not None:
+            return hit
+    return index.get(("name", name))
+
+
+def _identifier_label(identifier: dict) -> str:
+    """Human-readable rendering of an identifier we sent to Scryfall.
+
+    /cards/collection echoes unmatched identifiers back verbatim, so this is
+    what the 'not found' section prints.
+    """
+    name = identifier.get("name")
+    set_code = identifier.get("set")
+    collector = identifier.get("collector_number")
+    if set_code and collector:
+        return f"{set_code.upper()} #{collector}"
+    if name and set_code:
+        return f"{name} ({set_code.upper()})"
+    return name or str(identifier)
+
+
+def _printing_label(card: dict, finish: Optional[str]) -> str:
+    """'Counterspell (DMR #281, foil)' — the printing a price refers to."""
+    name = card.get("name", "?")
+    set_code = (card.get("set") or "?").upper()
+    collector = card.get("collector_number", "?")
+    return f"{name} ({set_code} #{collector}, {finish or 'nonfoil'})"
+
+
+def _available_finishes(card: dict) -> str:
+    """What this printing does exist in, and what those cost.
+
+    Shown when the requested finish has no price, so the user learns why rather
+    than just that the number is missing.
+    """
+    bits: list[str] = []
+    for finish in ("nonfoil", "foil", "etched"):
+        if finish not in (card.get("finishes") or []):
+            continue
+        price = _price_for_finish(card, finish)
+        bits.append(f"{finish} ${price:.2f}" if price is not None else f"{finish} (no price)")
+    return ", ".join(bits) if bits else "none listed"
+
+
+def _entry_suffix(entry: DecklistEntry) -> str:
+    """What the decklist line asked for, for lines with no matching card."""
+    bits: list[str] = []
+    if entry.set_code:
+        printing = entry.set_code.upper()
+        if entry.collector_number:
+            printing += f" #{entry.collector_number}"
+        bits.append(f"({printing})")
+    if entry.finish:
+        bits.append(entry.finish)
+    return (" " + " ".join(bits)) if bits else ""
+
+
+def _build_price_sections(
+    entries: list[DecklistEntry],
+    index: dict,
+    not_found: list[dict],
+    unchecked: Optional[list[dict]] = None,
+) -> dict:
+    """Sort priced lines into sections and total only what was actually priced.
+
+    Returns lists of preformatted strings plus the total, so the tool body is
+    assembly only and this logic stays testable without network access.
+    """
+    priced: list[tuple[Decimal, str]] = []
+    defaulted: list[tuple[Decimal, str]] = []
+    no_price: list[str] = []
+    missing: list[str] = []
+    missing_identifiers: set[str] = set()
+    unchecked_lines: list[str] = []
+    unchecked_keys = {_identifier_key(i) for i in (unchecked or [])}
+
+    total = Decimal("0")
+    priced_cards = 0
+
+    for entry in entries:
+        card = _lookup_entry(index, entry)
+        if card is None:
+            entry_key = _identifier_key(_entry_identifier(entry))
+            if entry_key in unchecked_keys:
+                unchecked_lines.append(
+                    f"{entry.quantity}x {entry.name}{_entry_suffix(entry)}")
+            else:
+                missing.append(f"{entry.quantity}x {entry.name}{_entry_suffix(entry)}")
+                missing_identifiers.add(entry_key)
+            continue
+
+        unit = _price_for_finish(card, entry.finish)
+        if unit is None:
+            no_price.append(
+                f"{entry.quantity}x {_printing_label(card, entry.finish)} — "
+                f"no {entry.finish or 'nonfoil'} price. "
+                f"This printing has: {_available_finishes(card)}"
+            )
+            continue
+
+        line_total = unit * entry.quantity
+        total += line_total
+        priced_cards += entry.quantity
+        text = (f"{entry.quantity}x {_printing_label(card, entry.finish)} — "
+                f"${unit:.2f} ea → ${line_total:.2f}")
+        # A line that named no set got whichever printing Scryfall chose.
+        (priced if entry.set_code else defaulted).append((line_total, text))
+
+    priced.sort(key=lambda item: item[0], reverse=True)
+    defaulted.sort(key=lambda item: item[0], reverse=True)
+
+    # Every not_found identifier corresponds to some entry above whose lookup
+    # already failed (that's the identifier we sent for it), so it is already
+    # represented in `missing` with quantity and printing detail. Only surface
+    # a not_found identifier here if it somehow has no matching line above —
+    # defensive, but avoids reporting the same missing card twice.
+    for identifier in not_found:
+        key = _identifier_key(identifier)
+        if key not in missing_identifiers:
+            missing.append(_identifier_label(identifier))
+
+    return {
+        "priced": [text for _, text in priced],
+        "defaulted": [text for _, text in defaulted],
+        "no_price": no_price,
+        "missing": missing,
+        "unchecked": unchecked_lines,
+        "total": total,
+        "priced_cards": priced_cards,
+    }
 
 
 @mcp.tool(name="validate_decklist")

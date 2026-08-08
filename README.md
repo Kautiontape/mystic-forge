@@ -10,8 +10,8 @@ A unified MCP (Model Context Protocol) server for Magic: The Gathering. Combines
 | `scryfall_search` | Full Scryfall query syntax search |
 | `scryfall_named` | Look up a card by name (exact + fuzzy) |
 | `scryfall_random` | Random card with optional filter |
-| `scryfall_price` | Current prices across all printings |
-| `scryfall_price_list` | Batch-price up to 75 cards at once |
+| `scryfall_price` | Prices per printing; pin one with set code + collector number, filter by finish |
+| `scryfall_price_list` | Price a decklist at the printing and finish on each line |
 
 ### EDHRec — Commander Recommendations
 | Tool | Description |
