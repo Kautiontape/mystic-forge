@@ -66,6 +66,8 @@ CREATE TABLE IF NOT EXISTS card_uuids (
   PRIMARY KEY (card_name, uuid)
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE INDEX IF NOT EXISTS idx_prices_pfud
+  ON prices(provider, finish, uuid, date);
 """
 
 
