@@ -134,7 +134,8 @@ class Game:
     # -- serialization (D3) ------------------------------------------------
     def to_dict(self) -> dict:
         """"land_drops_remaining" is display-only; from_dict reads only
-        "land_drops_used"."""
+        "land_drops_used". The "opponents" array is 0-based; log labels are
+        1-based ("opp1" is opponents[0])."""
         return {
             "turn": self.turn, "phase": self.phase,
             "mana_pool": dict(self.mana_pool),
@@ -441,6 +442,23 @@ def _focus_target(g: Game) -> int:
     return 0
 
 
+def _damage_opponent(g: Game, idx: int, amount: int):
+    """Apply damage with life floored at 0 — the same zero convention as
+    commander-damage elimination. Overkill magnitude is deliberately
+    uncounted in life; the metrics' combat/noncombat damage split (Task 13)
+    owns damage totals."""
+    g.opponents[idx] = max(0, g.opponents[idx] - amount)
+
+
+def _check_table_win(g: Game):
+    """Table kill: every opponent at 0 sets won_turn exactly once. Called
+    from combat damage AND the damage verb — a cast-trigger burn kill must
+    not leave a dead table simulating on to the turn cap."""
+    if g.won_turn is None and all(life <= 0 for life in g.opponents):
+        g.won_turn = g.turn
+        g.emit(f"all opponents defeated — won turn {g.turn}")
+
+
 def _tutor_match(g: Game, f: str, name: str) -> bool:
     if f == "any":
         return True
@@ -490,11 +508,13 @@ def execute_verb(g: Game, source, verb: str, ctx: dict | None = None, **params):
             raise IllegalAction(
                 f"damage requires target in {sorted(DAMAGE_TARGETS)}, got {target!r}")
         if target == "each_opponent":
-            g.opponents = [life - n for life in g.opponents]
+            for i, life in enumerate(g.opponents):
+                if life > 0:              # dead opponents don't deepen
+                    _damage_opponent(g, i, n)
         else:
-            i = _focus_target(g)
-            g.opponents[i] -= n
+            _damage_opponent(g, _focus_target(g), n)
         g.emit(f"{n} damage ({target})")
+        _check_table_win(g)
     elif verb == "create_token":
         power, toughness = params.get("power"), params.get("toughness")
         if power is None or toughness is None:
@@ -1033,9 +1053,11 @@ def _step_attack(g: Game, action: dict):
     battlefield, so ONE dispatch reaches both — each with source=itself),
     tap all attackers, then damage per attacker: full effective_power into
     the focus-fire target (first opponent still above 0 when THAT attacker's
-    damage applies — overkill never spills). The commander's damage also
-    accrues cmdr_damage; 21+ eliminates that opponent (life zeroed). A table
-    kill (every opponent at or below 0) sets won_turn once."""
+    damage applies — overkill never spills, and life floors at 0). The
+    commander's damage also accrues cmdr_damage; 21+ eliminates that
+    opponent (life zeroed). The logged "total" is the power COMMITTED by all
+    attackers, even when the table dies before every attacker's damage lands.
+    A table kill (every opponent at 0) sets won_turn once."""
     if g.phase != "combat":
         raise IllegalAction(f"cannot attack during {g.phase}")
     if g.attacked_this_combat:
@@ -1057,6 +1079,7 @@ def _step_attack(g: Game, action: dict):
         attackers.append(p)
     # --- all checks passed; mutation begins ---
     g.attacked_this_combat = True
+    g.combats_done += 1               # per-turn: consumed combat instances
     ctx = {"attackers": list(ids)}
     fire(g, "combat_begin", ctx=ctx)
     if not attackers:
@@ -1065,16 +1088,17 @@ def _step_attack(g: Game, action: dict):
         fire(g, "attack", ctx=ctx)
         for p in attackers:
             p.tapped = True
-        total = 0
+        # committed power, pinned before the dead-table break below: the log
+        # reports what was swung, not what landed
+        powers = [effective_power(g, p) for p in attackers]
+        total = sum(powers)
         hit: list[int] = []           # opponent indexes in first-hit order
         eliminated: list[int] = []
-        for p in attackers:
+        for p, power in zip(attackers, powers):
             i = next((j for j, life in enumerate(g.opponents) if life > 0), None)
             if i is None:
                 break                 # nobody left alive to assign damage to
-            power = effective_power(g, p)
-            total += power
-            g.opponents[i] -= power
+            _damage_opponent(g, i, power)
             if i not in hit:
                 hit.append(i)
             if p.name == g.commander_name and not p.is_token:
@@ -1087,9 +1111,7 @@ def _step_attack(g: Game, action: dict):
                f"{summary or 'no living target'}")
         for i in eliminated:
             g.emit(f"opp{i + 1} eliminated by commander damage")
-    if g.won_turn is None and all(life <= 0 for life in g.opponents):
-        g.won_turn = g.turn
-        g.emit(f"all opponents defeated — won turn {g.turn}")
+    _check_table_win(g)
 
 
 def _step_pass(g: Game):
@@ -1111,6 +1133,12 @@ def _step_pass(g: Game):
             g.attacked_this_combat = False
             g.emit("extra combat")
         else:
+            if g.extra_combats > 0:
+                # Reachable only without an attack this combat (the replay
+                # branch above consumed the attacked case): extras don't
+                # carry past combat — stricter-than-plan gate, made visible.
+                g.emit(f"forfeited {g.extra_combats} extra combat(s)")
+                g.extra_combats = 0
             g.phase = "main2"
             g.emit("phase: main2")
     else:

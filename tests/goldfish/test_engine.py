@@ -1629,11 +1629,11 @@ def test_focus_fire_full_power_per_attacker_no_spillover():
     boss = g.new_perm("Boss"); boss.arrived_turn = 2
     g.opponents = [1, 40, 40]
     step(g, {"type": "attack", "attackers": [bear.id, boss.id]})
-    assert g.opponents == [-1, 37, 40]            # bear overkills opp1, boss
-    assert g.cmdr_damage == [0, 3, 0]             # retargets opp2 in full
+    assert g.opponents == [0, 37, 40]             # bear overkills opp1 (life floors
+    assert g.cmdr_damage == [0, 3, 0]             # at 0); boss retargets opp2 in full
     assert g.won_turn is None
     # exact log format pinned (golden logs)
-    assert "T3: attacked with 2 (total 5) — opp1 to -1, opp2 to 37" in g.log
+    assert "T3: attacked with 2 (total 5) — opp1 to 0, opp2 to 37" in g.log
 
 
 def test_commander_damage_21_eliminates_opponent():
@@ -1829,3 +1829,135 @@ def test_legal_actions_excludes_self_attach_pair():
     bear = g.new_perm("Bear")
     attaches = [a for a in legal_actions(g) if a["type"] == "attach"]
     assert attaches == [{"type": "attach", "card": blade.id, "target": bear.id}]
+
+
+# -- Task 9 review fixes: noncombat wins, life floor, combats_done, forfeits -
+
+def test_cast_trigger_burn_kill_sets_won_turn():
+    # Reviewer repro: a cast-trigger damage kill used to leave won_turn None
+    # and the game simulating a dead table to the turn cap.
+    cards = mini_cards()
+    cards["Fireball"] = SimCard(data=make_data("Fireball", cost=parse_cost("{R}"),
+                                types=frozenset({"sorcery"})), ann=None, scope_class=None)
+    annotated(cards, "Fireball", {"name": "Fireball", "triggers": [
+        {"on": "cast", "do": "damage", "target": "each_opponent", "count": 3}]})
+    g = started(cards, ["Plains"] * 40, hand=["Fireball"])
+    g.new_perm("Mountain")
+    g.opponents = [2]
+    step(g, {"type": "cast", "card": "Fireball"})
+    assert g.opponents == [0]                     # floored, not -1
+    assert g.won_turn == 1
+    assert "T1: all opponents defeated — won turn 1" in g.log
+
+
+def test_damage_floors_life_at_zero_and_skips_dead_opponents():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1, opponents=3)
+    g.phase = "main1"; g.turn = 2
+    g.opponents = [1, 0, 5]
+    execute_verb(g, None, "damage", count=2, target="each_opponent")
+    assert g.opponents == [0, 0, 3]               # floored; dead opp2 untouched
+    assert g.won_turn is None
+    execute_verb(g, None, "damage", count=50, target="one_opponent")
+    assert g.opponents == [0, 0, 0]               # focus-fire found opp3; floored
+    assert g.won_turn == 2                        # damage verb detects the table kill
+    assert sum("won turn" in line for line in g.log) == 1
+
+
+def test_combats_done_counts_consumed_attacks_and_resets():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.turn = 2
+    bear = g.new_perm("Bear"); bear.arrived_turn = 1
+    runner = g.new_perm("Runner")
+    g.extra_combats = 1
+    g.phase = "combat"
+    step(g, {"type": "attack", "attackers": [bear.id]})
+    assert g.combats_done == 1
+    step(g, {"type": "pass"})                     # replay: extra pending
+    step(g, {"type": "attack", "attackers": [runner.id]})
+    assert g.combats_done == 2                    # base + extra both consumed
+    step(g, {"type": "pass"})                     # main2
+    step(g, {"type": "pass"})                     # into turn 3
+    assert g.turn == 3 and g.combats_done == 0    # per-turn counter resets
+
+
+def test_attack_trigger_grants_extra_combat_replay():
+    # Aggravated Assault shape via annotation: an attacker whose own
+    # {on: attack} trigger banks the extra combat that replays the phase.
+    cards = mini_cards()
+    cards["Berserker"] = SimCard(data=make_data("Berserker", cost=parse_cost("{3}{R}"),
+                                 types=frozenset({"creature"}), power=2, toughness=2),
+                                 ann=None, scope_class=None)
+    annotated(cards, "Berserker", {"name": "Berserker", "triggers": [
+        {"on": "attack", "do": "extra_combat", "count": 1}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.turn = 2
+    zerk = g.new_perm("Berserker"); zerk.arrived_turn = 1
+    runner = g.new_perm("Runner")                 # haste: swings in the replay
+    g.phase = "combat"
+    step(g, {"type": "attack", "attackers": [zerk.id]})
+    assert g.extra_combats == 1                   # own attack trigger banked it
+    step(g, {"type": "pass"})
+    assert g.phase == "combat" and g.extra_combats == 0
+    step(g, {"type": "attack", "attackers": [runner.id]})
+    assert g.opponents == [37]                    # 2 + 1 across both combats
+    assert g.extra_combats == 1                   # attack is a GLOBAL event: the
+    step(g, {"type": "pass"})                     # battlefield Berserker banked
+    assert g.phase == "combat"                    # another replay (repeatable, as
+    step(g, {"type": "attack", "attackers": []})  # printed) — ended by declaring
+    step(g, {"type": "pass"})                     # no attack (no attack event, no
+    assert g.phase == "main2"                     # new extra) and passing out
+    assert g.combats_done == 3
+
+
+def test_pass_without_attack_forfeits_pending_extra_combats():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.turn = 2
+    bear = g.new_perm("Bear"); bear.arrived_turn = 1
+    g.phase = "combat"
+    g.extra_combats = 2
+    step(g, {"type": "pass"})                     # never attacked this combat
+    assert g.phase == "main2"                     # stricter-than-plan gate holds
+    assert g.extra_combats == 0                   # forfeited, not carried
+    assert "T2: forfeited 2 extra combat(s)" in g.log
+    assert bear.tapped is False
+
+
+def test_mid_combat_resume_preserves_attack_consumption():
+    cards = mini_cards()
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.turn = 2
+    bear = g.new_perm("Bear"); bear.arrived_turn = 1
+    runner = g.new_perm("Runner")
+    g.phase = "combat"
+    step(g, {"type": "attack", "attackers": [bear.id]})
+    blob = json.loads(json.dumps(g.to_dict()))    # real JSON round trip
+    g2 = Game.from_dict(blob, cards)
+    assert g2.attacked_this_combat is True
+    with pytest.raises(IllegalAction):
+        step(g2, {"type": "attack", "attackers": [runner.id]})   # still consumed
+    assert legal_actions(g2) == [{"type": "pass"}]
+    assert g2.to_dict() == g.to_dict()
+
+
+def test_attack_log_pins_committed_power_when_no_living_target():
+    # A combat_begin trigger that wipes the table before combat damage: the
+    # damage verb's win check fires (once), and the attack line still logs the
+    # attacker's real committed power.
+    cards = mini_cards()
+    cards["Volley"] = SimCard(data=make_data("Volley", cost=parse_cost("{2}"),
+                              types=frozenset({"enchantment"})), ann=None, scope_class=None)
+    annotated(cards, "Volley", {"name": "Volley", "triggers": [
+        {"on": "combat_begin", "do": "damage", "target": "each_opponent", "count": 5}]})
+    g = started(cards, ["Plains"] * 40, hand=[])
+    g.turn = 2
+    g.new_perm("Volley")
+    bear = g.new_perm("Bear"); bear.arrived_turn = 1
+    g.phase = "combat"
+    g.opponents = [3]
+    step(g, {"type": "attack", "attackers": [bear.id]})
+    assert g.opponents == [0] and g.won_turn == 2
+    assert "T2: attacked with 1 (total 2) — no living target" in g.log
+    assert sum("won turn" in line for line in g.log) == 1     # no duplicate win
