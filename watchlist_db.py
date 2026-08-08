@@ -216,8 +216,10 @@ def add_card(db, list_id: int, card_name: str, set_code: str | None = None,
 
 
 def remove_entry(db, list_id: int, entry_id: int | None = None,
-                 name: str | None = None) -> dict:
-    row = _find_entry(db, list_id, entry_id=entry_id, name=name)
+                 name: str | None = None, set_code: str | None = None,
+                 collector_number: str | None = None) -> dict:
+    row = _find_entry(db, list_id, entry_id=entry_id, name=name,
+                      set_code=set_code, collector_number=collector_number)
     if row is None:
         raise NotFound(f"No watchlist entry matching "
                        f"{'#' + str(entry_id) if entry_id else name!r}")
@@ -364,3 +366,21 @@ def uuids_for_entry(db, entry: dict) -> list[str]:
         q += " AND collector_number=?"
         args.append(entry["collector_number"])
     return [r["uuid"] for r in db.execute(q, args)]
+
+
+def entry_price_summary(db, entry: dict, provider: str = "tcgplayer",
+                        today: str | None = None):
+    """Price summary for an entry's tracked printings.
+
+    Prefers normal finish; falls back to foil so foil-only collector
+    printings still show a price. Adds a 'finish' key to the result."""
+    uuids = uuids_for_entry(db, entry)
+    if not uuids:
+        return None
+    for finish in ("normal", "foil"):
+        s = price_summary(db, uuids, provider=provider, finish=finish,
+                          today=today)
+        if s is not None:
+            s["finish"] = finish
+            return s
+    return None

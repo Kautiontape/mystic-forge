@@ -51,3 +51,21 @@ def test_price_series_respects_days_window(db):
     series = watchlist_db.price_series(db, ["uuid-a"], days=10,
                                        today="2026-08-08")
     assert all(d >= "2026-07-29" for d, _ in series["points"])
+
+
+def test_entry_price_summary_falls_back_to_foil(db):
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Etched','u-f')")
+    watchlist_db.upsert_price(db, "u-f", "2026-08-08", "tcgplayer", "foil", 42.0)
+    entry = {"card_name": "Etched", "set_code": None, "collector_number": None,
+             "uuid": None}
+    s = watchlist_db.entry_price_summary(db, entry, today="2026-08-08")
+    assert s["current"] == 42.0 and s["finish"] == "foil"
+
+
+def test_entry_price_summary_prefers_normal(db):
+    seed(db)
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Sol Ring','uuid-a')")
+    entry = {"card_name": "Sol Ring", "set_code": None,
+             "collector_number": None, "uuid": None}
+    s = watchlist_db.entry_price_summary(db, entry, today="2026-08-08")
+    assert s["current"] == 7.0 and s["finish"] == "normal"

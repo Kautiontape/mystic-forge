@@ -2390,6 +2390,8 @@ class WatchlistRemoveInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: Optional[str] = Field(None, description="Card name to remove")
     entry_id: Optional[int] = Field(None, description="Entry id (from watchlist_list/history)")
+    set_code: Optional[str] = Field(None, description="Disambiguate a specific pinned printing")
+    collector_number: Optional[str] = Field(None, description="Disambiguate a specific pinned printing")
     passphrase: Optional[str] = Field(None, description="List passphrase (omit when using a personal connector URL)")
 
 
@@ -2448,6 +2450,14 @@ def _fmt_delta(v) -> str:
     return f"{'▼' if v < 0 else '▲' if v > 0 else '·'}{abs(v):.2f}"
 
 
+def _fmt_summary_price(s) -> str:
+    """Price cell for an entry_price_summary result; marks foil fallback."""
+    if not s:
+        return "—"
+    p = _fmt_price(s["current"])
+    return f"{p} (foil)" if s.get("finish") == "foil" else p
+
+
 @mcp.tool(name="watchlist_create")
 async def watchlist_create(params: WatchlistCreateInput) -> str:
     """Create a new price watchlist. Returns its passphrase (SHOWN ONLY ONCE —
@@ -2485,22 +2495,41 @@ async def watchlist_add(params: WatchlistAddInput) -> str:
 
         name = params.name
         current_usd = None
-        try:
-            card = await _scryfall_get("/cards/named", {"fuzzy": params.name})
-            name = card.get("name", params.name)
-            current_usd = (card.get("prices") or {}).get("usd")
-        except Exception:
-            pass  # offline/unknown: keep the user's spelling
+        if params.set_code and params.collector_number:
+            # Pinned printing: validate it actually exists before storing,
+            # otherwise a typo would sit at "history pending" forever.
+            try:
+                card = await _scryfall_get(
+                    f"/cards/{params.set_code.lower()}/{params.collector_number}")
+                name = card.get("name", params.name)
+                current_usd = (card.get("prices") or {}).get("usd")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    return (f"No printing {params.set_code.upper()} "
+                            f"#{params.collector_number} found on Scryfall — "
+                            f"check the set code and collector number.")
+            except Exception:
+                pass  # Scryfall unreachable: accept the pin unvalidated
+        else:
+            try:
+                card = await _scryfall_get("/cards/named", {"fuzzy": params.name})
+                name = card.get("name", params.name)
+                current_usd = (card.get("prices") or {}).get("usd")
+            except Exception:
+                pass  # offline/unknown: keep the user's spelling
 
         _, entry = watchlist_db.add_card(
             db, row["id"], name, set_code=params.set_code,
             collector_number=params.collector_number,
             target_price=params.target_price, note=params.note)
         uuids = watchlist_db.uuids_for_entry(db, entry)
-        summary = watchlist_db.price_summary(db, uuids) if uuids else None
+        summary = watchlist_db.entry_price_summary(db, entry)
         backfill = ("history ready" if summary
                     else "history pending next nightly ingest")
-        lines = [warning + f"Added **{name}** (entry #{entry['entry_id']}) — {backfill}."]
+        printing = f" [{entry['set_code']} {entry['collector_number']}]" \
+            if entry.get("set_code") else ""
+        lines = [warning + f"Added **{name}**{printing} "
+                 f"(entry #{entry['entry_id']}) — {backfill}."]
         if current_usd:
             lines.append(f"Scryfall market price now: ${current_usd}")
         if entry.get("target_price") is not None:
@@ -2526,7 +2555,9 @@ async def watchlist_remove(params: WatchlistRemoveInput) -> str:
         warning = _supersession_warning(db, row)
         try:
             removed = watchlist_db.remove_entry(
-                db, row["id"], entry_id=params.entry_id, name=params.name)
+                db, row["id"], entry_id=params.entry_id, name=params.name,
+                set_code=params.set_code,
+                collector_number=params.collector_number)
         except watchlist_db.NotFound as e:
             return warning + str(e)
         return warning + f"Removed **{removed['card_name']}** (entry #{removed['entry_id']})."
@@ -2540,8 +2571,7 @@ def _render_entries(db, list_id: int) -> list[str]:
     entries = watchlist_db.current_entries(db, list_id)
     rows = []
     for e in entries:
-        s = watchlist_db.price_summary(db, watchlist_db.uuids_for_entry(db, e))
-        rows.append((e, s))
+        rows.append((e, watchlist_db.entry_price_summary(db, e)))
     rows.sort(key=lambda t: (t[1] is None,
                              t[1]["d30"] if t[1] and t[1]["d30"] is not None else 0))
     for e, s in rows:
@@ -2549,7 +2579,7 @@ def _render_entries(db, list_id: int) -> list[str]:
             if e.get("set_code") else ""
         lines.append(
             f"| {e['entry_id']} | {e['card_name']}{printing} "
-            f"| {_fmt_price(s['current']) if s else '—'} "
+            f"| {_fmt_summary_price(s)} "
             f"| {_fmt_delta(s['d7']) if s else '—'} "
             f"| {_fmt_delta(s['d30']) if s else '—'} "
             f"| {_fmt_price(e['target_price'])} | {e['note'] or ''} |")
@@ -2599,6 +2629,8 @@ class PriceHistoryInput(BaseModel):
     name: str = Field(..., description="Card name")
     days: int = Field(90, description="Days of history")
     provider: str = Field("tcgplayer", description="tcgplayer | cardkingdom | cardmarket")
+    set_code: Optional[str] = Field(None, description="Pin a specific printing: set code")
+    collector_number: Optional[str] = Field(None, description="Pin a specific printing: collector number")
 
 
 @mcp.tool(name="watchlist_report")
@@ -2613,7 +2645,7 @@ async def watchlist_report(params: WatchlistListInput) -> str:
         entries = watchlist_db.current_entries(db, row["id"])
         priced = []
         for e in entries:
-            s = watchlist_db.price_summary(db, watchlist_db.uuids_for_entry(db, e))
+            s = watchlist_db.entry_price_summary(db, e)
             if s:
                 priced.append((e, s))
         if not priced:
@@ -2778,10 +2810,10 @@ def _render_page(db, row, editable: bool) -> str:
     parts.append("<h2>Current cards</h2><table><tr><th>#</th><th>Card</th>"
                  "<th>Price</th><th>Target</th><th>Note</th></tr>")
     for e in watchlist_db.current_entries(db, row["id"]):
-        s = watchlist_db.price_summary(db, watchlist_db.uuids_for_entry(db, e))
+        s = watchlist_db.entry_price_summary(db, e)
         parts.append(
             f"<tr><td>{e['entry_id']}</td><td>{_esc(e['card_name'])}</td>"
-            f"<td>{_fmt_price(s['current']) if s else '—'}</td>"
+            f"<td>{_fmt_summary_price(s)}</td>"
             f"<td>{_fmt_price(e['target_price'])}</td>"
             f"<td>{_esc(e['note'] or '')}</td></tr>")
     parts.append("</table><h2>History</h2><table><tr><th>#</th><th>When</th>"
@@ -2825,13 +2857,14 @@ async def share_page(request: Request):
 
 @mcp.tool(name="price_history")
 async def price_history(params: PriceHistoryInput) -> str:
-    """Daily price series (cheapest printing) for a card from the local price
-    DB. Data exists for cards someone watches; global, needs no passphrase."""
+    """Daily price series for a card from the local price DB — cheapest
+    printing by default, or a specific one via set_code+collector_number.
+    Data exists for cards someone watches; global, needs no passphrase."""
     db = _wl_db()
     try:
-        uuids = [r["uuid"] for r in db.execute(
-            "SELECT uuid FROM card_uuids WHERE LOWER(card_name)=LOWER(?)",
-            (params.name,))]
+        uuids = watchlist_db.uuids_for_entry(db, {
+            "card_name": params.name, "set_code": params.set_code,
+            "collector_number": params.collector_number, "uuid": None})
         series = watchlist_db.price_series(db, uuids, days=params.days,
                                            provider=params.provider)
         if not series or not series["points"]:
@@ -2839,7 +2872,9 @@ async def price_history(params: PriceHistoryInput) -> str:
                     f"watchlist add + nightly ingest; for a spot price use "
                     f"scryfall_price.")
         pts = "\n".join(f"{d}: {p}" for d, p in series["points"])
-        return (f"# {params.name} — {params.provider}, cheapest printing "
+        which = (f"{params.set_code.upper()} #{params.collector_number}"
+                 if params.set_code else "cheapest printing")
+        return (f"# {params.name} — {params.provider}, {which} "
                 f"({series['uuid']})\n```\n{pts}\n```")
     finally:
         db.close()

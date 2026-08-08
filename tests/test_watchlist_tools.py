@@ -171,3 +171,97 @@ async def test_price_history_series(db_path, a_list, fake_scryfall):
     _seed_prices(db_path)
     out = await server.price_history(server.PriceHistoryInput(name="Sol Ring"))
     assert "2026-08-08" in out and "7.0" in out
+
+
+@pytest.fixture
+def fake_scryfall_printings(monkeypatch):
+    """Scryfall fake that knows exactly one printing: C21 #263."""
+    import httpx
+
+    async def _fake(endpoint, params=None):
+        if endpoint == "/cards/named":
+            return {"name": "Sol Ring", "prices": {"usd": "1.23"}}
+        if endpoint == "/cards/c21/263":
+            return {"name": "Sol Ring", "set": "c21",
+                    "collector_number": "263", "prices": {"usd": "2.50"}}
+        req = httpx.Request("GET", "https://api.scryfall.com" + endpoint)
+        raise httpx.HTTPStatusError("404", request=req,
+                                    response=httpx.Response(404, request=req))
+
+    monkeypatch.setattr(server, "_scryfall_get", _fake)
+
+
+async def test_add_pinned_printing_validates(db_path, a_list,
+                                             fake_scryfall_printings):
+    list_id, pp, _ = a_list
+    out = await server.watchlist_add(server.WatchlistAddInput(
+        name="Sol Ring", set_code="C21", collector_number="263",
+        passphrase=pp))
+    assert "Sol Ring" in out and "C21" in out
+    db = watchlist_db.connect(db_path)
+    entries = watchlist_db.current_entries(db, list_id)
+    db.close()
+    assert entries[0]["set_code"] == "C21"
+
+
+async def test_add_bad_printing_rejected(db_path, a_list,
+                                         fake_scryfall_printings):
+    list_id, pp, _ = a_list
+    out = await server.watchlist_add(server.WatchlistAddInput(
+        name="Sol Ring", set_code="XXX", collector_number="999",
+        passphrase=pp))
+    assert "No printing" in out and "XXX" in out
+    db = watchlist_db.connect(db_path)
+    assert watchlist_db.current_entries(db, list_id) == []   # nothing added
+    db.close()
+
+
+async def test_remove_specific_printing(db_path, a_list,
+                                        fake_scryfall_printings):
+    list_id, pp, _ = a_list
+    db = watchlist_db.connect(db_path)
+    watchlist_db.add_card(db, list_id, "Sol Ring", set_code="C21",
+                          collector_number="263")
+    watchlist_db.add_card(db, list_id, "Sol Ring", set_code="LTC",
+                          collector_number="284")
+    db.close()
+    out = await server.watchlist_remove(server.WatchlistRemoveInput(
+        name="Sol Ring", set_code="LTC", passphrase=pp))
+    assert "Removed" in out
+    db = watchlist_db.connect(db_path)
+    remaining = watchlist_db.current_entries(db, list_id)
+    db.close()
+    assert len(remaining) == 1 and remaining[0]["set_code"] == "C21"
+
+
+async def test_price_history_pinned_printing(db_path, a_list, fake_scryfall):
+    db = watchlist_db.connect(db_path)
+    db.executemany(
+        "INSERT INTO card_uuids (card_name, uuid, set_code, collector_number)"
+        " VALUES (?,?,?,?)",
+        [("Sol Ring", "uuid-a", "C21", "263"),
+         ("Sol Ring", "uuid-b", "LTC", "284")])
+    watchlist_db.upsert_price(db, "uuid-a", "2026-08-08", "tcgplayer",
+                              "normal", 7.0)
+    watchlist_db.upsert_price(db, "uuid-b", "2026-08-08", "tcgplayer",
+                              "normal", 20.0)
+    db.close()
+    out = await server.price_history(server.PriceHistoryInput(
+        name="Sol Ring", set_code="LTC", collector_number="284"))
+    assert "uuid-b" in out and "20.0" in out
+    out = await server.price_history(server.PriceHistoryInput(name="Sol Ring"))
+    assert "uuid-a" in out                    # unpinned = cheapest
+
+
+async def test_list_shows_foil_fallback(db_path, a_list, fake_scryfall):
+    list_id, pp, _ = a_list
+    await server.watchlist_add(server.WatchlistAddInput(name="Sol Ring",
+                                                        passphrase=pp))
+    db = watchlist_db.connect(db_path)
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES"
+               " ('Sol Ring','uuid-foil')")
+    watchlist_db.upsert_price(db, "uuid-foil", "2026-08-08", "tcgplayer",
+                              "foil", 42.0)                  # foil-only printing
+    db.close()
+    out = await server.watchlist_list(server.WatchlistListInput(passphrase=pp))
+    assert "42.00" in out and "foil" in out
