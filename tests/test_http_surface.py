@@ -5,6 +5,9 @@ import watchlist_db
 
 
 def client():
+    # StreamableHTTPSessionManager.run() is once-per-instance; each TestClient
+    # runs a fresh lifespan, so force a fresh manager (prod builds once).
+    server.mcp._session_manager = None
     return TestClient(server.build_app())
 
 
