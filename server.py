@@ -1430,40 +1430,97 @@ class ValidateArchidektInput(BaseModel):
     )
 
 
-def _parse_decklist(text: str) -> list[tuple[int, str]]:
-    """Parse a decklist into (quantity, card_name) tuples.
+@dataclass(frozen=True)
+class DecklistEntry:
+    """One parsed decklist line, including the printing it names."""
+    quantity: int
+    name: str
+    set_code: Optional[str] = None
+    collector_number: Optional[str] = None
+    finish: Optional[str] = None
 
-    Handles multiple formats:
-      1 Card Name
-      1x Card Name
-      1x Card Name (set) 123 [Category{flags}] ^Label,#hex^
-      # comments are ignored
+
+_QTY_RE = re.compile(r"^(\d+)x?\s+(.+)$")
+_LABEL_RE = re.compile(r"\s*\^[^^]*\^")
+_CATEGORY_RE = re.compile(r"\s*\[[^\]]*\]")
+_MARKER_RE = re.compile(r"\s*\*([FE])\*", re.IGNORECASE)
+_WORD_FINISH_RE = re.compile(r"\s*[(\[](foil|etched)[)\]]", re.IGNORECASE)
+# Anchored to the end so it can only match a trailing printing suffix, never a
+# card name that happens to contain parentheses (e.g. "B.F.M. (Big Furry
+# Monster)" — the inner text has spaces and cannot match a set token).
+_SET_CN_RE = re.compile(r"\s*\((?P<set>[a-zA-Z0-9]{2,6})\)(?:\s+(?P<cn>[^\s\[\]^*]+))?\s*$")
+
+
+def _parse_decklist_entries(text: str) -> list[DecklistEntry]:
+    """Parse a decklist into entries that keep set, collector number, and finish.
+
+    Handles the Archidekt/Moxfield grammar:
+      [qty][x] Name [(set)] [collector] [*F*|*E*] [[Category{flags}]] [^Label,#hex^]
+
+    Bare names and quantity-only lines still parse; the printing fields are just
+    None. Lines starting with '#' or '//' are comments.
     """
-    cards: list[tuple[int, str]] = []
-    for line in text.strip().splitlines():
-        line = line.strip()
+    entries: list[DecklistEntry] = []
+    for raw_line in text.strip().splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("//") or line.startswith("#"):
             continue
-        # Match: optional quantity (with optional 'x'), then card name,
-        # then strip trailing (set), collector#, [category], ^label^
-        match = re.match(r"^(\d+)x?\s+(.+)$", line)
+
+        match = _QTY_RE.match(line)
         if match:
             qty = int(match.group(1))
-            name = match.group(2).strip()
+            rest = match.group(2).strip()
         else:
             qty = 1
-            name = line
+            rest = line
 
-        # Strip Archidekt suffixes: (set) collector [Cat{flags}] ^label^
-        name = re.sub(r"\s*\^[^^]*\^", "", name)       # ^Label,#hex^
-        name = re.sub(r"\s*\[[^\]]*\]", "", name)       # [Category{flags}]
-        name = re.sub(r"\s+\d+$", "", name)              # trailing collector number
-        name = re.sub(r"\s*\([a-z0-9]+\)$", "", name)   # (set)
+        # Labels and categories carry no pricing information.
+        rest = _LABEL_RE.sub("", rest)
+        rest = _CATEGORY_RE.sub("", rest)
+
+        # Finish marker, before the set suffix so that "(foil)" is consumed here
+        # rather than being mistaken for a 4-character set code below.
+        finish: Optional[str] = None
+        marker = _MARKER_RE.search(rest)
+        if marker:
+            finish = MARKER_FINISHES[marker.group(1).upper()]
+            rest = _MARKER_RE.sub("", rest, count=1)
+        else:
+            worded = _WORD_FINISH_RE.search(rest)
+            if worded:
+                finish = worded.group(1).lower()
+                rest = _WORD_FINISH_RE.sub("", rest, count=1)
+
+        # Set and collector number, anchored at the end of what remains.
+        set_code: Optional[str] = None
+        collector: Optional[str] = None
+        suffix = _SET_CN_RE.search(rest)
+        if suffix:
+            set_code = suffix.group("set").lower()
+            collector = suffix.group("cn")
+            rest = rest[:suffix.start()]
+
+        # Legacy residual strips, kept verbatim so validate_decklist and
+        # precon_diff see the names they have always seen.
+        name = rest
+        name = re.sub(r"\s*\^[^^]*\^", "", name)
+        name = re.sub(r"\s*\[[^\]]*\]", "", name)
+        name = re.sub(r"\s+\d+$", "", name)
+        name = re.sub(r"\s*\([a-z0-9]+\)$", "", name)
         name = name.strip()
 
         if name:
-            cards.append((qty, name))
-    return cards
+            entries.append(DecklistEntry(qty, name, set_code, collector, finish))
+    return entries
+
+
+def _parse_decklist(text: str) -> list[tuple[int, str]]:
+    """Parse a decklist into (quantity, card_name) tuples.
+
+    Thin wrapper over _parse_decklist_entries, kept for validate_decklist and
+    precon_diff, which do not care about printings.
+    """
+    return [(e.quantity, e.name) for e in _parse_decklist_entries(text)]
 
 
 @mcp.tool(name="validate_decklist")
