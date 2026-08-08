@@ -16,6 +16,11 @@ and the searched land enters (firing ``land_etb`` once). Remaining
 approximations are flagged per-card via ``approx_notes``: the fetched land
 enters tapped (ramp_land's pinned common case) and the crack happens at
 sorcery speed.
+
+Approximation notes are stable machine-groupable strings: every entry is
+``"<kind>: <detail>"`` with ``<kind>`` drawn from ``_NOTE_KINDS``, and a card
+never carries the same note twice. The honesty report groups on the kind
+prefix.
 """
 from __future__ import annotations
 
@@ -71,6 +76,25 @@ _WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
           "five": 5, "six": 6, "seven": 7}
 _CARD_TYPES = frozenset({"land", "creature", "artifact", "enchantment",
                          "instant", "sorcery", "planeswalker", "legendary"})
+
+#: Stable approx-note vocabulary: every note is "<kind>: <detail>" with kind
+#: from this set (the honesty report groups on the kind prefix).
+#:   fetch                — fetch land pinned tapped/sorcery-speed
+#:   bounce-land          — Karoo modeled as N mana of either color
+#:   filter-ignored       — Add ability with a cost beyond {T} not modeled
+#:   residual-text        — producer oracle sentence with no model
+#:   any-color            — "any color" modeled as all five colors
+#:   conditional-tapland  — enters-tapped condition modeled by common case
+#:   dfc-back-face        — multi-face card modeled by its front face
+#:   creature-producer    — no sickness gate on mana tapping
+#:   ramp-widened         — ramp_land search wider than the printed one
+#:   for-each             — scaling Add modeled as a flat quantity
+#:   hybrid-cost          — unparseable mana cost (hybrid/phyrexian)
+#:   equipment-extra      — equipment rules text beyond its grants
+_NOTE_KINDS = frozenset({
+    "fetch", "bounce-land", "filter-ignored", "residual-text", "any-color",
+    "conditional-tapland", "dfc-back-face", "creature-producer",
+    "ramp-widened", "for-each", "hybrid-cost", "equipment-extra"})
 
 
 def _count_word(w: str) -> int:
@@ -130,17 +154,23 @@ def _parse_produces(oracle: str, produced_mana) -> tuple[dict | None, list[str],
     costed_add = False
     for line in oracle.splitlines():
         for m in _ADD_CLAUSE_RE.finditer(line):
+            if line[:m.start()].count('"') % 2:
+                continue           # inside quotes: an ability granted to
+                                   # another permanent, not this card's
             if not _add_cost_is_pure_tap(line, m.start()):
                 costed_add = True
                 continue
             clause = m.group(1)
+            if "for each" in clause.lower():
+                notes.append(f"for-each: 'Add {clause.strip()}' scaling "
+                             f"modeled as a flat quantity")
             if _ANY_COLOR_RE.search(clause):
                 qty = _count_word(clause.split()[0]) if clause.split() else 1
                 for c in COLORS:
                     produces[c] = max(produces.get(c, 0), qty)
                 notes.append(
-                    f"any-color producer ('Add {clause.strip()}') approximated "
-                    f"as producing all five colors")
+                    f"any-color: 'Add {clause.strip()}' approximated as "
+                    f"producing all five colors")
                 continue
             for alt in _ALT_SPLIT_RE.split(clause):
                 syms = _MANA_SYM_RE.findall(alt)
@@ -153,7 +183,7 @@ def _parse_produces(oracle: str, produced_mana) -> tuple[dict | None, list[str],
                     for c in counts:
                         produces[c] = max(produces.get(c, 0), len(syms))
                     notes.append(
-                        f"bounce land approximated as {len(syms)} mana of "
+                        f"bounce-land: approximated as {len(syms)} mana of "
                         f"either color; bounce drawback not modeled")
                 else:
                     for c, q in counts.items():
@@ -161,8 +191,8 @@ def _parse_produces(oracle: str, produced_mana) -> tuple[dict | None, list[str],
     if not produces and not costed_add and produced_mana:
         produces = {c: 1 for c in produced_mana if c in COLORS or c == "C"}
     if produces and costed_add:
-        notes.append("Add ability with an activation cost beyond {T} ignored "
-                     "(filter-style)")
+        notes.append("filter-ignored: Add ability with an activation cost "
+                     "beyond {T} ignored")
     return (produces or None), notes, costed_add
 
 
@@ -174,10 +204,46 @@ def _enters_tapped(stripped: str) -> tuple[bool, str | None]:
             continue
         low = line.lower()
         if "unless" in low or re.search(r"\bif\b", low):
-            return False, (f"conditional enters-tapped approximated as "
-                           f"untapped (common case): {line!r}")
+            return False, (f"conditional-tapland: approximated as untapped "
+                           f"(common case): {line!r}")
         return True, None
     return False, None
+
+
+def _residual_notes(stripped: str, keywords: frozenset) -> list[str]:
+    """Producer-branch mirror of _equipment_extra_text: flag oracle sentences
+    the model did not consume — anything that is not an Add clause, an
+    enters-tapped line, a fetch pattern, or a lone keyword. Catches Temple of
+    the False God's activation condition, Talisman damage riders, City of
+    Brass's tapped trigger, and triome cycling."""
+    notes = []
+    for line in stripped.splitlines():
+        for sent in line.split("."):
+            s = sent.strip()
+            if (not s or "Add" in s or _ENTERS_TAPPED_RE.search(s)
+                    or _FETCH_RE.search(s) or s.lower() in keywords):
+                continue
+            notes.append(f"residual-text: {s!r} not modeled")
+    return notes
+
+
+def _derive_producer(oracle: str, stripped: str,
+                     produced_mana) -> tuple[dict | None, bool, bool, list[str]]:
+    """Shared land/rock mana derivation: (produces, enters_tapped,
+    filter_only, notes). filter_only means the card's only Add abilities
+    carry activation costs beyond {T} (Signets, filter lands) — conservative:
+    flagged for annotation instead of over-modeled as a free tap."""
+    notes: list[str] = []
+    produces, pnotes, costed_add = _parse_produces(oracle, produced_mana)
+    notes.extend(pnotes)
+    enters_tapped, tnote = _enters_tapped(stripped)
+    if tnote:
+        notes.append(tnote)
+    filter_only = produces is None and costed_add
+    if filter_only:
+        notes.append("filter-ignored: every mana ability has an activation "
+                     "cost beyond {T}; filter land/rock not auto-modeled")
+    return produces, enters_tapped, filter_only, notes
 
 
 def _grant_keywords(text: str) -> tuple:
@@ -259,7 +325,7 @@ def _derive_one(raw: dict) -> Derived:
     face = raw
     if raw.get("card_faces") and not raw.get("oracle_text"):
         face = raw["card_faces"][0]
-        notes.append(f"multi-face card: derived from front face "
+        notes.append(f"dfc-back-face: derived from front face "
                      f"{face.get('name', '?')!r}; back face ignored")
     name = raw.get("name") or face.get("name") or "?"
     oracle = face.get("oracle_text") or ""
@@ -283,7 +349,8 @@ def _derive_one(raw: dict) -> Derived:
             cost = parse_cost(mana_cost)
         except CostParseError as exc:
             scope_class = "unmodeled_other"
-            notes.append(f"unparseable mana cost {mana_cost!r}: {exc}")
+            notes.append(f"hybrid-cost: unparseable mana cost "
+                         f"{mana_cost!r} — {exc}")
 
     # Sagas are pinned out of scope BEFORE the branch chain: a land-Saga
     # (Urza's Saga) must not classify as a plain land, and quoted chapter
@@ -316,40 +383,30 @@ def _derive_one(raw: dict) -> Derived:
             ann = Annotation(name=name, activated=[
                 Activated(do="ramp_land", mana=parse_cost(None), tap=True,
                           sac_self=True)])
-            notes.append("fetched land enters tapped per ramp_land pin "
+            notes.append("fetch: land enters tapped per ramp_land pin "
                          "(conditional-untap fetches like Fabled Passage "
-                         "subsumed); fetch timing approximated as "
-                         "sorcery-speed")
+                         "subsumed); timing approximated as sorcery-speed")
+            notes.extend(_residual_notes(stripped, keywords))
         else:
-            produces, pnotes, costed_add = _parse_produces(
-                oracle, raw.get("produced_mana"))
+            produces, enters_tapped, filter_only, pnotes = _derive_producer(
+                oracle, stripped, raw.get("produced_mana"))
             notes.extend(pnotes)
-            enters_tapped, tnote = _enters_tapped(stripped)
-            if tnote:
-                notes.append(tnote)
-            if produces is None and costed_add:
-                # Filter lands (Darkwater Catacombs): every mana ability has
-                # a cost beyond {T} — conservative, ask for an annotation.
-                needs = True
-                notes.append("filter land: every mana ability has an "
-                             "activation cost beyond {T}; not auto-modeled")
-            else:
-                auto = True
+            needs = filter_only
+            auto = not filter_only
+            if auto:
+                notes.extend(_residual_notes(stripped, keywords))
     elif "{T}: Add" in stripped:
-        produces, pnotes, costed_add = _parse_produces(
-            oracle, raw.get("produced_mana"))
+        produces, enters_tapped, filter_only, pnotes = _derive_producer(
+            oracle, stripped, raw.get("produced_mana"))
         notes.extend(pnotes)
-        enters_tapped, tnote = _enters_tapped(stripped)
-        if tnote:
-            notes.append(tnote)
-        if produces is None and costed_add:
+        if filter_only or produces is None:
+            # filter-style producer, or all Adds quoted grants: ask instead
             needs = True
-            notes.append("filter-style producer: every mana ability has an "
-                         "activation cost beyond {T}; not auto-modeled")
         else:
             auto = True
+            notes.extend(_residual_notes(stripped, keywords))
             if "creature" in types:
-                notes.append("creature mana producer: engine has no "
+                notes.append("creature-producer: engine has no "
                              "summoning-sickness gate on mana tapping")
     elif (dm := _DRAW_RE.fullmatch(" ".join(stripped.split()))):
         auto = True
@@ -361,15 +418,16 @@ def _derive_one(raw: dict) -> Derived:
         ann = Annotation(name=name, triggers=[
             Trigger(on="cast", do="ramp_land", count=count)])
         if "into your hand" in stripped:
-            notes.append("battlefield-plus-hand land split approximated as "
-                         "all searched lands onto the battlefield")
-        notes.append("ramp takes the first land in library order; 'basic "
-                     "land' search restrictions widened to any land")
+            notes.append("ramp-widened: battlefield-plus-hand land split "
+                         "approximated as all searched lands onto the "
+                         "battlefield")
+        notes.append("ramp-widened: takes the first land in library order; "
+                     "'basic land' search restrictions widened to any land")
     elif "equipment" in types and (grants := _equipment_grants(stripped)):
         auto = True
         ann = Annotation(name=name, grants=grants)
         if _equipment_extra_text(stripped):
-            notes.append("additional ability text not modeled")
+            notes.append("equipment-extra: additional ability text not modeled")
     elif (d9 := _d9_class(stripped, types)) is not None:
         scope_class = d9
     elif ("creature" in types and power is not None and toughness is not None
@@ -384,7 +442,8 @@ def _derive_one(raw: dict) -> Derived:
                     oracle=oracle)
     return Derived(card=merge_card(data, ann, scope_class),
                    auto_annotated=auto, needs_annotation=needs,
-                   oracle=oracle, approx_notes=notes)
+                   oracle=oracle,
+                   approx_notes=list(dict.fromkeys(notes)))    # dedup, ordered
 
 
 def derive(scryfall_cards: list[dict]) -> dict[str, Derived]:

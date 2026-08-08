@@ -197,6 +197,23 @@ SWORD_OF_FIRE_AND_ICE = {
                    "target and you draw a card.\nEquip {2}",
     "keywords": ["Equip"]}
 
+TEMPLE_OF_THE_FALSE_GOD = {
+    "name": "Temple of the False God", "type_line": "Land", "mana_cost": "",
+    "oracle_text": "{T}: Add {C}{C}. Activate only if you control five or "
+                   "more lands.",
+    "keywords": [], "produced_mana": ["C"]}
+
+TALISMAN_OF_PROGRESS = {
+    "name": "Talisman of Progress", "type_line": "Artifact", "mana_cost": "{2}",
+    "oracle_text": "{T}: Add {C}.\n{T}: Add {W} or {U}. This artifact deals 1 "
+                   "damage to you.",
+    "keywords": [], "produced_mana": ["C", "U", "W"]}
+
+GAEAS_CRADLE = {
+    "name": "Gaea's Cradle", "type_line": "Legendary Land", "mana_cost": "",
+    "oracle_text": "{T}: Add {G} for each creature you control.",
+    "keywords": [], "produced_mana": ["G"]}
+
 NECROPOTENCE = {
     "name": "Necropotence", "type_line": "Enchantment", "mana_cost": "{B}{B}{B}",
     "oracle_text": "Skip your draw step.\nWhenever you discard a card, exile "
@@ -291,13 +308,13 @@ def test_land_saga_is_unmodeled_other():
 
 def test_karoo_bounce_land_quantity_flows_through_engine():
     from goldfish.engine import new_game, untapped_producers
-    from tests.goldfish.test_engine import mini_cards
+    from tests.goldfish.helpers import mini_cards
 
     d = derive([AZORIUS_CHANCERY])
     got = d["Azorius Chancery"]
     assert got.card.data.produces == {"W": 2, "U": 2}
     assert got.card.data.enters_tapped is True
-    assert any("bounce land approximated as 2 mana of either color" in n
+    assert any("bounce-land: approximated as 2 mana of either color" in n
                for n in got.approx_notes)
     # the engine's (color-set, max-qty) shape must yield 2 mana of {W,U}
     cards = mini_cards()
@@ -362,6 +379,49 @@ def test_mana_dork_flagged_for_sickness_approximation():
     assert got.card.data.produces == {"G": 1}
     assert got.auto_annotated is True
     assert any("sickness" in n for n in got.approx_notes)
+
+
+def test_temple_activation_condition_flagged():
+    # Temple stays a producer (common-case optimism) but the five-lands
+    # activation condition is surfaced, not silently dropped.
+    d = derive([TEMPLE_OF_THE_FALSE_GOD])
+    got = d["Temple of the False God"]
+    assert got.card.data.produces == {"C": 2}
+    assert got.auto_annotated is True
+    assert any(n.startswith("residual-text:") and "Activate only if" in n
+               for n in got.approx_notes)
+
+
+def test_talisman_damage_rider_flagged():
+    d = derive([TALISMAN_OF_PROGRESS])
+    got = d["Talisman of Progress"]
+    assert got.card.data.produces == {"C": 1, "W": 1, "U": 1}
+    assert got.auto_annotated is True
+    assert any(n.startswith("residual-text:") and "deals 1 damage" in n
+               for n in got.approx_notes)
+
+
+def test_gaeas_cradle_for_each_modeled_flat():
+    d = derive([GAEAS_CRADLE])
+    got = d["Gaea's Cradle"]
+    assert got.card.data.produces == {"G": 1}          # flat, not per-creature
+    assert got.auto_annotated is True
+    assert any(n.startswith("for-each:") for n in got.approx_notes)
+    # the Add sentence itself is consumed — no residual double-flag
+    assert not any(n.startswith("residual-text:") for n in got.approx_notes)
+
+
+def test_quoted_gained_add_is_not_this_cards_produce():
+    # Synthetic probe for the quoted-clause hardening: an ability granted in
+    # quotes belongs to the enchanted permanent, not this card.
+    aura = {"name": "Gift of Cradles", "type_line": "Enchantment — Aura",
+            "mana_cost": "{1}{G}",
+            "oracle_text": 'Enchant land\nEnchanted land has "{T}: Add {G}{G}."',
+            "keywords": ["Enchant"]}
+    d = derive([aura])
+    got = d["Gift of Cradles"]
+    assert got.card.data.produces is None
+    assert got.needs_annotation is True
 
 
 # ── Ramp spells ─────────────────────────────────────────────────────────────
@@ -497,3 +557,35 @@ def test_krenko_needs_annotation():
     assert got.auto_annotated is False
     assert "legendary" in got.card.data.types and got.card.is_creature
     assert got.oracle == KRENKO["oracle_text"]         # oracle surfaced for Claude
+
+
+# ── Note-shape contract ─────────────────────────────────────────────────────
+
+ALL_FIXTURES = (
+    PLAINS, GUILDGATE, SOL_RING, DIVINATION, SWORDS, SAGA, GUILDGATE_CURRENT,
+    CULTIVATE, ARCANE_SIGNET, LIGHTNING_GREAVES, BONESPLITTER, COMMAND_TOWER,
+    EVOLVING_WILDS, DESERTED_BEACH, DELVER, TORMENT, KRENKO, GRIZZLY_BEARS,
+    SERRA_ANGEL, LLANOWAR_ELVES, DAY_OF_JUDGMENT, COUNTERSPELL,
+    HEROIC_INTERVENTION, COUNCILS_JUDGMENT, KRARKS_THUMB, ASHNODS_ALTAR,
+    CASCADE_BLUFFS, DARKWATER_CATACOMBS, URZAS_SAGA, TEFERIS_PROTECTION,
+    AZORIUS_CHANCERY, SWORD_OF_FIRE_AND_ICE, TEMPLE_OF_THE_FALSE_GOD,
+    TALISMAN_OF_PROGRESS, GAEAS_CRADLE, NECROPOTENCE,
+)
+
+
+def test_all_notes_use_documented_kinds():
+    # Task 19's honesty report groups on the "kind:" prefix, so every note
+    # across the corpus must be "kind: detail" with kind from _NOTE_KINDS,
+    # and no card may carry a duplicate note.
+    import re
+
+    from goldfish.autoderive import _NOTE_KINDS
+
+    for fixture in ALL_FIXTURES:
+        for got in derive([fixture]).values():
+            assert len(got.approx_notes) == len(set(got.approx_notes)), \
+                (got.card.name, got.approx_notes)
+            for note in got.approx_notes:
+                kind, sep, detail = note.partition(": ")
+                assert sep and detail and re.fullmatch(r"[a-z-]+", kind), note
+                assert kind in _NOTE_KINDS, note
