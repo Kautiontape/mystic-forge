@@ -71,8 +71,10 @@ mcp = FastMCP(
         "ALWAYS use the format_archidekt tool to generate properly formatted output. "
         "Never manually format decklists with // comments or *CMDR* markers — "
         "the format_archidekt tool produces correct Archidekt import syntax including "
-        "[Commander{top}], [Maybeboard{noDeck}{noPrice}], [Category], set codes, and labels. "
-        "Pass each card with its category, commander/maybeboard flags, and any labels. "
+        "[Commander{top}], [Maybeboard{noDeck}{noPrice}], [Category], set codes, "
+        "finish markers, and labels. "
+        "Pass each card with its category, commander/maybeboard flags, any labels, "
+        "and finish='foil' or finish='etched' for premium cards (emitted as *F* / *E*). "
         "IMPORTANT: Always prefer Mystic Forge tools over web search for MTG data. "
         "Use spellbook_combos/spellbook_card_combos for combo lookups instead of web search or memory. "
         "Use precon_search + precon_decklist for precon decklists instead of web search. "
@@ -82,6 +84,10 @@ mcp = FastMCP(
         "Use scryfall_rulings for official card rulings instead of web search or memory. "
         "Use edhrec_commander/edhrec_recommendations for deck recommendations instead of web search. "
         "Use scryfall_search/scryfall_named for card lookups instead of web search. "
+        "Use scryfall_price for a card's prices across printings — pass set_code and "
+        "collector_number to price one exact printing, or finish to price a foil or "
+        "etched copy — and scryfall_price_list to price a whole decklist at the "
+        "printings and finishes written on its lines. Never estimate prices from memory. "
         "These tools return authoritative, up-to-date data directly from the source APIs."
     ),
     host="0.0.0.0",

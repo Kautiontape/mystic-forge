@@ -532,3 +532,131 @@ def test_single_printing_view_tolerates_a_sparse_card():
     assert "# X" in out
     assert "No price data" in out
     assert "Artist:" not in out
+
+
+# ── end-to-end tool orchestration ─────────────────────────────────────────────
+
+def _fake_collection(known: dict):
+    """Build a fake /cards/collection responder from {(set, cn): card}."""
+    async def fake_post(endpoint, body):
+        data, not_found = [], []
+        for identifier in body["identifiers"]:
+            key = (identifier.get("set"), identifier.get("collector_number"))
+            if key in known:
+                data.append(known[key])
+            else:
+                not_found.append(identifier)
+        return {"data": data, "not_found": not_found}
+    return fake_post
+
+
+async def test_price_list_batches_beyond_the_seventy_five_identifier_cap(monkeypatch):
+    # The old tool capped input at 75 and did not batch, so a 100-card deck
+    # could not be priced at all.
+    known = {}
+    lines = []
+    for n in range(100):
+        cn = str(n)
+        known[("tst", cn)] = {
+            "name": f"Card {n}", "set": "tst", "collector_number": cn,
+            "finishes": ["nonfoil"], "prices": {"usd": "1.00"},
+        }
+        lines.append(f"1x Card {n} (tst) {cn}")
+
+    calls = []
+    inner = _fake_collection(known)
+    async def counting_post(endpoint, body):
+        calls.append(len(body["identifiers"]))
+        return await inner(endpoint, body)
+    monkeypatch.setattr(server, "_scryfall_post", counting_post)
+
+    out = await server.scryfall_price_list(
+        server.PriceListInput(decklist="\n".join(lines)))
+
+    assert calls == [75, 25]                      # two batches, correctly sized
+    assert "**Total: $100.00** (100 of 100 cards priced)" in out
+
+
+async def test_price_list_keeps_partial_results_when_a_batch_fails(monkeypatch):
+    known = {}
+    lines = []
+    for n in range(80):
+        cn = str(n)
+        known[("tst", cn)] = {
+            "name": f"Card {n}", "set": "tst", "collector_number": cn,
+            "finishes": ["nonfoil"], "prices": {"usd": "1.00"},
+        }
+        lines.append(f"1x Card {n} (tst) {cn}")
+
+    inner = _fake_collection(known)
+    state = {"n": 0}
+    async def flaky_post(endpoint, body):
+        state["n"] += 1
+        if state["n"] == 2:
+            raise RuntimeError("simulated API failure")
+        return await inner(endpoint, body)
+    monkeypatch.setattr(server, "_scryfall_post", flaky_post)
+
+    out = await server.scryfall_price_list(
+        server.PriceListInput(decklist="\n".join(lines)))
+
+    # Batch 1's 75 cards still priced; batch 2's 5 are unchecked, not "missing".
+    assert "**Total: $75.00** (75 of 80 cards priced)" in out
+    assert "Could not be checked" in out
+    assert "Not found on Scryfall" not in out
+
+
+async def test_price_list_honors_the_finish_on_each_line(monkeypatch):
+    known = {
+        ("dmr", "281"): {
+            "name": "Counterspell", "set": "dmr", "collector_number": "281",
+            "finishes": ["nonfoil", "foil"],
+            "prices": {"usd": "2.15", "usd_foil": "9.99"},
+        },
+    }
+    monkeypatch.setattr(server, "_scryfall_post", _fake_collection(known))
+
+    out = await server.scryfall_price_list(server.PriceListInput(
+        decklist="1x Counterspell (dmr) 281 *F*"))
+
+    assert "$9.99" in out            # the foil price, not the nonfoil one
+    assert "2.15" not in out
+
+
+async def test_price_shows_a_detail_view_for_one_pinned_printing(monkeypatch):
+    card = {
+        "name": "Counterspell", "set": "dmr", "collector_number": "281",
+        "set_name": "Dominaria Remastered", "rarity": "common",
+        "finishes": ["nonfoil", "foil"],
+        "prices": {"usd": "2.15", "usd_foil": "2.17"},
+        "artist": "Zack Stella",
+    }
+    async def fake_get(endpoint, params=None):
+        return {"data": [card], "total_cards": 1}
+    monkeypatch.setattr(server, "_scryfall_get", fake_get)
+
+    out = await server.scryfall_price(server.PriceInput(
+        name="Counterspell", set_code="dmr", collector_number="281", finish="foil"))
+
+    assert "# Counterspell" in out
+    assert "Requested finish (foil): $2.17" in out
+    assert "Artist: Zack Stella" in out
+    assert "Showing" not in out      # detail view, not the list view
+
+
+async def test_price_falls_back_to_the_list_view_when_more_than_one_card_matches(monkeypatch):
+    cards = [
+        {"name": "C", "set": "dmr", "collector_number": "281", "set_name": "A",
+         "rarity": "common", "finishes": ["nonfoil"], "prices": {"usd": "2.15"}},
+        {"name": "C", "set": "dmr", "collector_number": "281", "set_name": "B",
+         "rarity": "common", "finishes": ["nonfoil"], "prices": {"usd": "3.15"}},
+    ]
+    async def fake_get(endpoint, params=None):
+        return {"data": cards, "total_cards": 2}
+    monkeypatch.setattr(server, "_scryfall_get", fake_get)
+
+    out = await server.scryfall_price(server.PriceInput(
+        name="C", set_code="dmr", collector_number="281"))
+
+    assert "Showing 2 of 2 printings" in out
+    assert "Cheapest nonfoil: $2.15" in out
