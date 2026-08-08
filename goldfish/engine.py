@@ -1276,7 +1276,29 @@ def _step_activate(g: Game, action: dict):
     # --- all checks passed; mutation begins ---
     pay(g, ability.mana)
     g.emit(f"activated {perm.name} ability {idx}")   # cause precedes the verb's effects
-    execute_verb(g, perm, ability.do, count=ability.count, target=ability.target,
+    source = perm
+    if ability.sac_self:
+        # Sacrifice-as-cost (fetch lands): the permanent leaves the
+        # battlefield BEFORE the verb resolves, so a ramp_land search's
+        # land_etb fires exactly once — for the fetched land, never for the
+        # departing fetch. v1 has no leaves-battlefield events, so nothing
+        # else fires on the departure. Attachment bookkeeping is cleared
+        # defensively: fetches never carry attachments, but the bidirectional
+        # attached/attached_to invariant must survive any sac_self user.
+        g.battlefield.remove(perm)
+        for eq_id in perm.attached:
+            g.perm(eq_id).attached_to = None
+        perm.attached = []
+        if perm.attached_to is not None:
+            host = g.perm(perm.attached_to)
+            if perm.id in host.attached:
+                host.attached.remove(perm.id)
+            perm.attached_to = None
+        if not perm.is_token:            # tokens cease to exist instead
+            g.graveyard.append(perm.name)
+        g.emit(f"sacrificed {perm.name}")
+        source = None                    # the permanent is gone
+    execute_verb(g, source, ability.do, count=ability.count, target=ability.target,
                 power=ability.power, toughness=ability.toughness,
                 keywords=ability.keywords, tutor_filter=ability.tutor_filter,
                 pips=ability.pips, any_mana=ability.any_mana, duration=ability.duration)

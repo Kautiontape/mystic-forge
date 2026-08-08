@@ -10,11 +10,12 @@ Classification order (first match wins): land -> mana rock/dork -> draw
 spell -> ramp spell -> equipment grants -> D9 out-of-scope classes ->
 vanilla creature -> needs annotation.
 
-v1 deviation (flagged per-card via ``approx_notes``): the spec's fetch-land
-semantics (sacrifice-to-search modeled as sac-self + the searched land
-entering) require engine support that v1 does not have, so fetches are
-approximated as producing lands — colors = the union of fetchable basic
-colors, entering untapped. The landfall double-trigger is not modeled.
+Fetch lands (sacrifice-to-search) follow the spec's semantics: a sac-self
+``{T}`` activation running ``ramp_land``, so cracking the fetch removes it
+and the searched land enters (firing ``land_etb`` once). Remaining
+approximations are flagged per-card via ``approx_notes``: the fetched land
+enters tapped (ramp_land's pinned common case) and the crack happens at
+sorcery speed.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field
 
 from .cards import (
     COLORS,
+    Activated,
     Annotation,
     CardData,
     Cost,
@@ -67,8 +69,6 @@ _WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
           "five": 5, "six": 6, "seven": 7}
 _CARD_TYPES = frozenset({"land", "creature", "artifact", "enchantment",
                          "instant", "sorcery", "planeswalker", "legendary"})
-_BASIC_COLORS = (("plains", "W"), ("island", "U"), ("swamp", "B"),
-                 ("mountain", "R"), ("forest", "G"))
 
 
 def _count_word(w: str) -> int:
@@ -138,13 +138,6 @@ def _enters_tapped(stripped: str) -> tuple[bool, str | None]:
                            f"untapped (common case): {line!r}")
         return True, None
     return False, None
-
-
-def _fetch_produces(fetch_text: str) -> dict:
-    """Union of fetchable basic colors; a plain 'basic land' search is any."""
-    low = fetch_text.lower()
-    colors = [c for basic, c in _BASIC_COLORS if basic in low]
-    return {c: 1 for c in (colors or COLORS)}
 
 
 def _equipment_grants(stripped: str) -> dict:
@@ -246,14 +239,14 @@ def _derive_one(raw: dict) -> Derived:
         pass                                          # classified above, not asked
     elif "land" in types:
         auto = True
-        fetch = _FETCH_RE.search(stripped)
-        if fetch:
-            # DEVIATION from spec fetch semantics (sac-self + land_etb): the
-            # v1 engine has no sac_self mechanism, so fetches become plain
-            # producing lands — honest via the note.
-            produces = _fetch_produces(fetch.group(0))
-            notes.append("fetch approximated as a producing land; landfall "
-                         "double-trigger not modeled")
+        if _FETCH_RE.search(stripped):
+            # Spec fetch semantics: sacrifice-to-search is a sac-self {T}
+            # activation running ramp_land — the fetch is NOT a producer.
+            ann = Annotation(name=name, activated=[
+                Activated(do="ramp_land", mana=parse_cost(None), tap=True,
+                          sac_self=True)])
+            notes.append("fetched land enters tapped per ramp_land pin; "
+                         "fetch timing approximated as sorcery-speed")
         else:
             produces, pnotes = _parse_produces(oracle, raw.get("produced_mana"))
             notes.extend(pnotes)

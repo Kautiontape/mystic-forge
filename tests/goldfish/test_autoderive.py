@@ -3,10 +3,9 @@
 keywords, produced_mana, card_faces), pulled once via the Scryfall API.
 
 The first six fixtures and the five tests that use them are the plan's
-Task 17 Step-1 block verbatim. Note: the plan's Step-3 fetch modeling
-(sac_self honored by the engine) was NOT built into the frozen engine, so
-fetch lands are approximated as producing lands (see
-test_fetch_approximated_as_producing_land) — an approx note flags this.
+Task 17 Step-1 block verbatim. Fetch lands follow the spec's semantics via
+the engine's sac_self mechanism (see
+test_fetch_derives_sac_self_ramp_activation).
 """
 from goldfish.autoderive import derive
 
@@ -225,17 +224,23 @@ def test_any_color_land():
     assert got.auto_annotated is True
 
 
-def test_fetch_approximated_as_producing_land():
-    # DEVIATION from the plan's Step-3 fetch clause: the frozen engine has no
-    # sac_self mechanism, so fetches are modeled as producing lands (union of
-    # fetchable basic colors), entering untapped, with an approx note.
+def test_fetch_derives_sac_self_ramp_activation():
+    # Spec fetch semantics via the engine's sac_self mechanism: cracking the
+    # fetch removes it and runs ramp_land (the searched land enters, firing
+    # land_etb). The fetch itself is NOT a mana producer.
     d = derive([EVOLVING_WILDS])
     got = d["Evolving Wilds"]
     assert got.card.is_land
-    assert got.card.data.produces == ALL_FIVE          # "basic land card" = any basic
+    assert got.card.data.produces is None
     assert got.card.data.enters_tapped is False
-    assert any("fetch approximated" in n for n in got.approx_notes)
-    assert any("landfall" in n for n in got.approx_notes)
+    ann = got.card.ann
+    assert ann is not None and len(ann.activated) == 1
+    act = ann.activated[0]
+    assert act.do == "ramp_land"
+    assert act.tap is True and act.sac_self is True
+    assert act.mana.mv == 0                            # cost is just the {T} + sac
+    assert any("ramp_land pin" in n for n in got.approx_notes)
+    assert any("sorcery-speed" in n for n in got.approx_notes)
     assert got.auto_annotated is True and got.needs_annotation is False
 
 

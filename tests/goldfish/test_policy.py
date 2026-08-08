@@ -293,3 +293,22 @@ def test_policy_never_illegal_across_seeds():
                     f"seed {seed}: illegal {action!r} ({reason}): {e}") from e
         else:
             raise AssertionError(f"seed {seed}: game stalled before turn 9")
+
+
+def test_rule8_cracks_fetch_when_land_drop_spent():
+    cards = mini_cards()
+    cards["Wilds"] = SimCard(data=make_data("Wilds", types=frozenset({"land"})),
+                             ann=None, scope_class=None)
+    annotated(cards, "Wilds", {"name": "Wilds", "activated": [
+        {"cost": "{T}", "do": "ramp_land", "sac_self": True}]})
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.phase, g.turn = "main1", 1
+    g.hand[:] = ["Plains"]
+    g._land_drops_used = 1                       # drop spent: rule 1 can't fire
+    wilds = g.new_perm("Wilds")
+    action, reason = choose_action(g)
+    assert action == {"type": "activate", "card": wilds.id, "ability": 0}
+    assert reason.startswith("rule 8")
+    step(g, action)
+    assert "Wilds" in g.graveyard
+    assert any(p.name == "Plains" and p.tapped for p in g.battlefield)

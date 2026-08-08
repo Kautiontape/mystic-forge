@@ -93,6 +93,8 @@ class Activated:
     do: str
     mana: Cost
     tap: bool = False
+    sac_self: bool = False                  # fetch lands: the permanent is
+                                            # sacrificed as part of the cost
     # same verb params as Trigger:
     count: object = 1
     target: str | None = None
@@ -238,6 +240,7 @@ def _parse_activated(card, raw: dict) -> Activated:
             {"a mana cost string like {2}{W}, optionally with {T}"})
     a = Activated(
         do=do, mana=mana, tap=tap,
+        sac_self=bool(raw.get("sac_self", False)),
         count=_parse_count(card, raw.get("count", 1)),
         target=raw.get("target"),
         power=raw.get("power"), toughness=raw.get("toughness"),

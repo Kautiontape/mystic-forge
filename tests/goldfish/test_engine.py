@@ -2328,3 +2328,69 @@ def test_second_wins_combo_post_win_records_but_never_casts():
     assert sum("(combo)" in line for line in g.log) == 2      # A1, A2 only
     assert sum("won turn" in line for line in g.log) == 1
     assert g.won_turn == 3
+
+
+# -- sac_self activations (fetch lands) ---------------------------------------
+
+def _fetch_game():
+    """Wilds = a fetch (sac-self {T}: ramp_land); Scout = a landfall listener."""
+    cards = mini_cards()
+    cards["Wilds"] = SimCard(data=make_data("Wilds", types=frozenset({"land"})),
+                             ann=None, scope_class=None)
+    annotated(cards, "Wilds", {"name": "Wilds", "activated": [
+        {"cost": "{T}", "do": "ramp_land", "sac_self": True}]})
+    cards["Scout"] = SimCard(data=make_data(
+        "Scout", cost=parse_cost("{1}"), types=frozenset({"creature"}),
+        power=1, toughness=1), ann=None, scope_class=None)
+    annotated(cards, "Scout", {"name": "Scout", "triggers": [
+        {"on": "land_etb", "do": "gain_life"}]})
+    g = started(cards, ["Plains"] * 40, hand=["Wilds"])
+    g.new_perm("Scout")
+    return g
+
+
+def test_fetch_crack_sacrifices_ramps_and_fires_landfall_once():
+    g = _fetch_game()
+    step(g, {"type": "play_land", "card": "Wilds"})
+    # the fetch's own arrival is a normal land_etb (spec: land_etb fires for
+    # EVERY land entering)
+    assert g.trigger_fires.get("Scout|land_etb|gain_life") == 1
+    wilds = next(p for p in g.battlefield if p.name == "Wilds")
+    step(g, {"type": "activate", "card": wilds.id, "ability": 0})
+    # the fetch left the battlefield for the graveyard...
+    assert all(p.name != "Wilds" for p in g.battlefield)
+    assert g.graveyard == ["Wilds"]
+    assert any("sacrificed Wilds" in line for line in g.log)
+    # ...a library land entered tapped (ramp_land's pinned common case)...
+    fetched = [p for p in g.battlefield if p.name == "Plains"]
+    assert len(fetched) == 1 and fetched[0].tapped is True
+    # ...and the crack fired land_etb exactly once (2 total with the play).
+    assert g.trigger_fires["Scout|land_etb|gain_life"] == 2
+
+
+def test_fetch_crack_deterministic():
+    def run():
+        g = _fetch_game()
+        step(g, {"type": "play_land", "card": "Wilds"})
+        wilds = next(p for p in g.battlefield if p.name == "Wilds")
+        step(g, {"type": "activate", "card": wilds.id, "ability": 0})
+        return g.log
+    assert run() == run()
+
+
+def test_sac_self_clears_attachment_bookkeeping():
+    """Fetches never carry attachments, but the bidirectional invariant is
+    kept defensively: sacrificing an equipped permanent detaches its gear."""
+    cards = mini_cards()
+    annotated(cards, "Bear", {"name": "Bear", "activated": [
+        {"cost": "{T}", "do": "draw", "sac_self": True}]})
+    g = started(cards, ["Plains"] * 40)
+    bear = g.new_perm("Bear")
+    bear.arrived_turn = 0                        # past summoning sickness
+    hammer = g.new_perm("Hammer")
+    hammer.attached_to = bear.id
+    bear.attached.append(hammer.id)
+    step(g, {"type": "activate", "card": bear.id, "ability": 0})
+    assert all(p.name != "Bear" for p in g.battlefield)
+    assert g.graveyard == ["Bear"]
+    assert hammer.attached_to is None            # invariant survives the sac

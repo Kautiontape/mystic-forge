@@ -268,3 +268,15 @@ def test_merge_annotation_and_scope():
     assert c.inert_reason == "unmodeled_other"
     c2 = merge_card(data, ann=Annotation(name="Cait Sith"), scope_class="unmodeled_other")
     assert c2.inert_reason is None   # explicit annotation overrides the scope class
+
+
+# -- sac_self (fetch lands) ----------------------------------------------------
+
+def test_activated_sac_self_parsed_and_defaults_false():
+    anns = validate_annotations([
+        {"name": "Wilds", "activated": [
+            {"cost": "{T}", "do": "ramp_land", "sac_self": True}]},
+        {"name": "Orb", "activated": [{"cost": "{T}", "do": "draw"}]},
+    ])
+    assert anns["Wilds"].activated[0].sac_self is True
+    assert anns["Orb"].activated[0].sac_self is False
