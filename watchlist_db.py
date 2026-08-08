@@ -251,3 +251,37 @@ def state_at(db, list_id: int, seq: int | None = None) -> dict[int, dict]:
 
 def replay_state(db, list_id: int) -> dict[int, dict]:
     return state_at(db, list_id, None)
+
+
+def clone_list(db, source_list_id: int, at_seq: int | None = None,
+               recovery: bool = False) -> tuple[int, str, str]:
+    """Mint a new list seeded from source state as of at_seq (default: latest).
+
+    recovery=True marks the source superseded by the new list (spec: cloning
+    your OWN list is recovery; cloning via share code is a fork)."""
+    source = get_list(db, source_list_id)
+    if source is None:
+        raise NotFound(f"No list #{source_list_id}")
+    if at_seq is None:
+        at_seq = db.execute("SELECT COALESCE(MAX(seq),0) FROM events"
+                            " WHERE list_id=?", (source_list_id,)).fetchone()[0]
+    snapshot = state_at(db, source_list_id, at_seq)
+    new_id, passphrase, share_code = create_list(
+        db, label=source["label"],
+        cloned_from_list=source_list_id, cloned_from_seq=at_seq)
+    append_event(db, new_id, "clone_init",
+                 {"source_list": source_list_id, "source_seq": at_seq,
+                  "source_share_code": source["share_code"],
+                  "recovery": recovery})
+    db.commit()
+    for entry in sorted(snapshot.values(), key=lambda e: e["entry_id"]):
+        add_card(db, new_id, entry["card_name"],
+                 set_code=entry.get("set_code"),
+                 collector_number=entry.get("collector_number"),
+                 target_price=entry.get("target_price"),
+                 note=entry.get("note"))
+    if recovery:
+        db.execute("UPDATE lists SET superseded_by=? WHERE id=?",
+                   (new_id, source_list_id))
+        db.commit()
+    return new_id, passphrase, share_code

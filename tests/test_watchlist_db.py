@@ -127,3 +127,49 @@ def test_replay_reproduces_current(db):
         for col in ("card_name", "set_code", "collector_number",
                     "target_price", "note", "added_at"):
             assert entry[col] == current[eid][col], f"{col} diverged"
+
+
+def test_clone_at_seq_matches_source_state(db):
+    src, _, _ = watchlist_db.create_list(db, label="orig")
+    watchlist_db.add_card(db, src, "Sol Ring", target_price=2.0)
+    s_cult, _ = watchlist_db.add_card(db, src, "Cultivate")
+    at = db.execute("SELECT MAX(seq) FROM events WHERE list_id=?",
+                    (src,)).fetchone()[0]
+    watchlist_db.remove_entry(db, src, entry_id=s_cult)      # after `at`
+    new_id, pp, sc = watchlist_db.clone_list(db, src, at_seq=at, recovery=False)
+    names = sorted(e["card_name"] for e in watchlist_db.current_entries(db, new_id))
+    assert names == ["Cultivate", "Sol Ring"]
+    targets = {e["card_name"]: e["target_price"]
+               for e in watchlist_db.current_entries(db, new_id)}
+    assert targets["Sol Ring"] == 2.0
+    row = watchlist_db.get_list(db, new_id)
+    assert row["cloned_from_list"] == src and row["cloned_from_seq"] == at
+    assert row["label"] == "orig"
+
+
+def test_clone_defaults_to_latest(db):
+    src, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, src, "Sol Ring")
+    new_id, _, _ = watchlist_db.clone_list(db, src, at_seq=None, recovery=False)
+    assert [e["card_name"] for e in watchlist_db.current_entries(db, new_id)] \
+        == ["Sol Ring"]
+
+
+def test_recovery_clone_supersedes_source_but_fork_does_not(db):
+    src, _, _ = watchlist_db.create_list(db)
+    fork_id, _, _ = watchlist_db.clone_list(db, src, recovery=False)
+    assert watchlist_db.get_list(db, src)["superseded_by"] is None
+    rec_id, _, _ = watchlist_db.clone_list(db, src, recovery=True)
+    assert watchlist_db.get_list(db, src)["superseded_by"] == rec_id
+
+
+def test_clone_history_starts_with_clone_init_then_adds(db):
+    src, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, src, "Sol Ring")
+    new_id, _, _ = watchlist_db.clone_list(db, src, recovery=False)
+    actions = [r["action"] for r in db.execute(
+        "SELECT action FROM events WHERE list_id=? ORDER BY seq", (new_id,))]
+    assert actions == ["create", "clone_init", "add"]
+    # replay invariant holds for clones too
+    replayed = watchlist_db.replay_state(db, new_id)
+    assert [e["card_name"] for e in replayed.values()] == ["Sol Ring"]
