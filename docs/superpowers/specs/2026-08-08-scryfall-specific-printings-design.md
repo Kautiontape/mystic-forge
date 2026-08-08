@@ -250,7 +250,16 @@ Extraction order, applied left to right on each line:
 6. Apply the **existing** residual strips from `_parse_decklist` (`server.py:1432-1435`)
    to whatever name remains.
 
-Step 6 exists specifically to guarantee byte-identical names for current callers.
+Step 6 exists specifically to preserve current behavior for existing callers.
+
+**One intentional difference.** The legacy strip at `server.py:1435` is
+`\s*\([a-z0-9]+\)$` — lowercase only — so `1x Sol Ring (LTC)` currently keeps the
+set code glued to the name, and `validate_decklist` then reports `Sol Ring (LTC)` as
+an unrecognized card. Step 5 is case-insensitive because Moxfield emits uppercase set
+codes while Archidekt emits lowercase, and the new feature needs both. Uppercase set
+codes therefore now strip correctly. This fixes a latent bug in `validate_decklist`
+and `precon_diff` rather than regressing them, and the regression test asserts the
+new behavior explicitly instead of pretending nothing changed.
 
 **`_parse_decklist` is preserved, not replaced.** It becomes a wrapper:
 
@@ -350,7 +359,9 @@ New pure helpers, all independently testable without network access:
 | `_entry_identifier` | `DecklistEntry` → Scryfall identifier dict |
 | `_price_for_finish` | `(card, finish)` → `Decimal \| None`, no cross-finish fallback |
 | `_index_collection_results` | response → lookup dict |
-| `_format_printing_line` | card + entry → one display line |
+| `_printing_label` | card + finish → `Counterspell (DMR #281, foil)` |
+| `_available_finishes` | card → which finishes it has, and their prices |
+| `_archidekt_line` | the single Archidekt line grammar, shared by both emitters |
 | `_finish_marker` | `"foil"` → `"*F*"`, `"etched"` → `"*E*"`, else `""` |
 
 `_finish_marker` is shared by `format_archidekt` and `archidekt_export` so the two
