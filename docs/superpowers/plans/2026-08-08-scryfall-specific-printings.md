@@ -997,6 +997,7 @@ def _build_price_sections(
     defaulted: list[tuple[Decimal, str]] = []
     no_price: list[str] = []
     missing: list[str] = []
+    missing_identifiers: set[str] = set()
 
     total = Decimal("0")
     priced_cards = 0
@@ -1005,6 +1006,7 @@ def _build_price_sections(
         card = _lookup_entry(index, entry)
         if card is None:
             missing.append(f"{entry.quantity}x {entry.name}{_entry_suffix(entry)}")
+            missing_identifiers.add(repr(sorted(_entry_identifier(entry).items())))
             continue
 
         unit = _price_for_finish(card, entry.finish)
@@ -1027,11 +1029,21 @@ def _build_price_sections(
     priced.sort(key=lambda item: item[0], reverse=True)
     defaulted.sort(key=lambda item: item[0], reverse=True)
 
+    # Every not_found identifier corresponds to some entry above whose lookup
+    # already failed (that's the identifier we sent for it), so it is already
+    # represented in `missing` with quantity and printing detail. Only surface
+    # a not_found identifier here if it somehow has no matching line above —
+    # defensive, but avoids reporting the same missing card twice.
+    for identifier in not_found:
+        key = repr(sorted(identifier.items()))
+        if key not in missing_identifiers:
+            missing.append(_identifier_label(identifier))
+
     return {
         "priced": [text for _, text in priced],
         "defaulted": [text for _, text in defaulted],
         "no_price": no_price,
-        "missing": missing + [_identifier_label(i) for i in not_found],
+        "missing": missing,
         "total": total,
         "priced_cards": priced_cards,
     }
