@@ -12,6 +12,7 @@ A unified MCP (Model Context Protocol) server for Magic: The Gathering. Combines
 | `scryfall_random` | Random card with optional filter |
 | `scryfall_price` | Prices per printing; pin one with set code + collector number, filter by finish |
 | `scryfall_price_list` | Price a decklist at the printing and finish on each line |
+| `scryfall_card_text` | Exact oracle text for a whole list of cards in one call |
 
 ### EDHRec — Commander Recommendations
 | Tool | Description |
@@ -27,7 +28,7 @@ A unified MCP (Model Context Protocol) server for Magic: The Gathering. Combines
 ### Archidekt — Deck Reading
 | Tool | Description |
 |---|---|
-| `archidekt_deck` | Fetch a public deck by ID or URL |
+| `archidekt_deck` | Fetch a public deck by ID or URL (`include_text` adds full oracle text) |
 | `archidekt_user_decks` | List a user's public decks |
 | `archidekt_export` | Export deck as importable card list |
 
