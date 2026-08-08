@@ -33,11 +33,15 @@ ENGINE_LABEL = "goldfish"
 def run_code(inputs: dict) -> str:
     """Short base32 code content-addressing a run's canonical inputs.
 
-    Callers hash the RESOLVED deck — the sorted library name list plus the
-    commander — together with annotations, combos, n, seed, until_turn and
-    engine_version, NOT the raw deck string/URL. An Archidekt deck that is
-    merely re-ordered or re-categorized (or a decklist pasted in a
-    different order) therefore keeps its code; any card swap changes it.
+    Callers hash the RESOLVED library in its GIVEN order plus the
+    commander — the exact list handed to the engine — together with
+    annotations, combos, n, seed, until_turn and engine_version, NOT the
+    raw deck string/URL. Resolution already drops Scryfall-unrecognized
+    names and the command-zone commander copy, so raw-text cosmetics
+    (count grouping, Archidekt category metadata) don't move the code —
+    but ORDER does: the engine shuffles the library as given, so hashing
+    anything order-insensitive would let one code stand for two different
+    game sequences and break the byte-identical claim below.
     Presentation-only fields (``generated_at``) are excluded by callers.
 
     Identical inputs -> the same 13-char code and (per the determinism

@@ -89,18 +89,26 @@ def sample_ab():
 # ── run_code: resolved-library semantics (Task-19 deferred item) ─────────────
 
 
-async def test_run_code_order_insensitive_card_sensitive(monkeypatch):
-    """Reordering the decklist keeps the run code; a card swap changes it."""
+async def test_run_code_given_order_and_card_sensitive(monkeypatch):
+    """The run code hashes the resolved library IN GIVEN ORDER.
+
+    This protects the spec's reproducibility claim ("identical inputs →
+    the same code AND byte-identical results"): the engine shuffles the
+    library exactly as loaded, so two orderings of the same multiset play
+    different game sequences — an order-insensitive hash would let one
+    code stand for both. Hence: rerunning the same list keeps the code;
+    reordering it (a different run input) or swapping a card changes it."""
     _patch_fetch_minideck(monkeypatch)
     reordered = "1 Boss\n12 Hammer\n30 Bear\n20 Runner\n17 Mountain\n20 Plains"
     swapped = "1 Boss\n20 Plains\n17 Mountain\n30 Bear\n21 Runner\n11 Hammer"
     ids = []
-    for deck in (MINI_DECK_TEXT, reordered, swapped):
+    for deck in (MINI_DECK_TEXT, MINI_DECK_TEXT, reordered, swapped):
         out = await srv.goldfish_run(srv.GoldfishRunInput(
             deck=deck, n=2, seed=5, until_turn=2))
         ids.append(_payload(out)["run_id"])
-    assert ids[0] == ids[1]        # same multiset, different order → same code
-    assert ids[0] != ids[2]        # one-card swap → different code
+    assert ids[0] == ids[1]        # identical inputs → same code
+    assert ids[0] != ids[2]        # different order → different code
+    assert ids[0] != ids[3]        # one-card swap → different code
 
 
 def test_run_code_shape_and_generated_at_excluded():

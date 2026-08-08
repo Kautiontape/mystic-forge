@@ -3138,10 +3138,11 @@ async def goldfish_run(params: GoldfishRunInput) -> str:
         return ("internal simulator error — please report with these "
                 f"inputs: seed={params.seed}, n={params.n}, "
                 f"until_turn={until_turn}")
-    # Content-address the RESOLVED library (sorted) + commander, not the raw
-    # deck string: cosmetic Archidekt edits (reordering, category moves)
-    # keep the code; any card swap changes it (report.run_code docstring).
-    inputs = {"library": sorted(library), "commander": commander,
+    # Content-address the RESOLVED library in its GIVEN order + commander,
+    # not the raw deck string: this list is exactly what the engine
+    # shuffles, so identical code ⇒ byte-identical results — the spec's
+    # reproducibility claim (report.run_code docstring).
+    inputs = {"library": list(library), "commander": commander,
               "annotations": params.annotations,
               "combos": params.combos, "n": params.n, "seed": params.seed,
               "until_turn": until_turn, "opponents": params.opponents,
@@ -3236,8 +3237,9 @@ async def goldfish_ab(params: GoldfishAbInput) -> str:
         return ("internal simulator error — please report with these "
                 f"inputs: seed={params.seed}, n={params.n}, "
                 f"until_turn={until_turn}")
-    # Resolved-library hashing, as in goldfish_run (report.run_code doc).
-    inputs = {"library_a": sorted(lib_a), "library_b": sorted(lib_b),
+    # Resolved libraries hashed in GIVEN order, as in goldfish_run
+    # (report.run_code docstring: order is a run input).
+    inputs = {"library_a": list(lib_a), "library_b": list(lib_b),
               "commander_a": cmdr_a, "commander_b": cmdr_b,
               "annotations": params.annotations,
               "annotations_a": params.annotations_a,
