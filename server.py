@@ -828,14 +828,57 @@ async def scryfall_card_text(params: CardTextInput) -> str:
     if unchecked and not found_cards:
         return errors[0]
 
+    # Second pass for names split on their own comma. Costs one request, and
+    # only when something already missed.
+    recovered: dict[str, dict] = {}
+    candidates = _rejoin_candidates(not_found)
+    if candidates:
+        try:
+            rejoined = await _scryfall_post(
+                "/cards/collection",
+                {"identifiers": [{"name": name} for _, name in candidates]})
+        except Exception:
+            rejoined = None      # best-effort: a failure here changes nothing
+        if rejoined:
+            by_alias: dict[str, dict] = {}
+            for card in rejoined.get("data", []):
+                for alias in _card_name_aliases(card):
+                    by_alias.setdefault(alias, card)
+            consumed: set[int] = set()
+            for i, name in candidates:
+                card = by_alias.get(name.lower())
+                if card is None or i in consumed or i + 1 in consumed:
+                    continue
+                found_cards.append(card)
+                # Both halves point at the recovered card, so the entry loop
+                # below emits a single block for the pair.
+                recovered[not_found[i]["name"].lower()] = card
+                recovered[not_found[i + 1]["name"].lower()] = card
+                consumed |= {i, i + 1}
+            not_found = [ident for j, ident in enumerate(not_found)
+                         if j not in consumed]
+
     index = _index_collection_results(found_cards)
+    for alias, card in recovered.items():
+        index.setdefault(("name", alias), card)
 
     # One block per unique card, in the order the input asked for them.
     blocks: list[str] = []
     seen_cards: set[int] = set()
+    reported = {_identifier_key(ident) for ident in not_found + unchecked}
     for entry in entries:
         card = _lookup_entry(index, entry)
-        if card is None or id(card) in seen_cards:
+        if card is None:
+            # Scryfall answered but never echoed this identifier as missing, so
+            # no other section will mention it. A pinned printing that does not
+            # come back is the usual way here.
+            identifier = _entry_identifier(entry)
+            key = _identifier_key(identifier)
+            if key not in reported:
+                reported.add(key)
+                not_found.append(identifier)
+            continue
+        if id(card) in seen_cards:
             continue
         seen_cards.add(id(card))
         blocks.append(_format_card(card, verbose=False))
@@ -2084,6 +2127,22 @@ def _dedupe_identifiers(entries: list[DecklistEntry]) -> list[dict]:
 def _chunk(items: list, size: int) -> list[list]:
     """Split items into chunks of at most `size`."""
     return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def _rejoin_candidates(not_found: list[dict]) -> list[tuple[int, str]]:
+    """(position, rejoined name) for every adjacent pair of name-only misses.
+
+    Most legendary creature names carry a comma, and a caller reading
+    'Delney, Streetwise Lookout' as a list produces two adjacent misses that
+    rejoin into one real card. Identifiers that pinned a set or collector
+    number are skipped — those did not come from splitting a name.
+    """
+    candidates: list[tuple[int, str]] = []
+    for i in range(len(not_found) - 1):
+        first, second = not_found[i], not_found[i + 1]
+        if set(first) == {"name"} and set(second) == {"name"}:
+            candidates.append((i, f"{first['name']}, {second['name']}"))
+    return candidates
 
 
 def _price_for_finish(card: dict, finish: Optional[str]) -> Optional[Decimal]:
