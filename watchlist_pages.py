@@ -52,6 +52,7 @@ _CSS = """
   --hitbg:#a6da9518;--hitglow:#a6da9540;
 }
 *{box-sizing:border-box;margin:0}
+html{background:var(--base)}   /* real navigations never flash white */
 body{
   font-family:var(--font-display);color:var(--text);background:var(--base);
   background-image:radial-gradient(60rem 40rem at 85% -10%,var(--glow1),transparent 60%),
@@ -192,28 +193,45 @@ footer a{color:var(--sub)}
 .axis{font-family:var(--font-data);font-size:11px;fill:var(--sub)}
 .gridline{stroke:var(--surface0);stroke-width:1}
 .targetline{stroke:var(--peach);stroke-width:1.5;stroke-dasharray:5 4}
+@media(max-width:40rem){
+  .wrap{padding:1.3rem .9rem 0}
+  header.masthead{flex-wrap:wrap;gap:.3rem .6rem}
+  h1{flex:1 0 100%;font-size:1.75rem}          /* title gets the full width */
+  .iconbtn{font-size:1.35rem;padding:.45rem .6rem}
+  .meta{gap:.55rem .5rem}
+  .meta .mright{margin-left:0}
+  .chip,.shops a{font-size:.85rem;padding:.45rem .75rem}   /* real tap targets */
+  button.act{padding:.65rem 1.1rem}
+  .tgtedit input{width:8rem;padding:.5rem .6rem}
+}
 """
 
 _JS = """
 const KEY=%(key)s, EDITABLE=%(editable)s, CPAD=%(cpad)d, CW=%(cw)d, CH=%(ch)d, CUR=%(cur)s;
 const X=s=>String(s??'').replace(/[&<>"']/g,
   c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const themeBtn=document.getElementById('theme');
-function themeGlyph(){themeBtn.textContent=
-  document.documentElement.dataset.theme==='latte'?'\\u{1F319}':'\\u2600\\uFE0F';
-  themeBtn.title='switch to '+(document.documentElement.dataset.theme==='latte'?'macchiato':'latte');}
-themeBtn.onclick=()=>{const h=document.documentElement;
-  h.dataset.theme=h.dataset.theme==='latte'?'macchiato':'latte';
-  localStorage.setItem('mf-theme',h.dataset.theme);themeGlyph();};
-themeGlyph();
-document.querySelectorAll('[data-copy]').forEach(c=>c.onclick=e=>{
+// In-place refresh: fetch this page and swap .wrap — no navigation, no white
+// flash; the card entrance animations replay as the change lands.
+async function refresh(){
+  try{
+    const r=await fetch(location.href);
+    if(!r.ok)throw 0;
+    const doc=new DOMParser().parseFromString(await r.text(),'text/html');
+    const nw=doc.querySelector('.wrap');
+    if(!nw)throw 0;
+    document.querySelector('.wrap').replaceWith(nw);
+    document.querySelectorAll('dialog[open]').forEach(d=>d.close());
+    wire();
+  }catch(e){location.reload()}
+}
+const copyable=c=>c.onclick=e=>{
   e.stopPropagation();navigator.clipboard.writeText(c.dataset.copy);
   if(!c.style.minWidth){c.style.minWidth=c.getBoundingClientRect().width+'px';
     c.style.textAlign='center'}       // lock width so the row never reflows
   if(!c.dataset.orig)c.dataset.orig=c.textContent;
   c.textContent='copied \\u2713';clearTimeout(c._t);
   c._t=setTimeout(()=>{c.textContent=c.dataset.orig},900);
-});
+};
 const enterClicks=(inputId,btnId)=>{const i=document.getElementById(inputId);
   if(i)i.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();
     document.getElementById(btnId).click()}}};
@@ -221,30 +239,53 @@ document.querySelectorAll('dialog').forEach(d=>
   d.addEventListener('click',e=>{if(e.target===d)d.close()}));
 const keyable=el=>{el.setAttribute('tabindex','0');el.setAttribute('role','button');
   el.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();el.click()}}};
+const themeGlyph=()=>{const b=document.getElementById('theme');if(!b)return;
+  b.textContent=document.documentElement.dataset.theme==='latte'?'\\u{1F319}':'\\u2600\\uFE0F';
+  b.title='switch to '+(document.documentElement.dataset.theme==='latte'?'macchiato':'latte');};
+// wire(): bindings for elements inside .wrap — rerun after every refresh().
+function wire(){
+  const themeBtn=document.getElementById('theme');
+  if(themeBtn)themeBtn.onclick=()=>{const h=document.documentElement;
+    h.dataset.theme=h.dataset.theme==='latte'?'macchiato':'latte';
+    localStorage.setItem('mf-theme',h.dataset.theme);
+    h.style.background=getComputedStyle(document.body).backgroundColor;
+    themeGlyph();};
+  themeGlyph();
+  document.querySelectorAll('[data-copy]').forEach(copyable);
+  const renameBtn=document.getElementById('rename');
+  if(renameBtn)renameBtn.onclick=()=>{
+    document.getElementById('renameInput').value=renameBtn.dataset.label||'';
+    document.getElementById('renameErr').textContent='';
+    document.getElementById('renameDlg').showModal();};
+  const claimBtn=document.getElementById('claim');
+  if(claimBtn)claimBtn.onclick=claimFlow;
+  const addBtn=document.getElementById('addCard');
+  if(addBtn)addBtn.onclick=()=>{document.getElementById('addPreview').innerHTML='';
+    document.getElementById('addErr').textContent='';
+    document.getElementById('addGo').style.display='none';
+    document.getElementById('addInput').value='';
+    document.getElementById('addDlg').showModal();
+    document.getElementById('addInput').focus();};
+  const alertsBtn=document.getElementById('alerts');
+  if(alertsBtn)alertsBtn.onclick=()=>document.getElementById('alertsDlg').showModal();
+  if(document.getElementById('cardDlg'))
+    document.querySelectorAll('.card[data-name]').forEach(wireCard);
+  if(document.getElementById('revDlg'))
+    document.querySelectorAll('.rev').forEach(wireRev);
+}
 // ── rename via its own themed dialog, never browser chrome ──
-const renameBtn=document.getElementById('rename'),renameDlg=document.getElementById('renameDlg');
-if(renameBtn&&renameDlg){
-  renameBtn.onclick=()=>{document.getElementById('renameInput').value=
-    renameBtn.dataset.label||'';document.getElementById('renameErr').textContent='';
-    renameDlg.showModal();};
+if(document.getElementById('renameDlg')){
   document.getElementById('renameSave').onclick=async()=>{
     const r=await fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({key:KEY,label:document.getElementById('renameInput').value})});
-    if(r.ok)location.reload();
+    if(r.ok){document.getElementById('renameDlg').close();refresh()}
     else document.getElementById('renameErr').textContent='could not rename';
   };
   enterClicks('renameInput','renameSave');
 }
 // ── add a card from a Scryfall link or name ──
-const addBtn=document.getElementById('addCard');
-if(addBtn){
-  const addDlg=document.getElementById('addDlg');
-  addBtn.onclick=()=>{document.getElementById('addPreview').innerHTML='';
-    document.getElementById('addErr').textContent='';
-    document.getElementById('addGo').style.display='none';
-    document.getElementById('addInput').value='';addDlg.showModal();
-    document.getElementById('addInput').focus();};
-  let pending=null;
+let pending=null;
+if(document.getElementById('addDlg')){
   document.getElementById('addLookup').onclick=async()=>{
     const q=document.getElementById('addInput').value.trim();if(!q)return;
     document.getElementById('addErr').textContent='';
@@ -276,15 +317,12 @@ if(addBtn){
     if(d.backfilling)document.getElementById('addPreview').innerHTML+=
       '<p class=sub>added \\u2713 \\u2014 pulling 90 days of history from the '+
       'cached price data; it appears within a minute or two.</p>';
-    setTimeout(()=>location.reload(),d.backfilling?1800:0);
+    setTimeout(()=>{document.getElementById('addDlg').close();refresh()},
+               d.backfilling?1500:0);
   };
 }
-// ── alerts (ntfy) explainer ──
-const alertsBtn=document.getElementById('alerts');
-if(alertsBtn)alertsBtn.onclick=()=>document.getElementById('alertsDlg').showModal();
 // ── claim: start your own list from a shared one ──
-const claimBtn=document.getElementById('claim');
-if(claimBtn)claimBtn.onclick=async()=>{
+async function claimFlow(){
   const dlg=document.getElementById('claimDlg');dlg.showModal();
   const out=document.getElementById('claimOut');
   out.innerHTML='<p class=sub>minting your copy\\u2026</p>';
@@ -297,12 +335,12 @@ if(claimBtn)claimBtn.onclick=async()=>{
     `<p class=sub>That key is how you edit your list \\u2014 open `+
     `<a href="${d.page}">your page</a> or tell it to Claude in chat. `+
     `Your copy starts with everything on this board and is yours alone.</p>`;
-};
+}
 // ── card detail modal ──
-const cardDlg=document.getElementById('cardDlg');
-if(cardDlg)document.querySelectorAll('.card[data-name]').forEach(card=>{
+function wireCard(card){
   keyable(card);
   card.onclick=()=>{
+    const cardDlg=document.getElementById('cardDlg');
     document.getElementById('cardTitle').textContent=card.dataset.name;
     document.getElementById('cardSub').textContent=card.dataset.sub;
     document.getElementById('chartHost').innerHTML=card.dataset.chart||'';
@@ -322,13 +360,13 @@ if(cardDlg)document.querySelectorAll('.card[data-name]').forEach(card=>{
     if(pts.length)armCrosshair(pts);
     cardDlg.showModal();
   };
-});
+}
 const boughtBtn=document.getElementById('boughtBtn');
 if(boughtBtn)boughtBtn.onclick=async()=>{
   const r=await fetch('/api/bought',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({key:KEY,entry_id:+boughtBtn.dataset.entry,
                          bought:!boughtBtn.dataset.bought})});
-  if(r.ok)location.reload();
+  if(r.ok){document.getElementById('cardDlg').close();refresh()}
 };
 const removeBtn=document.getElementById('removeBtn');
 if(removeBtn){
@@ -340,7 +378,7 @@ if(removeBtn){
   document.getElementById('rmYes').onclick=async()=>{
     const r=await fetch('/api/remove',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({key:KEY,entry_id:+removeBtn.dataset.entry})});
-    if(r.ok)location.reload();
+    if(r.ok){document.getElementById('cardDlg').close();refresh()}
   };
 }
 function armCrosshair(pts){
@@ -378,7 +416,7 @@ if(tgtSave)tgtSave.onclick=async()=>{
   const r=await fetch('/api/target',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({key:KEY,entry_id:+document.getElementById('tgtEdit').dataset.entry,
                          target_price:v===''?null:+v})});
-  if(r.ok)location.reload();
+  if(r.ok){document.getElementById('cardDlg').close();refresh()}
   else document.getElementById('tgtErr').textContent='could not save target';
 };
 if(tgtSave)enterClicks('tgtInput','tgtSave');
@@ -386,8 +424,8 @@ document.querySelectorAll('dialog .xclose').forEach(b=>
   b.onclick=()=>b.closest('dialog').close());
 // ── revision modal (history view) ── all interpolated data goes through X()
 const revDlg=document.getElementById('revDlg');
-if(revDlg){
-  document.querySelectorAll('.rev').forEach(r=>{keyable(r);r.onclick=async()=>{
+function wireRev(r){
+  keyable(r);r.onclick=async()=>{
     const seq=r.dataset.seq;
     document.getElementById('revTitle').textContent='Revision #'+seq;
     document.getElementById('revBody').innerHTML='<p class=sub>consulting the ledger\\u2026</p>';
@@ -406,7 +444,9 @@ if(revDlg){
     document.getElementById('forkBtn').dataset.seq=seq;
     const rec=document.getElementById('recoverBtn');
     if(rec)rec.dataset.seq=seq;
-  }});
+  };
+}
+if(revDlg){
   async function doFork(mode,seq){
     const res=await fetch('/api/fork',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({key:KEY,at_seq:+seq,mode})});
@@ -422,6 +462,7 @@ if(revDlg){
   if(recBtn)recBtn.onclick=e=>doFork('recover',e.target.dataset.seq);
 }
 document.querySelectorAll('dialog .close').forEach(b=>b.onclick=()=>b.closest('dialog').close());
+wire();
 """
 
 
