@@ -4,6 +4,7 @@ Definitions MOVED here from their original homes — ``make_data`` from
 test_cards, ``mini_cards``/``annotated``/``started`` from test_engine,
 ``small_deck`` from test_runner — so every test module imports one place.
 """
+import server as srv
 from goldfish.cards import CardData, SimCard, parse_cost, validate_annotations
 from goldfish.engine import new_game
 
@@ -57,3 +58,47 @@ def mini_cards():
 
 def small_deck():
     return ["Plains"] * 15 + ["Mountain"] * 15 + ["Bear"] * 5 + ["Runner"] * 4
+
+
+# ── Server-tool helpers (Task 18) ────────────────────────────────────────────
+
+# First line's card is the commander (goldfish's text-decklist pin), so Boss
+# leads. Total is 100 including commander.
+MINI_DECK_TEXT = "1 Boss\n20 Plains\n17 Mountain\n30 Bear\n20 Runner\n12 Hammer"
+
+# Scryfall-shaped fixtures for the six mini-pool names (Task 17 fixture style).
+MINI_SCRYFALL = [
+    {"name": "Boss", "type_line": "Legendary Creature — Human Warrior",
+     "mana_cost": "{2}{R}", "power": "3", "toughness": "3",
+     "oracle_text": "", "keywords": []},
+    {"name": "Plains", "type_line": "Basic Land — Plains",
+     "oracle_text": "({T}: Add {W}.)", "produced_mana": ["W"], "keywords": []},
+    {"name": "Mountain", "type_line": "Basic Land — Mountain",
+     "oracle_text": "({T}: Add {R}.)", "produced_mana": ["R"], "keywords": []},
+    {"name": "Bear", "type_line": "Creature — Bear", "mana_cost": "{1}{G}",
+     "power": "2", "toughness": "2", "oracle_text": "", "keywords": []},
+    {"name": "Runner", "type_line": "Creature — Goblin", "mana_cost": "{R}",
+     "power": "1", "toughness": "1", "oracle_text": "Haste",
+     "keywords": ["Haste"]},
+    {"name": "Hammer", "type_line": "Artifact — Equipment", "mana_cost": "{1}",
+     "oracle_text": "Equipped creature gets +10/+10.\nEquip {8}",
+     "keywords": ["Equip"]},
+]
+
+
+def _fake_fetch_for(fixtures):
+    """A stand-in for srv._goldfish_fetch_cards serving the given Scryfall-
+    shaped dicts; unknown names come back in the not_found list."""
+    by_name = {c["name"]: c for c in fixtures}
+
+    async def fake_fetch(names):
+        unique = list(dict.fromkeys(names))
+        return ([by_name[n] for n in unique if n in by_name],
+                [n for n in unique if n not in by_name])
+
+    return fake_fetch
+
+
+def _patch_fetch_minideck(monkeypatch):
+    monkeypatch.setattr(srv, "_goldfish_fetch_cards",
+                        _fake_fetch_for(MINI_SCRYFALL))

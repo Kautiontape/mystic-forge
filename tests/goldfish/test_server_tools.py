@@ -1,56 +1,21 @@
 """Server-tool tests for the goldfish MCP surface (Task 18).
 
-The shared helpers ``MINI_DECK_TEXT`` and ``_patch_fetch_minideck`` are
-defined here per the plan; later server-tool test modules
-(test_interactive.py, test_acceptance.py) import them from this file.
+The shared server-tool helpers (``MINI_DECK_TEXT``, ``_patch_fetch_minideck``,
+``_fake_fetch_for``) live in tests/goldfish/helpers.py — the pinned
+consolidation home — for reuse by later server-tool test modules
+(test_interactive.py, test_acceptance.py).
 """
 import pydantic
 import pytest
 
 import server as srv
 from goldfish.odds import odds_at_least
-
-# ── Shared helpers ───────────────────────────────────────────────────────────
-
-# First line's card is the commander (goldfish's text-decklist pin), so Boss
-# leads. Total is 100 including commander.
-MINI_DECK_TEXT = "1 Boss\n20 Plains\n17 Mountain\n30 Bear\n20 Runner\n12 Hammer"
-
-# Scryfall-shaped fixtures for the six mini-pool names (Task 17 fixture style).
-MINI_SCRYFALL = [
-    {"name": "Boss", "type_line": "Legendary Creature — Human Warrior",
-     "mana_cost": "{2}{R}", "power": "3", "toughness": "3",
-     "oracle_text": "", "keywords": []},
-    {"name": "Plains", "type_line": "Basic Land — Plains",
-     "oracle_text": "({T}: Add {W}.)", "produced_mana": ["W"], "keywords": []},
-    {"name": "Mountain", "type_line": "Basic Land — Mountain",
-     "oracle_text": "({T}: Add {R}.)", "produced_mana": ["R"], "keywords": []},
-    {"name": "Bear", "type_line": "Creature — Bear", "mana_cost": "{1}{G}",
-     "power": "2", "toughness": "2", "oracle_text": "", "keywords": []},
-    {"name": "Runner", "type_line": "Creature — Goblin", "mana_cost": "{R}",
-     "power": "1", "toughness": "1", "oracle_text": "Haste",
-     "keywords": ["Haste"]},
-    {"name": "Hammer", "type_line": "Artifact — Equipment", "mana_cost": "{1}",
-     "oracle_text": "Equipped creature gets +10/+10.\nEquip {8}",
-     "keywords": ["Equip"]},
-]
-
-
-def _fake_fetch_for(fixtures):
-    by_name = {c["name"]: c for c in fixtures}
-
-    async def fake_fetch(names):
-        unique = list(dict.fromkeys(names))
-        return ([by_name[n] for n in unique if n in by_name],
-                [n for n in unique if n not in by_name])
-
-    return fake_fetch
-
-
-def _patch_fetch_minideck(monkeypatch):
-    monkeypatch.setattr(srv, "_goldfish_fetch_cards",
-                        _fake_fetch_for(MINI_SCRYFALL))
-
+from tests.goldfish.helpers import (
+    MINI_DECK_TEXT,
+    _fake_fetch_for,
+    _patch_fetch_minideck,
+)
+from tests.goldfish.test_autoderive import PLAINS, SOL_RING
 
 # ── goldfish_odds ────────────────────────────────────────────────────────────
 
@@ -134,7 +99,6 @@ BOROS_SIGNET = {
 
 
 async def test_goldfish_annotate_three_sections(monkeypatch):
-    from tests.goldfish.test_autoderive import PLAINS, SOL_RING
     monkeypatch.setattr(
         srv, "_goldfish_fetch_cards",
         _fake_fetch_for([PLAINS, SOL_RING, SWORDS, PURESTEEL, BOROS_SIGNET]))
@@ -142,9 +106,9 @@ async def test_goldfish_annotate_three_sections(monkeypatch):
         deck="1 Puresteel Paladin\n1 Plains\n1 Sol Ring\n"
              "1 Swords to Plowshares\n1 Boros Signet\n1 Fake Card"))
 
-    # Three sections, correctly populated.
+    # Three sections, correctly populated (singular header for one card).
     assert "## Auto-derived (2 cards)" in out
-    assert "## Out of scope (1" in out
+    assert "## Out of scope (1 card)" in out
     assert "## Needs annotation (2 cards)" in out
     needs = out.split("## Needs annotation")[1]
     assert "Puresteel Paladin" in needs and "Boros Signet" in needs
@@ -162,6 +126,11 @@ async def test_goldfish_annotate_three_sections(monkeypatch):
     assert "add_mana" in needs and "metalcraft" in needs
     assert "Cloud, Ex-SOLDIER" in needs
     assert '"Boros Signet"' in needs and '"{1}{T}"' in needs
+    # Filter/target vocabularies are part of the cheat-sheet.
+    assert "instant_or_sorcery" in needs        # spell_cast/cost_reduction filters
+    assert "name:<CardName>" in needs           # tutor filter escape hatch
+    assert "color:<W|U|B|R|G>" in needs         # cost_reduction color filter
+    assert "each_opponent" in needs and "one_opponent" in needs
 
     # Unrecognized names surface at the top.
     assert "Not recognized by Scryfall" in out
@@ -190,13 +159,15 @@ async def test_goldfish_annotate_warns_on_non_100(monkeypatch):
 
 
 async def test_load_deck_first_line_commander():
-    names, commander = await srv._goldfish_load_deck("1 Boss\n2 Plains\n1 Bear")
+    names, commander, note = await srv._goldfish_load_deck(
+        "1 Boss\n2 Plains\n1 Bear")
     assert commander == "Boss"
     assert names == ["Boss", "Plains", "Plains", "Bear"]
+    assert note is None
 
 
 async def test_load_deck_cmdr_marker_overrides_first_line():
-    names, commander = await srv._goldfish_load_deck(
+    names, commander, _ = await srv._goldfish_load_deck(
         "2 Plains\n1 Boss *CMDR*\n1 Bear")
     assert commander == "Boss"
     assert names.count("Boss") == 1
@@ -204,9 +175,62 @@ async def test_load_deck_cmdr_marker_overrides_first_line():
 
 
 async def test_load_deck_single_line_count_pattern():
-    names, commander = await srv._goldfish_load_deck("2 Plains")
+    names, commander, _ = await srv._goldfish_load_deck("2 Plains")
     assert names == ["Plains", "Plains"]
     assert commander == "Plains"
+
+
+async def test_load_deck_zero_quantity_deck_rejected():
+    with pytest.raises(ValueError, match="no cards"):
+        await srv._goldfish_load_deck("0 Sol Ring\n0 Plains")
+
+
+async def test_load_deck_non_archidekt_url_rejected():
+    with pytest.raises(ValueError, match="Only Archidekt URLs"):
+        await srv._goldfish_load_deck("https://moxfield.com/decks/abc123")
+
+
+async def test_annotate_non_archidekt_url_message():
+    out = await srv.goldfish_annotate(srv.GoldfishAnnotateInput(
+        deck="https://moxfield.com/decks/abc123"))
+    assert "Only Archidekt URLs" in out
+
+
+ARCHIDEKT_PARTNER_DATA = {
+    "categories": [
+        {"name": "Commander", "isPremier": True, "includedInDeck": True},
+    ],
+    "cards": [
+        {"quantity": 1, "categories": ["Commander"],
+         "card": {"oracleCard": {"name": "Partner A"}}},
+        {"quantity": 1, "categories": ["Commander"],
+         "card": {"oracleCard": {"name": "Partner B"}}},
+        {"quantity": 2, "categories": [],
+         "card": {"oracleCard": {"name": "Plains"}}},
+    ],
+}
+
+
+async def test_load_deck_partner_precon_note(monkeypatch):
+    async def fake_get(path, params=None):
+        return ARCHIDEKT_PARTNER_DATA
+
+    monkeypatch.setattr(srv, "_archidekt_get", fake_get)
+    names, commander, note = await srv._goldfish_load_deck("12345")
+    assert commander == "Partner A"
+    assert note is not None and "first of 2 premier cards" in note
+    assert names.count("Plains") == 2
+
+
+async def test_annotate_partner_note_in_header(monkeypatch):
+    async def fake_get(path, params=None):
+        return ARCHIDEKT_PARTNER_DATA
+
+    monkeypatch.setattr(srv, "_archidekt_get", fake_get)
+    _patch_fetch_minideck(monkeypatch)
+    out = await srv.goldfish_annotate(srv.GoldfishAnnotateInput(deck="12345"))
+    assert "Commander: Partner A (first of 2 premier cards" in out
+    assert "v1 simulates a single commander" in out
 
 
 # ── _goldfish_fetch_cards cache ──────────────────────────────────────────────
