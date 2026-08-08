@@ -2191,3 +2191,68 @@ def test_check_combos_empty_fast_path():
     g.battlefield = _Boom()
     from goldfish.engine import check_combos
     check_combos(g)                               # no zone access, no raise
+
+
+def test_castable_requires_current_assembly_not_ever_assembled():
+    # Reviewer repro: a combo piece cast normally as an instant dies to the
+    # graveyard (permanently dead in v1). A later turn must not price the
+    # combo out of the graveyard, record castable, or declare a false win —
+    # while combo_assembled_turn stays monotone (never reset).
+    cards = mini_cards()
+    cards["Scepter"] = SimCard(data=make_data("Scepter", cost=parse_cost("{2}"),
+                               types=frozenset({"artifact"})), ann=None, scope_class=None)
+    cards["Reversal"] = SimCard(data=make_data("Reversal", cost=parse_cost("{R}"),
+                                types=frozenset({"instant"})), ann=None, scope_class=None)
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1,
+                 combos=[{"cards": ["Scepter", "Reversal"], "wins": True}])
+    g.phase = "main1"; g.turn = 3
+    g.hand[:] = ["Reversal"]
+    g.new_perm("Scepter")
+    from goldfish.engine import check_combos
+    check_combos(g)                               # no producers: assembled only
+    assert g.combo_assembled_turn[0] == 3
+    assert g.combo_castable_turn[0] is None
+    g.new_perm("Mountain")                        # direct perm: no combo check ran
+    step(g, {"type": "cast", "card": "Reversal"})
+    assert g.graveyard == ["Reversal"]            # the piece is gone for good (v1)
+    assert g.combo_castable_turn[0] is None       # end-of-cast check: not assembled NOW
+    assert g.won_turn is None
+    for _ in range(3):                            # through combat/main2 into turn 4
+        step(g, {"type": "pass"})
+    assert g.turn == 4
+    check_combos(g)                               # Mountain untapped again
+    assert g.combo_assembled_turn[0] == 3         # monotone: first turn sticks
+    assert g.combo_castable_turn[0] is None       # never priced from the graveyard
+    assert g.won_turn is None
+
+
+def test_second_wins_combo_post_win_records_but_never_casts():
+    # After the game is won, a second wins-combo going castable is still
+    # recorded (legitimate data) but must not emit synthetic "(combo)" casts
+    # or inflate spells_cast_this_turn — the game already ended.
+    cards = mini_cards()
+    for name, cost in (("A1", "{R}"), ("A2", "{R}"), ("B1", "{3}{R}"), ("B2", "{3}{R}")):
+        cards[name] = SimCard(data=make_data(name, cost=parse_cost(cost),
+                              types=frozenset({"creature"}), power=1, toughness=1),
+                              ann=None, scope_class=None)
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1,
+                 combos=[{"cards": ["A1", "A2"], "wins": True},
+                         {"cards": ["B1", "B2"], "wins": True}])
+    g.phase = "main1"; g.turn = 3
+    g.hand[:] = ["A1", "A2", "B1", "B2"]
+    for _ in range(2):
+        g.new_perm("Mountain")
+    from goldfish.engine import check_combos
+    check_combos(g)
+    assert g.won_turn == 3                        # combo 1 wins at {R}+{R}
+    assert g.spells_cast_this_turn == 2
+    assert g.combo_assembled_turn == [3, 3]
+    assert g.combo_castable_turn == [3, None]     # combo 2: 8 mv vs 2 producers
+    for _ in range(6):
+        g.new_perm("Mountain")
+    check_combos(g)
+    assert g.combo_castable_turn == [3, 3]        # still recorded post-win
+    assert g.spells_cast_this_turn == 2           # no synthetic casts after the end
+    assert sum("(combo)" in line for line in g.log) == 2      # A1, A2 only
+    assert sum("won turn" in line for line in g.log) == 1
+    assert g.won_turn == 3

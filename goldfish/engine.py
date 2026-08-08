@@ -886,23 +886,31 @@ def check_combos(g: Game) -> None:
     hand and on the battlefield counts as deployed), each priced through the
     same _cast_cost pipeline a real cast would be charged (commander tax for
     a command-zone commander piece, cost_reduction statics), summed pip-wise
-    into one Cost and payable with currently available producers. The joint
-    same-turn payment is a flagged simplification (ignores casting a piece
-    the turn before). A `wins` combo ends the game at first
-    assembled+castable: each undeployed piece is logged as cast (feeding
-    spells_cast_this_turn and the cast metrics) and the win goes through
-    _declare_win — the kill-turn histogram reads won_turn, and an earlier win
-    is never overwritten."""
+    into one Cost and payable with currently available producers. Castable is
+    only evaluated while the combo is assembled RIGHT NOW — a piece cast away
+    to the graveyard (permanently dead in v1) stops being priceable, while
+    combo_assembled_turn keeps the first turn it was ever assembled (the
+    metric is monotone, never reset). Flagged v1 approximations: the joint
+    same-turn payment ignores casting a piece the turn before, and a land
+    piece not yet fielded prices at ZERO through _cast_cost (lands carry no
+    mana cost and are played, not cast). A `wins` combo ends the game at
+    first assembled+castable: each undeployed piece is logged as cast
+    (feeding spells_cast_this_turn and the cast metrics) and the win goes
+    through _declare_win — the kill-turn histogram reads won_turn. Once the
+    game is won, later castable flips are still recorded (legitimate data)
+    but emit no synthetic casts."""
     if not g.combos:
         return
+    if all(t is not None for t in g.combo_castable_turn):
+        return                        # every combo fully recorded: nothing left
     fielded = {p.name for p in g.battlefield}
     accessible = set(g.hand) | set(g.command) | fielded
     for i, pieces in enumerate(g.combos):
-        if (g.combo_assembled_turn[i] is None
-                and all(name in accessible for name in pieces)):
+        assembled_now = all(name in accessible for name in pieces)
+        if assembled_now and g.combo_assembled_turn[i] is None:
             g.combo_assembled_turn[i] = g.turn
             g.emit(f"combo {i + 1} assembled: {', '.join(pieces)}")
-        if g.combo_assembled_turn[i] is None or g.combo_castable_turn[i] is not None:
+        if not assembled_now or g.combo_castable_turn[i] is not None:
             continue
         undeployed = [name for name in pieces if name not in fielded]
         joint = dict(parse_cost(None).pips)
@@ -915,7 +923,7 @@ def check_combos(g: Game) -> None:
             continue
         g.combo_castable_turn[i] = g.turn
         g.emit(f"combo {i + 1} castable")
-        if g.combo_wins[i]:
+        if g.combo_wins[i] and g.won_turn is None:
             for name in undeployed:
                 g.spells_cast_this_turn += 1
                 g.emit(f"cast {name} (combo)")
