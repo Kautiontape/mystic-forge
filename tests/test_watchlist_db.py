@@ -1,5 +1,6 @@
 import re
-import sqlite3
+
+import pytest
 
 import watchlist_db
 
@@ -45,3 +46,84 @@ def test_create_records_create_event(db):
     list_id, _, _ = watchlist_db.create_list(db, label="x")
     ev = db.execute("SELECT * FROM events WHERE list_id=?", (list_id,)).fetchone()
     assert ev["seq"] == 1 and ev["action"] == "create"
+
+
+def test_add_card_materializes_current(db):
+    list_id, _, _ = watchlist_db.create_list(db)
+    seq, entry = watchlist_db.add_card(db, list_id, "Sol Ring",
+                                       target_price=1.5, note="Cloud deck")
+    row = db.execute("SELECT * FROM watchlist_current WHERE list_id=?",
+                     (list_id,)).fetchone()
+    assert row["entry_id"] == seq == entry["entry_id"]
+    assert row["card_name"] == "Sol Ring"
+    assert row["target_price"] == 1.5
+    assert row["note"] == "Cloud deck"
+
+
+def test_add_same_name_twice_updates_instead_of_duplicating(db):
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring", target_price=2.0)
+    watchlist_db.add_card(db, list_id, "Sol Ring", target_price=1.0, note="hi")
+    rows = db.execute("SELECT * FROM watchlist_current WHERE list_id=?",
+                      (list_id,)).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["target_price"] == 1.0 and rows[0]["note"] == "hi"
+    actions = [r["action"] for r in db.execute(
+        "SELECT action FROM events WHERE list_id=? ORDER BY seq", (list_id,))]
+    assert actions == ["create", "add", "set_target", "set_note"]
+
+
+def test_two_printings_of_same_card_coexist(db):
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring", set_code="C21",
+                          collector_number="263")
+    watchlist_db.add_card(db, list_id, "Sol Ring", set_code="LTC",
+                          collector_number="284")
+    rows = db.execute("SELECT * FROM watchlist_current WHERE list_id=?",
+                      (list_id,)).fetchall()
+    assert len(rows) == 2
+
+
+def test_remove_by_name_and_by_entry_id(db):
+    list_id, _, _ = watchlist_db.create_list(db)
+    seq1, _ = watchlist_db.add_card(db, list_id, "Sol Ring")
+    watchlist_db.add_card(db, list_id, "Cultivate")
+    removed = watchlist_db.remove_entry(db, list_id, entry_id=seq1)
+    assert removed["card_name"] == "Sol Ring"
+    removed = watchlist_db.remove_entry(db, list_id, name="cultivate")
+    assert removed["card_name"] == "Cultivate"
+    assert db.execute("SELECT COUNT(*) FROM watchlist_current WHERE list_id=?",
+                      (list_id,)).fetchone()[0] == 0
+
+
+def test_remove_missing_raises(db):
+    list_id, _, _ = watchlist_db.create_list(db)
+    with pytest.raises(watchlist_db.NotFound):
+        watchlist_db.remove_entry(db, list_id, name="Ghost Card")
+
+
+def test_lists_are_isolated(db):
+    a, _, _ = watchlist_db.create_list(db)
+    b, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, a, "Sol Ring")
+    assert watchlist_db.current_entries(db, b) == []
+    with pytest.raises(watchlist_db.NotFound):
+        watchlist_db.remove_entry(db, b, name="Sol Ring")
+
+
+def test_replay_reproduces_current(db):
+    """Spec acceptance: replaying events reproduces watchlist_current exactly."""
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring", target_price=2.0)
+    s2, _ = watchlist_db.add_card(db, list_id, "Cultivate", note="ramp")
+    watchlist_db.add_card(db, list_id, "Sol Ring", target_price=1.0)
+    watchlist_db.remove_entry(db, list_id, entry_id=s2)
+    replayed = watchlist_db.replay_state(db, list_id)
+    current = {r["entry_id"]: dict(r) for r in
+               db.execute("SELECT * FROM watchlist_current WHERE list_id=?",
+                          (list_id,))}
+    assert set(replayed) == set(current)
+    for eid, entry in replayed.items():
+        for col in ("card_name", "set_code", "collector_number",
+                    "target_price", "note", "added_at"):
+            assert entry[col] == current[eid][col], f"{col} diverged"

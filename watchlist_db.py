@@ -147,3 +147,107 @@ def append_event(db, list_id: int, action: str, payload: dict) -> int:
                " VALUES (?,?,?,?,?)",
                (list_id, seq, _now(), action, json.dumps(payload)))
     return seq
+
+
+class NotFound(Exception):
+    pass
+
+
+def current_entries(db, list_id: int) -> list[dict]:
+    return [dict(r) for r in db.execute(
+        "SELECT * FROM watchlist_current WHERE list_id=? ORDER BY entry_id",
+        (list_id,))]
+
+
+def _find_entry(db, list_id: int, entry_id=None, name=None,
+                set_code=None, collector_number=None):
+    if entry_id is not None:
+        return db.execute(
+            "SELECT * FROM watchlist_current WHERE list_id=? AND entry_id=?",
+            (list_id, entry_id)).fetchone()
+    q = "SELECT * FROM watchlist_current WHERE list_id=? AND LOWER(card_name)=LOWER(?)"
+    args = [list_id, name]
+    if set_code:
+        q += " AND LOWER(set_code)=LOWER(?)"
+        args.append(set_code)
+    if collector_number:
+        q += " AND collector_number=?"
+        args.append(collector_number)
+    return db.execute(q, args).fetchone()
+
+
+def add_card(db, list_id: int, card_name: str, set_code: str | None = None,
+             collector_number: str | None = None, target_price: float | None = None,
+             note: str | None = None) -> tuple[int, dict]:
+    """Append add (or set_target/set_note for an existing entry) and materialize.
+
+    Returns (last_seq, entry_dict)."""
+    existing = _find_entry(db, list_id, name=card_name, set_code=set_code,
+                           collector_number=collector_number)
+    if existing:
+        seq = existing["entry_id"]
+        eid = existing["entry_id"]
+        if target_price is not None and target_price != existing["target_price"]:
+            seq = append_event(db, list_id, "set_target",
+                              {"entry_id": eid, "target_price": target_price})
+            db.execute("UPDATE watchlist_current SET target_price=?"
+                       " WHERE list_id=? AND entry_id=?",
+                       (target_price, list_id, eid))
+        if note is not None and note != existing["note"]:
+            seq = append_event(db, list_id, "set_note",
+                              {"entry_id": eid, "note": note})
+            db.execute("UPDATE watchlist_current SET note=?"
+                       " WHERE list_id=? AND entry_id=?", (note, list_id, eid))
+        db.commit()
+        return seq, dict(_find_entry(db, list_id, entry_id=eid))
+
+    added_at = _now()
+    payload = {"card_name": card_name, "set_code": set_code,
+               "collector_number": collector_number,
+               "target_price": target_price, "note": note, "added_at": added_at}
+    seq = append_event(db, list_id, "add", payload)
+    db.execute(
+        "INSERT INTO watchlist_current (list_id, entry_id, card_name, set_code,"
+        " collector_number, target_price, note, added_at) VALUES (?,?,?,?,?,?,?,?)",
+        (list_id, seq, card_name, set_code, collector_number,
+         target_price, note, added_at))
+    db.commit()
+    return seq, dict(_find_entry(db, list_id, entry_id=seq))
+
+
+def remove_entry(db, list_id: int, entry_id: int | None = None,
+                 name: str | None = None) -> dict:
+    row = _find_entry(db, list_id, entry_id=entry_id, name=name)
+    if row is None:
+        raise NotFound(f"No watchlist entry matching "
+                       f"{'#' + str(entry_id) if entry_id else name!r}")
+    append_event(db, list_id, "remove",
+                 {"entry_id": row["entry_id"], "card_name": row["card_name"]})
+    db.execute("DELETE FROM watchlist_current WHERE list_id=? AND entry_id=?",
+               (list_id, row["entry_id"]))
+    db.commit()
+    return dict(row)
+
+
+def state_at(db, list_id: int, seq: int | None = None) -> dict[int, dict]:
+    """Pure fold of the event chain up to (and including) seq."""
+    q = "SELECT * FROM events WHERE list_id=? ORDER BY seq"
+    entries: dict[int, dict] = {}
+    for ev in db.execute(q, (list_id,)):
+        if seq is not None and ev["seq"] > seq:
+            break
+        payload = json.loads(ev["payload_json"])
+        if ev["action"] == "add":
+            entries[ev["seq"]] = {"entry_id": ev["seq"], **payload}
+        elif ev["action"] == "remove":
+            entries.pop(payload["entry_id"], None)
+        elif ev["action"] == "set_target":
+            entries[payload["entry_id"]]["target_price"] = payload["target_price"]
+        elif ev["action"] == "set_note":
+            entries[payload["entry_id"]]["note"] = payload["note"]
+        # create / clone_init carry no state
+    return entries
+
+
+def replay_state(db, list_id: int) -> dict[int, dict]:
+    return state_at(db, list_id, None)
