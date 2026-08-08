@@ -233,7 +233,8 @@ button.act:hover{filter:brightness(1.08)}
   color:var(--sub);font-size:1.15rem;cursor:pointer;line-height:1;padding:.2rem .4rem;
   border-radius:.4rem}
 .xclose:hover{background:var(--mantle);color:var(--text)}
-dialog{position:relative}
+/* no position override on dialog: the UA's dialog:modal{position:fixed} must win,
+   else the sheet anchors to the document and rides up with page scroll */
 .modalend{display:flex;gap:.6rem;margin-top:.9rem;justify-content:flex-start;
   align-items:center;flex-wrap:wrap;position:sticky;bottom:-1.3rem;
   background:var(--base);padding:.6rem 0;z-index:2}
