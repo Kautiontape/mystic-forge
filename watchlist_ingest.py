@@ -74,9 +74,11 @@ def resolve_watched(db, allprintings_path: str) -> int:
     ap.row_factory = sqlite3.Row
     added = 0
     for row in pending:
+        # scryfallId lives in cardIdentifiers, not cards (real MTGJSON schema)
         for c in ap.execute(
-                "SELECT name, uuid, setCode, number, scryfallId FROM cards"
-                " WHERE LOWER(name)=LOWER(?)", (row["card_name"],)):
+                "SELECT c.name, c.uuid, c.setCode, c.number, ci.scryfallId"
+                " FROM cards c LEFT JOIN cardIdentifiers ci ON ci.uuid = c.uuid"
+                " WHERE LOWER(c.name)=LOWER(?)", (row["card_name"],)):
             db.execute(
                 "INSERT OR IGNORE INTO card_uuids (card_name, uuid, set_code,"
                 " collector_number, scryfall_id) VALUES (?,?,?,?,?)",

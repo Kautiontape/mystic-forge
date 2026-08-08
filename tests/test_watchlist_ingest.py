@@ -8,15 +8,20 @@ import watchlist_ingest
 
 
 def make_allprintings(tmp_path):
-    """Minimal AllPrintings.sqlite lookalike: cards(name,uuid,setCode,number,scryfallId)."""
+    """Minimal AllPrintings.sqlite lookalike, mirroring the real MTGJSON
+    schema: cards has no scryfallId; it lives in cardIdentifiers."""
     p = str(tmp_path / "AllPrintings.sqlite")
     ap = sqlite3.connect(p)
     ap.execute("CREATE TABLE cards (name TEXT, uuid TEXT, setCode TEXT,"
-               " number TEXT, scryfallId TEXT)")
-    ap.executemany("INSERT INTO cards VALUES (?,?,?,?,?)", [
-        ("Sol Ring", "uuid-a", "C21", "263", "scry-a"),
-        ("Sol Ring", "uuid-b", "LTC", "284", "scry-b"),
-        ("Cultivate", "uuid-c", "M21", "177", "scry-c"),
+               " number TEXT)")
+    ap.execute("CREATE TABLE cardIdentifiers (uuid TEXT, scryfallId TEXT)")
+    ap.executemany("INSERT INTO cards VALUES (?,?,?,?)", [
+        ("Sol Ring", "uuid-a", "C21", "263"),
+        ("Sol Ring", "uuid-b", "LTC", "284"),
+        ("Cultivate", "uuid-c", "M21", "177"),
+    ])
+    ap.executemany("INSERT INTO cardIdentifiers VALUES (?,?)", [
+        ("uuid-a", "scry-a"), ("uuid-b", "scry-b"), ("uuid-c", "scry-c"),
     ])
     ap.commit()
     ap.close()
