@@ -1,8 +1,24 @@
 import json
 
+import pytest
+
 from goldfish.cards import SimCard, parse_cost
-from goldfish.engine import Game, derive_seed, new_game
+from goldfish.engine import (
+    Game,
+    IllegalAction,
+    _payment_plan,
+    can_pay,
+    derive_seed,
+    new_game,
+    pay,
+    untapped_producers,
+)
 from tests.goldfish.test_cards import make_data  # reuse the factory
+
+
+def bf_land(g, name):
+    p = g.new_perm(name)
+    return p
 
 
 def mini_cards():
@@ -44,6 +60,7 @@ def test_state_roundtrip():
     cards = mini_cards()
     combos_arg = [{"cards": ["Plains", "Boss"], "wins": True}]
     g = new_game(cards, ["Plains"] * 40, commander="Boss", seed=3, combos=combos_arg)
+    assert g.combos[0] is not combos_arg[0]["cards"]            # defensive copy in new_game
     g.rng.random()                                              # advance rng
     g.turn = 3
     p = g.new_perm("Hammer", attached=["b1"], pump_eot=[1, 2], pump_perm=[3, 4],
@@ -84,3 +101,110 @@ def test_state_roundtrip():
     combos_arg[0]["cards"].append("Mountain")
     assert raw_blob["combo_assembled_turn"] == [None]
     assert raw_blob["combos"] == [["Plains", "Boss"]]
+
+
+# -- Task 5: mana payment solver -----------------------------------------
+
+def test_untapped_producers_strictest_first_ordering():
+    cards = mini_cards()
+    cards["Karoo"] = SimCard(data=make_data("Karoo", types=frozenset({"land"}),
+                                            produces={"W": 2}), ann=None, scope_class=None)
+    cards["Rainbow"] = SimCard(data=make_data(
+        "Rainbow", types=frozenset({"land"}),
+        produces={"W": 1, "U": 1, "B": 1, "R": 1, "G": 1}), ann=None, scope_class=None)
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bf_land(g, "Rainbow")                      # 5 colors -> id b1, least strict
+    bf_land(g, "Plains")                       # 1 color -> id b2
+    bf_land(g, "Karoo")                        # 1 color, qty 2 -> id b3
+    mtn = bf_land(g, "Mountain")
+    mtn.tapped = True                           # tapped producers are excluded
+
+    out = untapped_producers(g)
+    assert [p.id for p, _, _ in out] == ["b2", "b3", "b1"]      # strictest (fewest
+    # colors) first, ties broken by perm id
+    assert out[0][1] == frozenset({"W"}) and out[0][2] == 1
+    assert out[1][1] == frozenset({"W"}) and out[1][2] == 2
+    assert out[2][1] == frozenset({"W", "U", "B", "R", "G"}) and out[2][2] == 1
+
+
+def test_cannot_pay_red_with_only_plains():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    for _ in range(3):
+        bf_land(g, "Plains")
+    assert can_pay(g, parse_cost("{R}")) is False
+    assert can_pay(g, parse_cost("{2}")) is True
+
+
+def test_greedy_prefers_flexible_land_for_generic():
+    # 1 Mountain + 1 Plains, cost {1}{R}: the Mountain must fund {R}, Plains the {1}
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bf_land(g, "Mountain"); bf_land(g, "Plains")
+    assert can_pay(g, parse_cost("{1}{R}")) is True
+    pay(g, parse_cost("{1}{R}"))
+    assert all(p.tapped for p in g.battlefield)
+
+
+def test_quantity_producer_and_pool_wildcard():
+    cards = mini_cards()
+    cards["Karoo"] = SimCard(data=make_data("Karoo", types=frozenset({"land"}),
+                                            produces={"W": 2}), ann=None, scope_class=None)
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bf_land(g, "Karoo")
+    g.mana_pool["any"] = 1
+    assert can_pay(g, parse_cost("{2}{R}")) is True   # W W from Karoo + wildcard R
+
+
+def test_karoo_pays_double_pip_with_single_tap_and_no_surplus():
+    # {W}{W} against a single Karoo (produces W qty 2): one permanent taps,
+    # and the surplus is fully consumed by the second pip (pool ends at 0).
+    cards = mini_cards()
+    cards["Karoo"] = SimCard(data=make_data("Karoo", types=frozenset({"land"}),
+                                            produces={"W": 2}), ann=None, scope_class=None)
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    bf_land(g, "Karoo")
+    assert can_pay(g, parse_cost("{W}{W}")) is True
+    pay(g, parse_cost("{W}{W}"))
+    tapped = [p for p in g.battlefield if p.tapped]
+    assert len(tapped) == 1
+    assert tapped[0].name == "Karoo"
+    assert g.mana_pool["W"] == 0
+
+
+def test_generic_paid_from_pool_with_empty_battlefield():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g.mana_pool["any"] = 1
+    assert can_pay(g, parse_cost("{1}")) is True
+    pay(g, parse_cost("{1}"))
+    assert g.battlefield == []                 # nothing to tap
+    assert g.mana_pool["any"] == 0
+
+
+def test_pay_impossible_cost_raises_and_leaves_game_unmutated():
+    cards = mini_cards()
+    g = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    for _ in range(3):
+        bf_land(g, "Plains")
+    pool_before = dict(g.mana_pool)
+    with pytest.raises(IllegalAction):
+        pay(g, parse_cost("{R}"))
+    assert all(not p.tapped for p in g.battlefield)
+    assert g.mana_pool == pool_before
+
+
+def test_payment_plan_is_deterministic():
+    cards = mini_cards()
+    g1 = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    g2 = new_game(cards, ["Plains"] * 40, "Boss", seed=1)
+    for g in (g1, g2):
+        bf_land(g, "Mountain"); bf_land(g, "Plains"); bf_land(g, "Mountain")
+    cost = parse_cost("{1}{R}{R}")
+    plan1 = _payment_plan(g1, cost)
+    plan2 = _payment_plan(g2, cost)
+    assert plan1 is not None and plan2 is not None
+    ids1, pool1 = plan1
+    ids2, pool2 = plan2
+    assert ids1 == ids2                          # same perms tapped, same order
+    assert pool1 == pool2

@@ -5,7 +5,7 @@ import hashlib
 import random
 from dataclasses import dataclass, field
 
-from .cards import COLORS, SimCard
+from .cards import COLORS, Cost, SimCard
 
 
 def derive_seed(master_seed: int, game_index: int) -> int:
@@ -184,3 +184,79 @@ def new_game(cards: dict, deck: list, commander: str, seed: int,
     g.combo_castable_turn = [None] * len(g.combos)
     g.rng = rng
     return g
+
+
+# -- Mana payment solver (D5-ish; see spec Engine (Mana)) -------------------
+
+def untapped_producers(g: Game):
+    """[(perm, colors: frozenset|{'C'}, qty)] for untapped mana permanents,
+    summoning-sickness-aware for creatures with {T} in produces (none in v1 —
+    rocks/lands only), deterministic order by perm id."""
+    out = []
+    for p in g.battlefield:
+        if p.tapped:
+            continue
+        card = g.card(p.name)
+        if card.data.produces:
+            colors = frozenset(card.data.produces.keys())
+            qty = max(card.data.produces.values())
+            out.append((p, colors, qty))
+    out.sort(key=lambda t: (len(t[1]), int(t[0].id[1:])))   # strictest first
+    return out
+
+
+def _payment_plan(g: Game, cost: Cost):
+    """Greedy: colored pips from strictest producers, generic from the rest
+    (largest quantity first), pool wildcards last. Returns [perm ids] or None."""
+    producers = untapped_producers(g)
+    used, avail = [], list(producers)
+    pool = dict(g.mana_pool)
+    need = dict(cost.pips)
+
+    for color in sorted([c for c in ("W", "U", "B", "R", "G", "C") if need.get(c)],
+                        key=lambda c: -need[c]):
+        for _ in range(need[color]):
+            if pool.get(color, 0) > 0:
+                pool[color] -= 1
+                continue
+            hit = next((t for t in avail if color in t[1]), None)
+            if hit:
+                avail.remove(hit)
+                used.append(hit)
+                surplus = hit[2] - 1
+                if surplus:
+                    pool["any" if len(hit[1]) > 1 else next(iter(hit[1]))] = \
+                        pool.get("any" if len(hit[1]) > 1 else next(iter(hit[1])), 0) + surplus
+            elif pool.get("any", 0) > 0:
+                pool["any"] -= 1
+            else:
+                return None
+
+    generic = need.get("generic", 0)
+    avail.sort(key=lambda t: (-t[2], len(t[1])))    # big colorless rocks first
+    for t in list(avail):
+        if generic <= 0:
+            break
+        avail.remove(t); used.append(t); generic -= t[2]
+    while generic > 0:
+        for k in ("C", "W", "U", "B", "R", "G", "any"):
+            if pool.get(k, 0) > 0:
+                pool[k] -= 1; generic -= 1
+                break
+        else:
+            return None
+    return [t[0].id for t in used], pool
+
+
+def can_pay(g: Game, cost: Cost) -> bool:
+    return _payment_plan(g, cost) is not None
+
+
+def pay(g: Game, cost: Cost):
+    plan = _payment_plan(g, cost)
+    if plan is None:
+        raise IllegalAction(f"cannot pay {cost.pips}")
+    ids, pool = plan
+    for pid in ids:
+        g.perm(pid).tapped = True
+    g.mana_pool = {k: pool.get(k, 0) for k in list("WUBRG") + ["C", "any"]}
