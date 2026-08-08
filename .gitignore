@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .venv/
+.playwright-mcp/
+*.png
+nohup.out
