@@ -1590,14 +1590,18 @@ def _index_collection_results(cards: list[dict]) -> dict:
 
 
 def _lookup_entry(index: dict, entry: DecklistEntry) -> Optional[dict]:
-    """Find the card matching this entry, most specific key first."""
+    """Find the card matching this entry, most specific key first.
+
+    An entry that names a collector number is asking for one exact printing, so
+    a miss there is a miss — degrading to another printing of the same card
+    would report someone else's price as the user's. Entries that named only a
+    set, or only a name, do degrade.
+    """
     name = entry.name.lower().strip()
     set_code = (entry.set_code or "").lower()
 
     if set_code and entry.collector_number:
-        hit = index.get(("printing", set_code, entry.collector_number))
-        if hit is not None:
-            return hit
+        return index.get(("printing", set_code, entry.collector_number))
     if set_code:
         hit = index.get(("name_set", name, set_code))
         if hit is not None:

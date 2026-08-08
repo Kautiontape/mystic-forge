@@ -258,6 +258,27 @@ def test_lookup_returns_none_when_absent():
     assert server._lookup_entry(index, entry) is None
 
 
+def test_lookup_does_not_substitute_a_different_printing_from_the_same_set():
+    # A named collector number is a request for one exact printing. Degrading
+    # to another printing of the same card in the same set would report
+    # someone else's price as the user's.
+    other_sld_sol_ring = {
+        "name": "Sol Ring", "set": "sld", "collector_number": "2417",
+        "finishes": ["foil"], "prices": {"usd_foil": "48.21"},
+    }
+    index = server._index_collection_results([other_sld_sol_ring])
+    entry = server.DecklistEntry(1, "Sol Ring", "sld", "9999", None)
+    assert server._lookup_entry(index, entry) is None
+
+
+def test_lookup_still_degrades_when_only_a_set_was_named():
+    # Contrast with the above: no collector number means the caller did not ask
+    # for a specific printing, so falling back to the bare-name key is correct.
+    index = server._index_collection_results([SOL_RING_LTC])
+    entry = server.DecklistEntry(1, "Sol Ring", "c21", None, None)
+    assert server._lookup_entry(index, entry) is SOL_RING_LTC
+
+
 # ── _identifier_label ─────────────────────────────────────────────────────────
 
 def test_identifier_label_renders_each_identifier_shape_readably():
