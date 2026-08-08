@@ -11,6 +11,7 @@ configure Archidekt credentials for private deck access.
 
 import asyncio
 import json
+import os
 import re
 import time
 import uuid
@@ -2675,6 +2676,17 @@ async def goldfish_annotate(params: GoldfishAnnotateInput) -> str:
 GOLDFISH_MAX_N = 20_000
 GOLDFISH_MAX_RUNS = 50
 
+# Hosted report delivery (spec §Run reports, delivery path 2). When
+# GOLDFISH_REPORT_DIR is set, every completed run's HTML is persisted there
+# (content-addressed <run_code>.html, size-capped); when the public base URL
+# is ALSO set, run/AB outputs append a public Report: link served by the
+# /goldfish/r/{code} route. When unset, tools simply omit the link and
+# goldfish_report serves from the in-memory LRU.
+GOLDFISH_REPORT_DIR = os.environ.get("GOLDFISH_REPORT_DIR")
+GOLDFISH_PUBLIC_BASE_URL = os.environ.get(
+    "GOLDFISH_PUBLIC_BASE_URL", "").rstrip("/")
+GOLDFISH_REPORT_FILE_CAP = 500     # newest files kept by the dir cleanup
+
 #: At most two CPU-bound sims run concurrently server-wide; further requests
 #: queue here while every other tool call stays responsive (spec §Concurrency).
 _GOLDFISH_SEMAPHORE = asyncio.Semaphore(2)
@@ -2699,10 +2711,93 @@ async def _run_sim_offloop(fn, *args, **kw):
 
 def _goldfish_store_run(run_id: str, inputs: dict, result: dict,
                         kind: str) -> None:
-    _GOLDFISH_RUNS[run_id] = {"inputs": inputs, "result": result, "kind": kind}
+    """LRU-store a completed run, keeping only what the report renders:
+    inputs (resolved library + commander header info), metrics/deltas/
+    correlation and the extras the tools fold in. Per-game records are
+    dropped — they dwarf everything else and nothing re-reads them."""
+    slim = {k: v for k, v in result.items()
+            if k not in ("records", "records_a", "records_b")}
+    _GOLDFISH_RUNS[run_id] = {"inputs": inputs, "result": slim,
+                              "kind": kind, "html": None}
     _GOLDFISH_RUNS.move_to_end(run_id)
     while len(_GOLDFISH_RUNS) > GOLDFISH_MAX_RUNS:
         _GOLDFISH_RUNS.popitem(last=False)
+
+
+def _goldfish_get_run(run_id: str) -> dict | None:
+    """Fetch a stored run and refresh its LRU recency (reads keep a
+    frequently-consulted report alive, mirroring the games store)."""
+    entry = _GOLDFISH_RUNS.get(run_id)
+    if entry is not None:
+        _GOLDFISH_RUNS.move_to_end(run_id)
+    return entry
+
+
+def _goldfish_entry_html(entry: dict) -> str:
+    """Render an entry's report lazily and cache it. The generated-at stamp
+    is applied HERE (server side) — report.render_report itself never reads
+    the clock — and is excluded from the run-code hash by the renderer."""
+    if entry["html"] is None:
+        stamped = dict(entry["inputs"])
+        stamped["generated_at"] = time.strftime(
+            "%Y-%m-%d %H:%M UTC", time.gmtime())
+        entry["html"] = report.render_report(
+            entry["result"], stamped, kind=entry["kind"])
+    return entry["html"]
+
+
+def _goldfish_persist_report(run_id: str, entry: dict) -> str | None:
+    """Hosted mode (spec §Run reports): when GOLDFISH_REPORT_DIR is set,
+    write the rendered report as <run_code>.html and prune the directory to
+    the newest GOLDFISH_REPORT_FILE_CAP files by mtime. Returns the public
+    report URL when GOLDFISH_PUBLIC_BASE_URL is also set, else None."""
+    if not GOLDFISH_REPORT_DIR:
+        return None
+    os.makedirs(GOLDFISH_REPORT_DIR, exist_ok=True)
+    path = os.path.join(GOLDFISH_REPORT_DIR, f"{run_id}.html")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(_goldfish_entry_html(entry))
+    paths = [os.path.join(GOLDFISH_REPORT_DIR, name)
+             for name in os.listdir(GOLDFISH_REPORT_DIR)
+             if name.endswith(".html")]
+    paths.sort(key=os.path.getmtime, reverse=True)      # newest first
+    for stale in paths[GOLDFISH_REPORT_FILE_CAP:]:
+        try:
+            os.remove(stale)
+        except OSError:
+            pass                     # a racing cleanup already removed it
+    if GOLDFISH_PUBLIC_BASE_URL:
+        return f"{GOLDFISH_PUBLIC_BASE_URL}/goldfish/r/{run_id}"
+    return None
+
+
+def _goldfish_read_report_file(code: str) -> str | None:
+    """Blocking read of a persisted report; None when unconfigured/absent."""
+    if not GOLDFISH_REPORT_DIR:
+        return None
+    path = os.path.join(GOLDFISH_REPORT_DIR, f"{code}.html")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+async def _goldfish_report_page(request):
+    """GET /goldfish/r/{code} — serve a persisted report (public-with-code,
+    the same capability-token model as game ids). Unknown/bad codes 404."""
+    from starlette.responses import HTMLResponse, PlainTextResponse
+    code = request.path_params["code"]
+    if not re.fullmatch(r"[a-z0-9]{13}", code):
+        return PlainTextResponse("bad code", status_code=404)
+    html = await asyncio.to_thread(_goldfish_read_report_file, code)
+    if html is None:
+        return PlainTextResponse("unknown run code", status_code=404)
+    return HTMLResponse(html)
+
+
+if GOLDFISH_REPORT_DIR:
+    mcp.custom_route("/goldfish/r/{code}",
+                     methods=["GET"])(_goldfish_report_page)
 
 
 async def _goldfish_prepare(
@@ -3043,12 +3138,21 @@ async def goldfish_run(params: GoldfishRunInput) -> str:
         return ("internal simulator error — please report with these "
                 f"inputs: seed={params.seed}, n={params.n}, "
                 f"until_turn={until_turn}")
-    inputs = {"deck": params.deck, "annotations": params.annotations,
+    # Content-address the RESOLVED library (sorted) + commander, not the raw
+    # deck string: cosmetic Archidekt edits (reordering, category moves)
+    # keep the code; any card swap changes it (report.run_code docstring).
+    inputs = {"library": sorted(library), "commander": commander,
+              "annotations": params.annotations,
               "combos": params.combos, "n": params.n, "seed": params.seed,
               "until_turn": until_turn, "opponents": params.opponents,
               "mulligan": mull_overrides, "engine_version": ENGINE_VERSION}
     run_id = report.run_code(inputs)
+    # Fold in what the report renders beyond runner output (D11 honesty
+    # standing notes + header note); stored alongside metrics, records-free.
+    result["approx_by_card"] = approx_by_card
+    result["commander_note"] = cmdr_note
     _goldfish_store_run(run_id, inputs, result, "run")
+    report_url = _goldfish_persist_report(run_id, _GOLDFISH_RUNS[run_id])
 
     m = result["metrics"]
     cmdr_display = f"{commander} {cmdr_note}" if cmdr_note else commander
@@ -3072,6 +3176,8 @@ async def goldfish_run(params: GoldfishRunInput) -> str:
     parts += ["", "## Metrics", "```json", json.dumps(payload), "```"]
     parts += [""] + _goldfish_honesty_lines(m["honesty"], approx_by_card)
     parts += ["", f'Full report: goldfish_report("{run_id}")']
+    if report_url:
+        parts += [f"Report: {report_url}"]
     return "\n".join(parts)
 
 
@@ -3130,7 +3236,9 @@ async def goldfish_ab(params: GoldfishAbInput) -> str:
         return ("internal simulator error — please report with these "
                 f"inputs: seed={params.seed}, n={params.n}, "
                 f"until_turn={until_turn}")
-    inputs = {"deck_a": params.deck_a, "deck_b": params.deck_b,
+    # Resolved-library hashing, as in goldfish_run (report.run_code doc).
+    inputs = {"library_a": sorted(lib_a), "library_b": sorted(lib_b),
+              "commander_a": cmdr_a, "commander_b": cmdr_b,
               "annotations": params.annotations,
               "annotations_a": params.annotations_a,
               "annotations_b": params.annotations_b,
@@ -3139,10 +3247,16 @@ async def goldfish_ab(params: GoldfishAbInput) -> str:
               "allow_different_commanders": params.allow_different_commanders,
               "engine_version": ENGINE_VERSION}
     run_id = report.run_code(inputs)
+    banner = _goldfish_scope_banner(lib_a, lib_b, scopes_a, scopes_b)
+    # The report re-emits the banner verbatim and the standing notes (D11).
+    result["scope_banner"] = banner
+    result["approx_by_card_a"] = approx_a
+    result["approx_by_card_b"] = approx_b
     _goldfish_store_run(run_id, inputs, result, "ab")
+    report_url = _goldfish_persist_report(run_id, _GOLDFISH_RUNS[run_id])
 
     # SCOPE BANNER FIRST (spec §Statistics) — nothing may precede it.
-    parts = [_goldfish_scope_banner(lib_a, lib_b, scopes_a, scopes_b), ""]
+    parts = [banner, ""]
     cmdrs = (f"Commander: {cmdr_a}" if cmdr_a == cmdr_b
              else f"Commanders: A {cmdr_a} vs B {cmdr_b}")
     parts.append(f"# Goldfish A/B\n{cmdrs} | {params.n} paired games, "
@@ -3180,7 +3294,33 @@ async def goldfish_ab(params: GoldfishAbInput) -> str:
                "run_id": run_id}
     parts += ["", "## Deltas JSON", "```json", json.dumps(payload), "```"]
     parts += ["", f'Full report: goldfish_report("{run_id}")']
+    if report_url:
+        parts += [f"Report: {report_url}"]
     return "\n".join(parts)
+
+
+class GoldfishReportInput(BaseModel):
+    run_id: str = Field(...,
+                        description="run_id from goldfish_run/goldfish_ab "
+                                    "(the 13-char content-addressed run "
+                                    "code).")
+
+
+@mcp.tool(name="goldfish_report")
+async def goldfish_report(params: GoldfishReportInput) -> str:
+    """Self-contained HTML report for a completed goldfish_run/goldfish_ab
+    (spec §Run reports, D11): fingerprint header, stat tiles with CIs,
+    inline-SVG charts, trigger table, honesty report — no JavaScript, no
+    external requests. Publish it VERBATIM as an artifact or file; never
+    hand-author the numbers."""
+    entry = _goldfish_get_run(params.run_id)
+    if entry is None:
+        live = ", ".join(_GOLDFISH_RUNS) or "(none)"
+        return (f"Unknown run_id {params.run_id!r}. Live run_ids: {live}. "
+                f"Completed runs are kept in a size-capped LRU (last "
+                f"{GOLDFISH_MAX_RUNS}); re-running goldfish_run/goldfish_ab "
+                "with the same inputs recreates the same run_id and report.")
+    return _goldfish_entry_html(entry)
 
 
 # ── Goldfish interactive mode (spec §Interactive mode, D3, D10) ──────────────
