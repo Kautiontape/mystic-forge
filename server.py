@@ -2725,6 +2725,100 @@ async def watchlist_clone(params: WatchlistCloneInput) -> str:
         db.close()
 
 
+from html import escape as _esc
+
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request):
+    """Health surface for compose healthcheck and /mtg/health monitoring."""
+    import datetime as _dt
+    try:
+        db = _wl_db()
+        lists = db.execute("SELECT COUNT(*) FROM lists").fetchone()[0]
+        cards = db.execute("SELECT COUNT(*) FROM watchlist_current").fetchone()[0]
+        row = db.execute("SELECT value FROM meta WHERE key='last_ingest'").fetchone()
+        db.close()
+    except Exception as e:
+        return JSONResponse({"status": "error", "db": False, "error": str(e)},
+                            status_code=500)
+    last = row["value"] if row else None
+    stale = False
+    if cards and last:
+        age = _dt.date.today() - _dt.date.fromisoformat(last)
+        stale = age.days > 1                  # > 36h in whole-day terms
+    elif cards:
+        stale = True
+    return JSONResponse({
+        "status": "degraded" if stale else "ok",
+        "db": True, "lists": lists, "watched_cards": cards,
+        "last_ingest": last, "ingest_stale": stale,
+    })
+
+
+def _render_page(db, row, editable: bool) -> str:
+    title = _esc(row["label"] or "Watchlist")
+    parts = [f"<!doctype html><meta charset=utf-8><title>{title}</title>",
+             "<style>body{font:15px system-ui;margin:2rem auto;max-width:52rem;"
+             "padding:0 1rem}table{border-collapse:collapse;width:100%}"
+             "td,th{border-bottom:1px solid #ccc;padding:.4rem;text-align:left}"
+             "code{background:#eee;padding:.1rem .3rem}</style>",
+             f"<h1>{title}</h1>"]
+    if row["superseded_by"]:
+        parts.append("<p>⚠️ This list was superseded by a recovery clone.</p>")
+    if not editable:
+        parts.append(f"<p>Read-only view via share code "
+                     f"<code>{_esc(row['share_code'])}</code></p>")
+    parts.append("<h2>Current cards</h2><table><tr><th>#</th><th>Card</th>"
+                 "<th>Price</th><th>Target</th><th>Note</th></tr>")
+    for e in watchlist_db.current_entries(db, row["id"]):
+        s = watchlist_db.price_summary(db, watchlist_db.uuids_for_entry(db, e))
+        parts.append(
+            f"<tr><td>{e['entry_id']}</td><td>{_esc(e['card_name'])}</td>"
+            f"<td>{_fmt_price(s['current']) if s else '—'}</td>"
+            f"<td>{_fmt_price(e['target_price'])}</td>"
+            f"<td>{_esc(e['note'] or '')}</td></tr>")
+    parts.append("</table><h2>History</h2><table><tr><th>#</th><th>When</th>"
+                 "<th>Action</th><th>Detail</th></tr>")
+    for ev in db.execute("SELECT * FROM events WHERE list_id=? ORDER BY seq DESC",
+                         (row["id"],)):
+        payload = json.loads(ev["payload_json"])
+        detail = payload.get("card_name") or payload.get("label") or ""
+        parts.append(f"<tr><td>{ev['seq']}</td><td>{_esc(ev['ts'])}</td>"
+                     f"<td>{_esc(ev['action'])}</td><td>{_esc(str(detail))}</td></tr>")
+    parts.append("</table><p>Recover any revision in chat: "
+                 "<code>watchlist_clone(at_seq=N)</code></p>")
+    return "".join(parts)
+
+
+@mcp.custom_route("/w/{passphrase}", methods=["GET"])
+async def watch_page(request: Request):
+    db = _wl_db()
+    try:
+        row = watchlist_db.get_list_by_passphrase(
+            db, request.path_params["passphrase"])
+        if row is None:
+            return HTMLResponse("unknown passphrase", status_code=404)
+        return HTMLResponse(_render_page(db, row, editable=True))
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/s/{share_code}", methods=["GET"])
+async def share_page(request: Request):
+    db = _wl_db()
+    try:
+        row = watchlist_db.get_list_by_share(
+            db, request.path_params["share_code"])
+        if row is None:
+            return HTMLResponse("unknown share code", status_code=404)
+        return HTMLResponse(_render_page(db, row, editable=False))
+    finally:
+        db.close()
+
+
 @mcp.tool(name="price_history")
 async def price_history(params: PriceHistoryInput) -> str:
     """Daily price series (cheapest printing) for a card from the local price
