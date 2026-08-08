@@ -448,6 +448,14 @@ Not in scope, recorded so it is not rediscovered from scratch:
   stamp `*F*` across every card including printings that have no foil.
 - Teaching `precon_export` and the EDHREC formatters about finishes. They emit
   suggested cards rather than owned ones, so finish is not meaningful there yet.
+- **Warning on an unrecognized Archidekt `modifier`.** `MODIFIER_FINISHES.get()`
+  returns `None` for anything outside `Normal`/`Foil`/`Etched`, so a new foil
+  treatment would silently export as nonfoil and then price wrong. Only three values
+  are documented and live-verified, so this is speculative — but the codebase already
+  has a `# WARNING:` convention in `format_archidekt` that would fit.
+- **README tool table is incomplete.** `format_archidekt`, `scryfall_rulings`,
+  `spellbook_combos`, and `spellbook_card_combos` are registered `@mcp.tool`
+  functions with no README row. Pre-existing and unrelated to this work.
 - **Escaping card names in Scryfall queries.** `scryfall_price` interpolates the name
   into `!"{name}"` with no escaping, so a card whose name contains a double quote
   breaks the query. Real examples exist — Unhinged's `"Ach! Hans, Run!"` is literally

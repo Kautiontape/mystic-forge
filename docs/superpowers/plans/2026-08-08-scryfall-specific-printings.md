@@ -1978,6 +1978,45 @@ Before calling this done, confirm each with actual command output rather than by
 - [ ] `archidekt_export` on deck `1585124` emits `*F*` and `*E*` markers.
 - [ ] `validate_decklist` and `precon_diff` still work on a decklist carrying set codes and finish markers.
 
+## Changes made during execution
+
+The plan was edited in place where its own code turned out to be wrong; those
+sections above now show the corrected version. Recorded here so the reasoning is not
+lost:
+
+1. **Task 5 — `_lookup_entry` degraded too far.** As originally written, an entry
+   naming both a set and a collector number would, on a miss, fall through to looser
+   keys and return a *different real printing* of the same card — which Task 7 would
+   then price and file under "priced at the printing you named." Reachable whenever a
+   list holds a second resolvable line for the same card. A named collector number is
+   now terminal. Two regression tests added.
+
+2. **Task 7 — `missing` double-counted.** `missing + [_identifier_label(i) for i in
+   not_found]` reported every genuinely absent card twice: once from the per-entry
+   lookup failure, once from Scryfall's echoed identifier. Now deduped via
+   `missing_identifiers`, keeping the richer per-line format.
+
+3. **Task 7 — a failed batch discarded everything.** Introduced by the batching this
+   task added. Worse, naive degradation would have filed those entries under "Not
+   found on Scryfall," claiming a real card does not exist because a request timed
+   out. Batches now fail individually into a distinct **unchecked** bucket.
+   `_identifier_key`, `_dedupe_identifiers`, and `_chunk` were extracted so the
+   dedupe and batching logic is unit-testable; five tests added.
+
+4. **Task 8 — the `order` parameter was inert.** The mandatory client-side price
+   re-sort made every non-default value indistinguishable from the default, so its
+   schema description misled the calling model. Removed outright (spec D8), and
+   `_printing_header` extracted to kill a verbatim duplicated format string. Five
+   tests added covering the single-printing detail view.
+
+5. **Tasks 9 and 10 — no committed guard on the emitters.** Both tasks refactored
+   working code paths whose only verification was a one-off shell command. Three
+   offline end-to-end tests were added (two for `format_archidekt`, one for
+   `archidekt_export`), stubbing the single network helper with `monkeypatch` so they
+   run in the suite like everything else.
+
+Final suite: **89 tests**, up from the 18 that existed before this plan.
+
 ## Known deferrals
 
 Recorded in the spec, deliberately not implemented here:
