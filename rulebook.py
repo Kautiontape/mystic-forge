@@ -65,6 +65,7 @@ class RulesIndex:
         self.glossary_display: dict[str, str] = {}  # lower term -> original casing
         self.effective_date: str = ""               # "August 7, 2026"
         self.effective_yyyymmdd: str = ""            # "20260807"
+        self.glossary_aliases: set[str] = set()     # alias keys added for compound headwords
 
     def glossary_refs(self, term: str) -> list[str]:
         """Rule numbers cited by a glossary definition, in order, deduped."""
@@ -78,6 +79,43 @@ class RulesIndex:
         """Closest rule numbers and glossary terms for a failed lookup."""
         pool = list(self.rules) + list(self.glossary_display.values())
         return get_close_matches(ref, pool, n=n, cutoff=0.6)
+
+    def _documents(self):
+        for number, rule in self.rules.items():
+            yield number, "rule", f"{number} {rule.text}"
+        for key, definition in self.glossary.items():
+            if key in self.glossary_aliases:
+                continue  # alias of a compound headword; canonical entry covers it
+            display = self.glossary_display[key]
+            yield display, "glossary", f"{display} {definition}"
+
+    def search(self, query: str, limit: int = 10) -> tuple[list[SearchHit], int]:
+        """Ranked hits over rules + glossary and the total match count.
+
+        Scoring: term frequency dampened by document length, x3 when every
+        query term is present, x2 when the terms appear as a phrase.
+        """
+        q = _tokenize(query)
+        if not q:
+            return [], 0
+        phrase = " ".join(q)
+        hits: list[SearchHit] = []
+        for ref, kind, text in self._documents():
+            tokens = _tokenize(text)
+            if not tokens:
+                continue
+            counts = Counter(tokens)
+            matched = sum(counts[t] for t in q)
+            if not matched:
+                continue
+            score = matched / (1.0 + len(tokens) / 200.0)
+            if all(counts[t] for t in q):
+                score *= 3.0
+            if len(q) > 1 and phrase in " ".join(tokens):
+                score *= 2.0
+            hits.append(SearchHit(ref=ref, kind=kind, text=text, score=score))
+        hits.sort(key=lambda h: (-h.score, h.ref))
+        return hits[:limit], len(hits)
 
 
 def parse(text: str) -> RulesIndex:
@@ -164,3 +202,4 @@ def _parse_glossary(idx: RulesIndex, lines: list[str]) -> None:
             if alias and alias not in idx.glossary:
                 idx.glossary[alias] = idx.glossary[key]
                 idx.glossary_display[alias] = alias_display
+                idx.glossary_aliases.add(alias)

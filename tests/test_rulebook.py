@@ -84,6 +84,34 @@ def test_suggest_close_matches(idx):
     assert any(s.startswith("702.2") for s in idx.suggest("702.9"))
 
 
+def test_search_all_terms_ranked_first(idx):
+    hits, total = idx.search("deathtouch state-based actions")
+    assert hits[0].ref in {"702.2b", "704.5m"}
+    assert total >= 2
+
+
+def test_search_phrase_match_wins(idx):
+    hits, _ = idx.search("keyword abilities")
+    assert hits[0].ref == "702"
+    assert hits[0].kind == "rule"
+
+
+def test_search_glossary_hits_flagged(idx):
+    hits, _ = idx.search("especially effective")
+    assert hits[0].kind == "glossary"
+    assert hits[0].ref == "Deathtouch"
+
+
+def test_search_limit_and_total(idx):
+    hits, total = idx.search("deathtouch", limit=2)
+    assert len(hits) == 2
+    assert total > 2
+
+
+def test_search_no_token_query(idx):
+    assert idx.search("!!! ???") == ([], 0)
+
+
 def test_real_cr_parses_structurally():
     real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
     idx = rulebook.parse(real)
@@ -104,3 +132,7 @@ def test_real_cr_parses_structurally():
     assert idx.glossary_display["banding"] == "Banding"
     assert "partner" in idx.glossary
     assert "kicked" in idx.glossary
+    # Aliases don't produce duplicate search documents.
+    hits, _ = idx.search("bands with other", limit=10)
+    gl = [h for h in hits if h.kind == "glossary" and "Bands with Other" in h.ref]
+    assert len(gl) == 1
