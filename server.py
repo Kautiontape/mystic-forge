@@ -1523,6 +1523,20 @@ def _parse_decklist(text: str) -> list[tuple[int, str]]:
     return [(e.quantity, e.name) for e in _parse_decklist_entries(text)]
 
 
+def _entry_identifier(entry: DecklistEntry) -> dict:
+    """Scryfall /cards/collection identifier naming this entry's printing.
+
+    Set plus collector number pins one printing exactly. Set alone lets Scryfall
+    choose within that set. Neither means Scryfall picks the default printing,
+    which the caller is responsible for flagging in its output.
+    """
+    if entry.set_code and entry.collector_number:
+        return {"set": entry.set_code, "collector_number": entry.collector_number}
+    if entry.set_code:
+        return {"name": entry.name, "set": entry.set_code}
+    return {"name": entry.name}
+
+
 @mcp.tool(name="validate_decklist")
 async def validate_decklist(params: ValidateDecklistInput) -> str:
     """Validate a Commander decklist for card name accuracy, deck size, and color identity.

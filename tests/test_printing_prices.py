@@ -121,3 +121,27 @@ def test_parse_decklist_now_strips_uppercase_set_codes():
 def test_parse_decklist_strips_trailing_number_without_a_set_code():
     # Legacy behavior preserved: the bare trailing-digits strip still applies.
     assert server._parse_decklist("1x Sol Ring 284") == [(1, "Sol Ring")]
+
+
+# ── _entry_identifier ─────────────────────────────────────────────────────────
+
+def test_identifier_uses_set_and_collector_number_when_both_present():
+    entry = server.DecklistEntry(1, "Sol Ring", "ltc", "284", None)
+    assert server._entry_identifier(entry) == {"set": "ltc", "collector_number": "284"}
+
+
+def test_identifier_uses_name_and_set_when_only_set_present():
+    entry = server.DecklistEntry(1, "Arcane Signet", "otc", None, None)
+    assert server._entry_identifier(entry) == {"name": "Arcane Signet", "set": "otc"}
+
+
+def test_identifier_falls_back_to_name_alone():
+    entry = server.DecklistEntry(1, "Rhystic Study", None, None, None)
+    assert server._entry_identifier(entry) == {"name": "Rhystic Study"}
+
+
+def test_identifier_ignores_finish():
+    # Scryfall identifiers have no finish dimension — one card object carries
+    # every finish's price, so finish only affects which column we read later.
+    entry = server.DecklistEntry(1, "Counterspell", "dmr", "281", "foil")
+    assert server._entry_identifier(entry) == {"set": "dmr", "collector_number": "281"}
