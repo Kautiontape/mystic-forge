@@ -133,6 +133,7 @@ def full_record():
         opening_hand=["Plains"] * 4 + ["Bear"] * 3,
         commander_cast_turn=3,
         equipped_on_arrival=True,
+        equipment_at_arrival=2,
         kill_turn=6,
         cmdr21_turn=None,
         table_lethal_turn=5,
@@ -140,12 +141,14 @@ def full_record():
         damage_by_turn=[0, 0, 3, 6, 10, 12],
         cmdr_damage_by_turn=[0, 0, 3, 3, 5, 5],
         noncombat_damage_by_turn=[0, 0, 0, 1, 0, 0],
+        damage_per_opponent_by_turn=[[0], [0], [3], [6], [10], [12]],
         board_width_by_turn=[0, 1, 2, 3, 3, 4],
         total_power_by_turn=[0, 2, 4, 7, 9, 12],
         casts_by_turn=[1, 1, 2, 4, 1, 0],
         lands_played_by_turn=[1, 1, 1, 1, 1, 0],
         mana_available_by_turn=[1, 2, 3, 4, 5, 5],
         tokens_created_by_turn=[0, 0, 1, 0, 2, 0],
+        tokens_by_source={"Krenko": 3},
         trigger_fires={"Puresteel Paladin|etb_equipment|equip_free": 2},
         static_active_turn={"Puresteel Paladin|metalcraft": 3},
         combo_assembled_turn=[5],
@@ -163,6 +166,7 @@ def synthetic_records():
                     combo_castable_turn=[None])
     # r3: commander on 4, cmdr21 beyond the horizon (censored by until_turn)
     r3 = GameRecord(commander_cast_turn=4, equipped_on_arrival=False,
+                    equipment_at_arrival=0,
                     cmdr21_turn=7, casts_by_turn=[1, 0, 1, 1, 1, 1],
                     lands_played_by_turn=[1, 1, 1, 1, 1, 1],
                     static_active_turn={"Puresteel Paladin|metalcraft": 5})
@@ -197,7 +201,7 @@ def test_aggregate_shapes():
     assert_turn_metric(cc)
     assert abs(cc["reached_pct"]["value"] - 2 / 3) < 1e-9
     assert cc["median_among_reached"] == 3     # lower-middle of [3, 4]
-    assert cc["histogram"] == {3: 1, 4: 1}
+    assert cc["histogram"] == {"3": 1, "4": 1}     # str keys: JSON round trip
     assert set(cc["pct_by_turn"]) == {"4", "5", "6"}
     for t in ("4", "5", "6"):
         assert_prop(cc["pct_by_turn"][t])
@@ -214,20 +218,35 @@ def test_aggregate_shapes():
     eq = m["equipped_on_arrival"]
     assert_prop(eq)
     assert eq["n_arrived"] == 2 and abs(eq["value"] - 0.5) < 1e-9
+    # avg equipment on board at arrival, among games it arrived: (2 + 0) / 2
+    assert abs(eq["avg_equipment_at_arrival"] - 1.0) < 1e-9
 
     for block, keys in (
         ("damage", ("avg_by_turn", "avg_cmdr_by_turn", "avg_noncombat_by_turn",
-                    "avg_total")),
+                    "avg_total", "combat", "noncombat",
+                    "avg_per_opponent_by_turn")),
         ("board", ("avg_width_by_turn", "avg_power_by_turn")),
-        ("tokens", ("avg_by_turn", "avg_total")),
+        ("tokens", ("avg_by_turn", "avg_total", "by_source")),
     ):
         assert set(m[block]) >= set(keys)
     assert len(m["damage"]["avg_by_turn"]) == 6
     assert len(m["board"]["avg_width_by_turn"]) == 6
     assert abs(m["tokens"]["avg_total"] - 1.0) < 1e-9
+    assert abs(m["tokens"]["by_source"]["Krenko"] - 1.0) < 1e-9   # 3 fires / 3
+
+    dm = m["damage"]
+    # explicit combat/noncombat split: combat = total - noncombat, per turn
+    # (only r1 has damage data, so turn 4 is r1's alone: 6 total, 1 noncombat)
+    assert abs(dm["combat"]["avg_by_turn"][3] - 5.0) < 1e-9
+    assert abs(dm["noncombat"]["avg_by_turn"][3] - 1.0) < 1e-9
+    assert abs(dm["combat"]["avg_total"] + dm["noncombat"]["avg_total"]
+               - dm["avg_total"]) < 1e-9
+    # per-opponent by turn: [turn][opponent], mean among games with data
+    assert len(dm["avg_per_opponent_by_turn"]) == 6
+    assert dm["avg_per_opponent_by_turn"][3] == [6.0]
 
     casts = m["casts"]
-    assert casts["distribution"] == {0: 3, 1: 10, 2: 1, 4: 1}
+    assert casts["distribution"] == {"0": 3, "1": 10, "2": 1, "4": 1}
     assert len(casts["avg_by_turn"]) == 6
     assert casts["max_chain"]["max"] == 4
     assert abs(casts["max_chain"]["avg"] - (4 + 1 + 1) / 3) < 1e-9
@@ -256,6 +275,13 @@ def test_aggregate_shapes():
     assert combos[0]["assembled"]["median_among_reached"] == 5
 
     assert "honesty" not in m   # only present when card_scopes is supplied
+
+
+def test_avg_by_turn_none_when_no_game_has_data():
+    # games ended by turn 2: later turns have NO data and emit None, not 0.0
+    recs = [GameRecord(damage_by_turn=[1, 2]), GameRecord(damage_by_turn=[3])]
+    m = aggregate(recs, until_turn=4)
+    assert m["damage"]["avg_by_turn"] == [2.0, 2.0, None, None]
 
 
 def test_aggregate_empty_records_rejected():

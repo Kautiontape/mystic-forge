@@ -23,14 +23,20 @@ from typing import Any
 
 
 def wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    """95% (by default) Wilson score interval for a binomial proportion."""
+    """95% (by default) Wilson score interval for a binomial proportion.
+
+    Endpoints are snapped exactly: 0 successes pins the lower bound to 0.0
+    and n successes pins the upper bound to 1.0 (mathematically true for the
+    Wilson interval; snapped explicitly so no float residue leaks out)."""
     if n == 0:
         return (0.0, 1.0)
     p = successes / n
     denom = 1 + z * z / n
     center = (p + z * z / (2 * n)) / denom
     half = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
-    return (max(0.0, center - half), min(1.0, center + half))
+    lo = 0.0 if successes == 0 else max(0.0, center - half)
+    hi = 1.0 if successes == n else min(1.0, center + half)
+    return (lo, hi)
 
 
 def mcnemar_exact_p(b: int, c: int) -> float:
@@ -134,6 +140,10 @@ class GameRecord:
     opening_hand: list[str] = field(default_factory=list)
     commander_cast_turn: int | None = None
     equipped_on_arrival: bool | None = None  # None until the commander arrives
+    equipment_at_arrival: int | None = None  # equipment on the battlefield at
+                                             # the end of the commander's
+                                             # arrival turn; None if it never
+                                             # arrived
     kill_turn: int | None = None
     cmdr21_turn: int | None = None
     table_lethal_turn: int | None = None
@@ -141,12 +151,14 @@ class GameRecord:
     damage_by_turn: list[int] = field(default_factory=list)
     cmdr_damage_by_turn: list[int] = field(default_factory=list)
     noncombat_damage_by_turn: list[int] = field(default_factory=list)
+    damage_per_opponent_by_turn: list[list[int]] = field(default_factory=list)
     board_width_by_turn: list[int] = field(default_factory=list)
     total_power_by_turn: list[int] = field(default_factory=list)
     casts_by_turn: list[int] = field(default_factory=list)
     lands_played_by_turn: list[int] = field(default_factory=list)
     mana_available_by_turn: list[int] = field(default_factory=list)
     tokens_created_by_turn: list[int] = field(default_factory=list)
+    tokens_by_source: dict[str, int] = field(default_factory=dict)
     trigger_fires: dict[str, int] = field(default_factory=dict)
     static_active_turn: dict[str, int] = field(default_factory=dict)
     combo_assembled_turn: list[int | None] = field(default_factory=list)
@@ -168,11 +180,12 @@ def _turn_metric(
     turns: Sequence[int | None], n: int, until_turn: int
 ) -> dict[str, Any]:
     """Censoring-aware turn-to-event metric: %-reached-by-T + median among
-    reached (spec §Statistics — no imputation)."""
+    reached (spec §Statistics — no imputation). Histogram keys are strings
+    so the whole aggregate dict survives a JSON round trip unchanged."""
     reached = sorted(t for t in turns if t is not None and t <= until_turn)
-    histogram: dict[int, int] = {}
+    histogram: dict[str, int] = {}
     for t in reached:
-        histogram[t] = histogram.get(t, 0) + 1
+        histogram[str(t)] = histogram.get(str(t), 0) + 1
     if reached:
         med, iqr = median_iqr(reached)
     else:
@@ -185,13 +198,16 @@ def _turn_metric(
     }
 
 
-def _avg_by_turn(lists: Sequence[Sequence[float]], until_turn: int) -> list[float]:
+def _avg_by_turn(
+    lists: Sequence[Sequence[float]], until_turn: int
+) -> list[float | None]:
     """Per-turn mean among games that have data for that turn (games that
-    ended early drop out of later turns — no imputation)."""
-    out: list[float] = []
+    ended early drop out of later turns — no imputation). Turns where NO
+    game has data emit None, never a fake 0.0."""
+    out: list[float | None] = []
     for i in range(until_turn):
         vals = [xs[i] for xs in lists if i < len(xs)]
-        out.append(sum(vals) / len(vals) if vals else 0.0)
+        out.append(sum(vals) / len(vals) if vals else None)
     return out
 
 
@@ -291,7 +307,9 @@ def aggregate(
     }
     metrics["commander_cast"] = commander_cast
 
-    # % equipped the turn the commander arrives, among games it arrived.
+    # % equipped the turn the commander arrives, among games it arrived, plus
+    # the average equipment count on the battlefield at that point (spec §v1
+    # metrics); None when the commander never arrived in any game.
     arrived = [
         r.equipped_on_arrival
         for r in records
@@ -299,6 +317,14 @@ def aggregate(
     ]
     equipped = _prop(sum(1 for v in arrived if v), len(arrived))
     equipped["n_arrived"] = len(arrived)
+    eq_counts = [
+        r.equipment_at_arrival
+        for r in records
+        if r.equipment_at_arrival is not None
+    ]
+    equipped["avg_equipment_at_arrival"] = (
+        sum(eq_counts) / len(eq_counts) if eq_counts else None
+    )
     metrics["equipped_on_arrival"] = equipped
 
     # Turn-to-event metrics (censoring-aware).
@@ -311,7 +337,41 @@ def aggregate(
     )
     metrics["won"] = _turn_metric([r.won_turn for r in records], n, until_turn)
 
-    # Damage per turn, combat/commander/noncombat split.
+    # Damage per turn, combat/commander/noncombat split. The explicit
+    # "combat"/"noncombat" sections carry the split; combat is derived
+    # per-record as total minus noncombat (records built by the runner keep
+    # the two arrays the same length; a missing noncombat entry counts 0).
+    def combat_row(r: GameRecord) -> list[int]:
+        return [
+            d
+            - (
+                r.noncombat_damage_by_turn[i]
+                if i < len(r.noncombat_damage_by_turn)
+                else 0
+            )
+            for i, d in enumerate(r.damage_by_turn)
+        ]
+
+    n_opp = max(
+        (
+            len(row)
+            for r in records
+            for row in r.damage_per_opponent_by_turn
+        ),
+        default=0,
+    )
+    per_opponent: list[list[float | None]] = []
+    for i in range(until_turn):
+        row: list[float | None] = []
+        for o in range(n_opp):
+            vals = [
+                r.damage_per_opponent_by_turn[i][o]
+                for r in records
+                if i < len(r.damage_per_opponent_by_turn)
+                and o < len(r.damage_per_opponent_by_turn[i])
+            ]
+            row.append(sum(vals) / len(vals) if vals else None)
+        per_opponent.append(row)
     metrics["damage"] = {
         "avg_by_turn": _avg_by_turn(
             [r.damage_by_turn for r in records], until_turn
@@ -325,6 +385,26 @@ def aggregate(
         "avg_total": avg(
             [sum(r.damage_by_turn[:until_turn]) for r in records]
         ),
+        "avg_per_opponent_by_turn": per_opponent,
+        "combat": {
+            "avg_by_turn": _avg_by_turn(
+                [combat_row(r) for r in records], until_turn
+            ),
+            "avg_total": avg(
+                [sum(combat_row(r)[:until_turn]) for r in records]
+            ),
+        },
+        "noncombat": {
+            "avg_by_turn": _avg_by_turn(
+                [r.noncombat_damage_by_turn for r in records], until_turn
+            ),
+            "avg_total": avg(
+                [
+                    sum(r.noncombat_damage_by_turn[:until_turn])
+                    for r in records
+                ]
+            ),
+        },
     }
 
     # Board state per turn.
@@ -336,6 +416,10 @@ def aggregate(
             [r.total_power_by_turn for r in records], until_turn
         ),
     }
+    source_totals: dict[str, int] = {}
+    for r in records:
+        for name, count in r.tokens_by_source.items():
+            source_totals[name] = source_totals.get(name, 0) + count
     metrics["tokens"] = {
         "avg_by_turn": _avg_by_turn(
             [r.tokens_created_by_turn for r in records], until_turn
@@ -343,6 +427,11 @@ def aggregate(
         "avg_total": avg(
             [sum(r.tokens_created_by_turn[:until_turn]) for r in records]
         ),
+        # avg per game per source card (runner attribution; approximate —
+        # see GameRecord.tokens_by_source's producer in the runner)
+        "by_source": {
+            name: source_totals[name] / n for name in sorted(source_totals)
+        },
     }
 
     # Casts per turn: distribution, max chain, % games with a 4+ turn by T6.
@@ -354,7 +443,8 @@ def aggregate(
         max(r.casts_by_turn[:until_turn], default=0) for r in records
     ]
     metrics["casts"] = {
-        "distribution": {k: distribution[k] for k in sorted(distribution)},
+        # str keys (like every histogram here) for JSON round-trip fidelity
+        "distribution": {str(k): distribution[k] for k in sorted(distribution)},
         "avg_by_turn": _avg_by_turn(
             [r.casts_by_turn for r in records], until_turn
         ),
@@ -370,6 +460,10 @@ def aggregate(
     }
 
     # On-curve health: all land drops through T5, mana available per turn.
+    # Short-list semantics: a game that ended before T5 is judged only on
+    # the turns it actually played — all() over the truncated list is
+    # vacuously true for the missing turns, so an early win with perfect
+    # drops counts as on-curve rather than as missed drops.
     horizon = min(5, until_turn)
     on_curve = sum(
         1
