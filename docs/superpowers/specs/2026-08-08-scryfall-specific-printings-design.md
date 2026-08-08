@@ -291,6 +291,15 @@ is removed; a per-request cap on total lines (500) replaces it as a sanity bound
 `(set, collector_number)` and by `(name.lower(), set)` and by `name.lower()` — and
 each line looks itself up. No positional assumptions.
 
+Lookup degrades from the most specific key to the least, **except** when the line
+named a collector number. A line that names one exact printing gets that printing or
+nothing: degrading it to a looser key would return a different real printing of the
+same card, whose price would then be reported as the user's under the
+"priced at the printing you named" heading. That is precisely the failure Goal 3
+forbids, and it is reachable whenever a list contains a second, resolvable line for
+the same card — a typo alongside a correct line, say. Lines that named only a set, or
+only a name, do degrade, since they never claimed a specific printing.
+
 **Price selection.** This is the correctness fix:
 
 - The entry's finish selects the column: `foil` → `usd_foil`, `etched` →
