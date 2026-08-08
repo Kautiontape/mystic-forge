@@ -148,6 +148,25 @@ async def test_malformed_resume_blob_clean_errors(monkeypatch):
     assert "hand" in res["error"]
 
 
+async def test_resume_unknown_card_in_rebuilt_pool(monkeypatch):
+    payload = await _start(monkeypatch)
+    blob = json.loads(json.dumps(payload["state"]))
+    blob["zones"]["hand"].append("Not A Real Card")
+    res = json.loads(await srv.goldfish_start(
+        srv.GoldfishStartInput(resume_state=blob)))
+    assert "rebuilt pool does not contain" in res["error"]
+    assert "Not A Real Card" in res["error"]
+
+
+def test_resume_keys_match_engine_serialization():
+    """Drift guard: the validator's required-key list is exactly the engine's
+    to_dict() output (minus display-only land_drops_remaining) plus the
+    tool-added resume meta."""
+    g = new_game(mini_cards(), ["Plains"] * 60, "Boss", seed=1)
+    expected = (set(g.to_dict()) - {"land_drops_remaining"}) | {"resume"}
+    assert set(srv._GOLDFISH_RESUME_KEYS) == expected
+
+
 # ── attach grouping (response formatting only) ───────────────────────────────
 
 
@@ -158,6 +177,7 @@ def test_attach_grouping_formatter_caps_targets():
     eq = g.new_perm("Hammer")
     tokens = [g.new_perm("Token", is_token=True, token_power=i,
                          token_toughness=1) for i in range(10)]
+    tokens[0].id = "weird-id"        # non-"b<N>" id: fallback key, no crash
     power_by_id = {t.id: i for i, t in enumerate(tokens)}
     actions = ([{"type": "play_land", "card": "Plains"}]
                + [{"type": "attach", "card": eq.id, "target": t.id}
@@ -254,6 +274,40 @@ async def test_until_end_stops_on_win_or_turn_cap(monkeypatch):
     out = json.loads(await srv.goldfish_step(
         srv.GoldfishStepInput(game_id=payload["game_id"], until="end")))
     assert out["state"]["won_turn"] is not None or out["state"]["turn"] > 30
+
+
+async def test_until_already_at_boundary_is_noop(monkeypatch):
+    payload = await _start(monkeypatch)              # auto-mulligan -> main1
+    out = json.loads(await srv.goldfish_step(srv.GoldfishStepInput(
+        game_id=payload["game_id"], until="phase:main1")))
+    assert out["applied"] == [] and out["applied_total"] == 0
+    assert out["state"] == payload["state"]          # nothing mutated
+
+
+async def test_until_applied_and_log_delta_caps(monkeypatch):
+    payload = await _start(monkeypatch)
+    monkeypatch.setattr(srv, "_GOLDFISH_APPLIED_ECHO_CAP", 2)
+    monkeypatch.setattr(srv, "_GOLDFISH_LOG_DELTA_CAP", 3)
+    out = json.loads(await srv.goldfish_step(srv.GoldfishStepInput(
+        game_id=payload["game_id"], until="turn:3")))
+    assert out["applied_total"] > 2                  # truncation exercised
+    assert len(out["applied"]) == 2
+    assert out["log_delta_total"] > 3
+    assert len(out["log_delta"]) == 3
+    assert out["state"]["log"][-3:] == out["log_delta"]   # the LAST lines
+
+
+async def test_until_guard_exhaustion_surfaces_error(monkeypatch):
+    payload = await _start(monkeypatch)
+    gid = payload["game_id"]
+    monkeypatch.setattr(srv, "_GOLDFISH_UNTIL_GUARD", 3)
+    out = json.loads(await srv.goldfish_step(
+        srv.GoldfishStepInput(game_id=gid, until="turn:10")))
+    assert "3 steps" in out["error"] and "turn:10" in out["error"]
+    assert out["state"] and out["legal_actions"]
+    again = json.loads(await srv.goldfish_state(     # game kept, not destroyed
+        srv.GoldfishStateInput(game_id=gid)))
+    assert again["state"] == out["state"]
 
 
 async def test_step_after_win_only_pass():

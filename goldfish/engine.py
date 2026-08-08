@@ -236,10 +236,20 @@ _SYNTHETIC_CARDS = (
 )
 
 
-def new_game(cards: dict, deck: list, commander: str, seed: int,
-             opponents: int = 1, combos: list | None = None) -> Game:
+def ensure_synthetic_cards(cards: dict) -> dict:
+    """Seed the engine-created synthetic cards (Treasure/Token/Rock) into a
+    card pool so g.card() always resolves engine-made permanents. new_game
+    calls this; any path that rebuilds a pool for Game.from_dict (which
+    deliberately doesn't touch the pool) must call it too, or a resumed
+    game with tokens on the battlefield crashes on lookup."""
     for name, types, produces in _SYNTHETIC_CARDS:
         cards.setdefault(name, _synth_card(name, types, produces))
+    return cards
+
+
+def new_game(cards: dict, deck: list, commander: str, seed: int,
+             opponents: int = 1, combos: list | None = None) -> Game:
+    ensure_synthetic_cards(cards)
     rng = random.Random(seed)
     library = list(deck)
     rng.shuffle(library)

@@ -29,8 +29,9 @@ from goldfish.cards import (CONDITIONS, COST_REDUCTION_FILTERS, DAMAGE_TARGETS,
                             STATIC_KINDS, SYMBOLIC_COUNTS, TUTOR_FILTERS, VERBS,
                             SimCard, merge_card, validate_annotations)
 from goldfish.engine import (Game, IllegalAction, MulliganRules,
-                             _SYNTHETIC_CARDS, _synth_card, auto_mulligan,
-                             effective_power, legal_actions, new_game, step)
+                             auto_mulligan, effective_power,
+                             ensure_synthetic_cards, legal_actions, new_game,
+                             step)
 from goldfish.odds import odds_at_least, odds_groups
 from goldfish.policy import choose_action
 from goldfish.runner import is_binary_ab_metric, run_ab, run_batch
@@ -3192,6 +3193,10 @@ _GOLDFISH_ATTACH_TARGET_CAP = 8
 #: engine's turn horizon (until only accepts turn:1-30 / "end" stops past 30).
 _GOLDFISH_UNTIL_GUARD = 500 * 30
 _GOLDFISH_UNTIL_TURN_CAP = 30
+#: Response-size hygiene for until fast-forwards: echo only the LAST N
+#: applied entries / log lines, with *_total carrying the full count.
+_GOLDFISH_APPLIED_ECHO_CAP = 50
+_GOLDFISH_LOG_DELTA_CAP = 200
 
 #: gid -> {"game": Game, "cards": pool, "meta": {deck, annotations, combos},
 #: "touched": last access}. LRU cap + idle TTL (spec §Concurrency); eviction
@@ -3333,6 +3338,13 @@ def _goldfish_group_attach(g: Game, actions: list) -> list:
     through unchanged, in place. The engine's legal_actions stays the pinned
     ground truth, and step() still takes the engine shape
     {"type": "attach", "card": ..., "target": ...}."""
+    def _target_key(pid: str):
+        try:                          # engine ids are "b<N>"; anything else
+            num = int(pid[1:])        # (hand-injected states) falls back to
+        except ValueError:            # a plain string tiebreak, no crash
+            num = 0
+        return (-effective_power(g, g.perm(pid)), num, pid)
+
     grouped: list = []
     emitted: set[str] = set()
     for a in actions:
@@ -3345,8 +3357,7 @@ def _goldfish_group_attach(g: Game, actions: list) -> list:
         emitted.add(eq_id)
         targets = [b["target"] for b in actions
                    if b.get("type") == "attach" and b["card"] == eq_id]
-        targets.sort(key=lambda pid: (-effective_power(g, g.perm(pid)),
-                                      int(pid[1:])))
+        targets.sort(key=_target_key)
         entry: dict = {"type": "attach", "card": eq_id,
                        "targets": targets[:_GOLDFISH_ATTACH_TARGET_CAP]}
         if len(targets) > _GOLDFISH_ATTACH_TARGET_CAP:
@@ -3409,8 +3420,8 @@ class GoldfishStepInput(BaseModel):
         default=None,
         description='Fast-forward the policy to a boundary: "turn:N" (stop '
                     'at the start of turn N), "phase:main1|combat|main2", or '
-                    '"end" (win or past turn 30). Mutually exclusive with '
-                    "action.")
+                    '"end" (win or past turn 30). Already at the boundary → '
+                    "applied is empty. Mutually exclusive with action.")
 
     @model_validator(mode="after")
     def _action_xor_until(self):
@@ -3485,8 +3496,7 @@ async def goldfish_start(params: GoldfishStartInput) -> str:
                 resume["deck"], resume["annotations"])
         except ValueError as e:
             return json.dumps({"error": str(e)})
-        for name, types, produces in _SYNTHETIC_CARDS:
-            cards_pool.setdefault(name, _synth_card(name, types, produces))
+        ensure_synthetic_cards(cards_pool)
         zones = blob["zones"]
         state_names = (set(zones["library"]) | set(zones["hand"])
                        | set(zones["graveyard"]) | set(zones["command"])
@@ -3547,10 +3557,14 @@ async def goldfish_step(params: GoldfishStepInput) -> str:
 
     Returns JSON {"applied", "state", "legal_actions", "log_delta"} —
     applied is one {"action", "reason"} (reason null for user actions, the
-    fired policy rule otherwise) or a list of them under until; log_delta
-    is only the log lines this call added. An illegal action returns
-    {"error", "state", "legal_actions"} and the game is guaranteed
-    unmutated. An unknown game_id names the recovery:
+    fired policy rule otherwise); log_delta is only the log lines this call
+    added. Under until, applied/log_delta echo just the LAST 50 entries /
+    200 lines, with "applied_total"/"log_delta_total" carrying the full
+    counts (the state's own log is always complete). An illegal action
+    returns {"error", "state", "legal_actions"} and the game is guaranteed
+    unmutated; a fast-forward that exhausts its step budget without
+    reaching the boundary returns an error too, with the advanced state
+    preserved. An unknown game_id names the recovery:
     goldfish_start(resume_state=...).
     """
     entry = _games_get(params.game_id)
@@ -3564,19 +3578,34 @@ async def goldfish_step(params: GoldfishStepInput) -> str:
         except IllegalAction as e:
             return json.dumps({"error": str(e),
                                **_goldfish_game_payload(g, meta)})
-        applied: dict | list = {"action": params.action, "reason": None}
+        applied = {"action": params.action, "reason": None}
     elif params.until is not None:
         parsed = _goldfish_parse_until(params.until)
         if isinstance(parsed, str):
             return json.dumps({"error": parsed})
         kind, value = parsed
-        applied = []
-        for _ in range(_GOLDFISH_UNTIL_GUARD):
-            if _goldfish_until_done(g, kind, value):
-                break
+        applied_list: list = []
+        while not _goldfish_until_done(g, kind, value):
+            if len(applied_list) >= _GOLDFISH_UNTIL_GUARD:
+                # Guard exhaustion must SURFACE, not masquerade as success:
+                # a legal-but-degenerate annotation loop (the runner's
+                # livelock case) would otherwise return 15k applied entries
+                # with no signal. The advanced game stays in the store.
+                return json.dumps({"error": (
+                    f"stopped after {len(applied_list)} steps without "
+                    f"reaching {params.until!r} — possible annotation "
+                    "loop; state preserved"),
+                    **_goldfish_game_payload(g, meta)})
             action, reason = choose_action(g)
             step(g, action)
-            applied.append({"action": action, "reason": reason})
+            applied_list.append({"action": action, "reason": reason})
+        log_delta = g.log[log_before:]
+        return json.dumps({
+            "applied": applied_list[-_GOLDFISH_APPLIED_ECHO_CAP:],
+            "applied_total": len(applied_list),
+            **_goldfish_game_payload(g, meta),
+            "log_delta": log_delta[-_GOLDFISH_LOG_DELTA_CAP:],
+            "log_delta_total": len(log_delta)})
     else:
         action, reason = choose_action(g)
         step(g, action)
