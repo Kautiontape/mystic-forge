@@ -50,6 +50,119 @@ async def test_add_kicks_instant_backfill_when_cache_exists(db_path, a_list,
     assert "backfilling now" in out
 
 
+@pytest.fixture
+def fake_scryfall_bulk(monkeypatch):
+    """Batch /cards/collection fake: knows three cards, misses 'Nonexistent'."""
+    known = {"sol ring": "Sol Ring", "rhystic study": "Rhystic Study",
+             "cultivate": "Cultivate"}
+    calls = {"batches": 0, "fuzzy": 0}
+
+    async def _post(endpoint, body):
+        assert endpoint == "/cards/collection"
+        calls["batches"] += 1
+        data, not_found = [], []
+        for ident in body["identifiers"]:
+            canon = known.get(ident["name"].lower())
+            if canon:
+                data.append({"name": canon, "prices": {"usd": "1.00"}})
+            else:
+                not_found.append(ident)
+        return {"data": data, "not_found": not_found}
+
+    async def _get(endpoint, params=None):
+        calls["fuzzy"] += 1
+        import httpx
+        req = httpx.Request("GET", "x://x")
+        raise httpx.HTTPStatusError("404", request=req,
+                                    response=httpx.Response(404, request=req))
+
+    monkeypatch.setattr(server, "_scryfall_post", _post)
+    monkeypatch.setattr(server, "_scryfall_get", _get)
+    return calls
+
+
+async def test_bulk_add_one_batch_many_cards(db_path, a_list, fake_scryfall_bulk):
+    list_id, pp, _ = a_list
+    out = await server.watchlist_bulk_add(server.WatchlistBulkAddInput(
+        decklist="1 Sol Ring\n1x Rhystic Study (c21) 12 [Draw]\nCultivate\n"
+                 "# a comment\n\n",
+        note="Cloud deck", passphrase=pp))
+    assert "Added 3 card(s)" in out
+    assert fake_scryfall_bulk["batches"] == 1        # ONE Scryfall round-trip
+    db = watchlist_db.connect(db_path)
+    entries = watchlist_db.current_entries(db, list_id)
+    db.close()
+    assert sorted(e["card_name"] for e in entries) == \
+        ["Cultivate", "Rhystic Study", "Sol Ring"]
+    assert all(e["note"] == "Cloud deck" for e in entries)
+
+
+async def test_bulk_add_per_line_and_default_targets(db_path, a_list,
+                                                     fake_scryfall_bulk):
+    list_id, pp, _ = a_list
+    await server.watchlist_bulk_add(server.WatchlistBulkAddInput(
+        decklist="Rhystic Study @ 60\n1 Sol Ring @ $2.50\nCultivate",
+        target_price=99.0, passphrase=pp))
+    db = watchlist_db.connect(db_path)
+    got = {e["card_name"]: e["target_price"]
+           for e in watchlist_db.current_entries(db, list_id)}
+    db.close()
+    assert got == {"Rhystic Study": 60.0, "Sol Ring": 2.5, "Cultivate": 99.0}
+
+
+async def test_bulk_add_reports_unknown_and_dedupes(db_path, a_list,
+                                                    fake_scryfall_bulk):
+    list_id, pp, _ = a_list
+    out = await server.watchlist_bulk_add(server.WatchlistBulkAddInput(
+        decklist="Sol Ring\nsol ring\nNonexistent Card", passphrase=pp))
+    assert "Added 1 card(s)" in out
+    assert "not recognized" in out and "Nonexistent Card" in out
+    db = watchlist_db.connect(db_path)
+    assert len(watchlist_db.current_entries(db, list_id)) == 1   # deduped
+    db.close()
+
+
+async def test_bulk_add_second_run_updates_not_duplicates(db_path, a_list,
+                                                          fake_scryfall_bulk):
+    list_id, pp, _ = a_list
+    await server.watchlist_bulk_add(server.WatchlistBulkAddInput(
+        decklist="Sol Ring", passphrase=pp))
+    out = await server.watchlist_bulk_add(server.WatchlistBulkAddInput(
+        decklist="Sol Ring @ 3\nCultivate", passphrase=pp))
+    assert "Added 1 card(s)" in out and "already watched" in out
+    db = watchlist_db.connect(db_path)
+    got = {e["card_name"]: e["target_price"]
+           for e in watchlist_db.current_entries(db, list_id)}
+    db.close()
+    assert got == {"Sol Ring": 3.0, "Cultivate": None}
+
+
+async def test_bulk_add_kicks_one_backfill_for_the_batch(db_path, a_list,
+                                                         fake_scryfall_bulk,
+                                                         monkeypatch):
+    kicked = []
+    monkeypatch.setattr(server, "_schedule_backfill",
+                        lambda names: kicked.append(list(names)) or True)
+    _, pp, _ = a_list
+    out = await server.watchlist_bulk_add(server.WatchlistBulkAddInput(
+        decklist="Sol Ring\nCultivate\nRhystic Study", passphrase=pp))
+    assert len(kicked) == 1 and len(kicked[0]) == 3   # one call, all cards
+    assert "backfilling now" in out
+
+
+async def test_bulk_add_requires_identity_and_rejects_empty(db_path,
+                                                            fake_scryfall_bulk):
+    out = await server.watchlist_bulk_add(
+        server.WatchlistBulkAddInput(decklist="Sol Ring"))
+    assert "watchlist_create" in out
+    db = watchlist_db.connect(db_path)
+    _, pp, _ = watchlist_db.create_list(db)
+    db.close()
+    out = await server.watchlist_bulk_add(server.WatchlistBulkAddInput(
+        decklist="\n# nothing but comments\n", passphrase=pp))
+    assert "No card names found" in out
+
+
 async def test_add_without_identity_errors_helpfully(db_path, fake_scryfall):
     out = await server.watchlist_add(server.WatchlistAddInput(name="Sol Ring"))
     assert "watchlist_create" in out and "passphrase" in out.lower()

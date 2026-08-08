@@ -70,7 +70,9 @@ mcp = FastMCP(
         "Watchlist: price watchlists are identified by a passphrase. When the "
         "user gives one (or uses a personal connector URL) pass it through; "
         "after watchlist_create, show the passphrase once and offer to "
-        "remember it for future chats. Share codes (SC-…) are read-only."
+        "remember it for future chats. Share codes (SC-…) are read-only. "
+        "To add MORE THAN ONE card, always use watchlist_bulk_add with all of "
+        "them in one call — never loop watchlist_add per card."
     ),
     host="0.0.0.0",
     port=8000,
@@ -2388,6 +2390,19 @@ class WatchlistAddInput(BaseModel):
     passphrase: Optional[str] = Field(None, description="List passphrase (omit when using a personal connector URL)")
 
 
+class WatchlistBulkAddInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    decklist: str = Field(..., description=(
+        "Cards to add, one per line. Accepts plain names, decklist quantities "
+        "('1 Sol Ring', '1x Sol Ring'), and Archidekt-style suffixes "
+        "((set) 123 [Category] ^label^) which are stripped. Quantities are "
+        "ignored — a watchlist tracks cards, not copies. An optional target "
+        "price may follow the name after ' @ ', e.g. 'Rhystic Study @ 60'."))
+    note: Optional[str] = Field(None, description="Note applied to every card added, e.g. the deck name")
+    target_price: Optional[float] = Field(None, description="Default target for cards without a per-line ' @ ' target")
+    passphrase: Optional[str] = Field(None, description="List passphrase (omit when using a personal connector URL)")
+
+
 class WatchlistRemoveInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: Optional[str] = Field(None, description="Card name to remove")
@@ -2448,11 +2463,13 @@ def _client_key(request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _schedule_backfill(card_name: str) -> bool:
-    """Instant-history kick after an add: resolve + backfill this one card
-    from the nightly-cached MTGJSON files, off the request path. No network —
-    if nothing is cached yet, defer to the nightly ingest (returns False)."""
-    if os.environ.get("MYSTIC_FORGE_NO_INGEST"):
+def _schedule_backfill(card_names) -> bool:
+    """Instant-history kick after an add: resolve + backfill the given card(s)
+    from the nightly-cached MTGJSON files, off the request path. One scan for
+    the whole batch. No network — if nothing is cached yet, defer to the
+    nightly ingest (returns False)."""
+    names = [card_names] if isinstance(card_names, str) else list(card_names or [])
+    if not names or os.environ.get("MYSTIC_FORGE_NO_INGEST"):
         return False
     data_dir = watchlist_ingest._data_dir()
     if not os.path.exists(os.path.join(data_dir, "AllPrices.json.gz")):
@@ -2460,11 +2477,11 @@ def _schedule_backfill(card_name: str) -> bool:
 
     async def run():
         try:
-            await asyncio.to_thread(watchlist_ingest.backfill_entry,
-                                    watchlist_db.DB_PATH, data_dir, card_name)
+            await asyncio.to_thread(watchlist_ingest.backfill_cards,
+                                    watchlist_db.DB_PATH, data_dir, names)
         except Exception:
             logging.getLogger("mystic_forge").exception(
-                "instant backfill failed for %r", card_name)
+                "instant backfill failed for %r", names)
 
     asyncio.get_running_loop().create_task(run())
     return True
@@ -2598,6 +2615,105 @@ async def watchlist_add(params: WatchlistAddInput) -> str:
             lines.append(f"Target: {_fmt_price(entry['target_price'])}")
         if uuids:
             lines.append(f"Tracking {len(uuids)} printing(s).")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+@mcp.tool(name="watchlist_bulk_add")
+async def watchlist_bulk_add(params: WatchlistBulkAddInput) -> str:
+    """Add many cards to a watchlist at once — USE THIS instead of calling
+    watchlist_add repeatedly. Paste a decklist, a shopping list, or any list
+    of card names (one per line); optional per-line target after ' @ '.
+    Validates every name against Scryfall in batches and backfills all their
+    price history in a single pass."""
+    db = _wl_db()
+    try:
+        try:
+            row = _resolve_list_row(db, params.passphrase)
+        except _NoIdentity as e:
+            return str(e)
+        warning = _supersession_warning(db, row)
+
+        # Peel any ' @ <price>' off each line FIRST — _parse_decklist strips
+        # trailing digits as collector numbers and would eat the target.
+        wanted: list[tuple[str, Optional[float]]] = []
+        seen_keys: set[str] = set()
+        for line in params.decklist.splitlines():
+            target = params.target_price
+            m = re.search(r"\s+@\s*[$€]?\s*(\d+(?:\.\d+)?)\s*$", line)
+            if m:
+                target = float(m.group(1))
+                line = line[:m.start()]
+            parsed = _parse_decklist(line)
+            if not parsed:
+                continue
+            name = parsed[0][1]
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen_keys:      # same card twice in one paste
+                continue
+            seen_keys.add(key)
+            wanted.append((name, target))
+        if not wanted:
+            return "No card names found in that list."
+        if len(wanted) > 300:
+            return (f"That's {len(wanted)} cards — more than this tool adds at "
+                    f"once. Split it into batches of 300 or fewer.")
+
+        # Validate every name against Scryfall, 75 identifiers per request
+        found: dict[str, dict] = {}
+        unresolved: list[str] = []
+        names = [n for n, _ in wanted]
+        for i in range(0, len(names), 75):
+            identifiers = [{"name": n} for n in names[i:i + 75]]
+            try:
+                data = await _scryfall_post("/cards/collection",
+                                            {"identifiers": identifiers})
+            except Exception as e:
+                return warning + f"Scryfall lookup failed: {_scryfall_error(e)}"
+            for card in data.get("data", []):
+                found[card["name"].lower()] = card
+                # Scryfall matches on exact/oracle name; map the query back too
+            for item in data.get("not_found", []):
+                unresolved.append(item.get("name", str(item)))
+
+        added, updated, skipped = [], [], []
+        for name, target in wanted:
+            card = found.get(name.lower())
+            if card is None:
+                # fall back to a fuzzy single lookup for near-misses
+                try:
+                    card = await _scryfall_get("/cards/named", {"fuzzy": name})
+                except Exception:
+                    skipped.append(name)
+                    continue
+            canonical = card.get("name", name)
+            existed = watchlist_db._find_entry(db, row["id"], name=canonical)
+            _, entry = watchlist_db.add_card(
+                db, row["id"], canonical, target_price=target, note=params.note)
+            (updated if existed else added).append(entry["card_name"])
+
+        backfilling = _schedule_backfill(added) if added else False
+
+        lines = [warning + f"**Added {len(added)} card(s)** to "
+                 f"{row['label'] or 'your watchlist'}."]
+        if added:
+            lines.append(", ".join(sorted(added)[:40])
+                         + (" …" if len(added) > 40 else ""))
+        if updated:
+            lines.append(f"\n{len(updated)} already watched (target/note "
+                         f"updated): " + ", ".join(sorted(updated)[:20])
+                         + (" …" if len(updated) > 20 else ""))
+        if skipped:
+            lines.append(f"\n⚠️ {len(skipped)} not recognized by Scryfall — "
+                         f"check spelling: " + ", ".join(skipped[:20])
+                         + (" …" if len(skipped) > 20 else ""))
+        lines.append("\n" + ("Price history is backfilling now from cached "
+                             "data — ready in a minute or two."
+                             if backfilling else
+                             "Price history arrives with the next nightly ingest."))
         return "\n".join(lines)
     finally:
         db.close()
