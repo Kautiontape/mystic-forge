@@ -43,10 +43,13 @@ must come from something the server mints itself.
 There is no user table and no auth system. The unit of identity is the
 **watchlist**, named by a server-minted passphrase.
 
-- **Passphrase format:** 3 words from the EFF large wordlist + a 2-digit number
-  (e.g. `crimson-otter-codex-42`), ≈ 45 bits. Human-typeable because it doubles
-  as a chat credential. Shown once at mint time; stored as SHA-256 hash.
-- **Transport 1 — personal connector URL:** `https://kautiontape.com/mcp/<passphrase>`.
+- **Passphrase format:** 4 words from the EFF short wordlist (1296 words,
+  committed to the repo as `watchlist_words.txt`) + a 2-digit number
+  (e.g. `crimson-otter-codex-dome-42`), ≈ 48 bits. Human-typeable because it
+  doubles as a chat credential. Shown once at mint time; stored as SHA-256 hash.
+- **Transport 1 — personal connector URL:** `https://kautiontape.com/mtg/mcp/<passphrase>`
+  (the shared Caddy in the parent `mcp-servers` repo strips `/mtg` before
+  proxying to this server, so the server itself sees `/mcp/<passphrase>`).
   ASGI middleware peels the passphrase off the path, resolves the list into
   request context, and forwards to the normal MCP app. Identity is automatic and
   invisible to Claude.
@@ -167,7 +170,9 @@ Served via FastMCP `custom_route` alongside the MCP mount:
 
 - `GET /w/<passphrase>` — full view: label, current list with prices, complete
   event chain (seq, timestamp, action, detail), lineage/supersession notices.
+  Public URL: `https://kautiontape.com/mtg/w/<passphrase>`.
 - `GET /s/<share_code>` — same page, read-only framing, no passphrase shown.
+  Public URL: `https://kautiontape.com/mtg/s/<share_code>`.
 - Plain server-rendered HTML, no JS required, no forms. Cloning instructions on
   the page point at the MCP tool.
 
@@ -185,11 +190,38 @@ Idempotent (PK upsert). Log to stdout; docker captures it.
 
 ## Deployment changes
 
-- `docker-compose.yml`: add a named volume mounted at `/data` for the SQLite DB
-  (currently state would be wiped on rebuild); DB path via `MYSTIC_FORGE_DB`
-  env (default `/data/mystic_forge.db`).
-- Middleware mounts: `/mcp/<passphrase>` → MCP app with list context; `/mcp` →
-  MCP app without identity (public); `/w/…`, `/s/…` → side pages.
+Mystic Forge deploys as one service of the parent `mcp-servers` repo
+(`/opt/services/mcp-servers` on the ktn box, this repo as a git submodule),
+behind a shared Caddy that routes `kautiontape.com/mtg/mcp*` to it with the
+`/mtg` prefix stripped. CI: parent-repo pushes build GHCR images and
+`docker compose up -d` via a self-hosted runner; pushes to this submodule's
+main trigger an on-box `compose build mystic-forge && up -d mystic-forge`.
+
+- **Parent repo** `mcp-servers/docker-compose.yml`: mystic-forge service gains a
+  named volume at `/data` (currently all state would be wiped on rebuild),
+  `MYSTIC_FORGE_DB=/data/mystic_forge.db`, and a container healthcheck.
+- **Parent repo** `Caddyfile`: new routes `/mtg/w/*`, `/mtg/s/*`, `/mtg/health`
+  → strip `/mtg` → mystic-forge (no auth, same as `/mtg/mcp`).
+- **This repo** `docker-compose.yml` (standalone dev only): same volume,
+  env, and healthcheck for parity.
+- Middleware mounts (as seen by the server, post-strip): `/mcp/<passphrase>` →
+  MCP app with list context; `/mcp` → MCP app without identity (public);
+  `/w/…`, `/s/…`, `/health` → plain HTTP routes.
+
+## Health & monitoring
+
+No monitoring exists in the kautiontape stack today; this feature introduces
+the pattern:
+
+- `GET /health` returns JSON: overall status, DB reachability, list/card
+  counts, `last_ingest`, and an `ingest_stale` flag (true when watchlists are
+  non-empty and last_ingest is older than 36 h). 200 when healthy, 500 when
+  the DB is unreachable — stale ingest degrades the payload but stays 200 so
+  container orchestration doesn't restart-loop a healthy server.
+- `docker-compose` healthcheck (python urllib probe, no curl in slim image)
+  in both parent and dev compose files.
+- `https://kautiontape.com/mtg/health` is the surface for any future external
+  uptime monitor (none exists yet; nothing to wire beyond exposing it).
 
 ## Acceptance criteria
 
@@ -208,6 +240,8 @@ Idempotent (PK upsert). Log to stdout; docker captures it.
       memory cap)
 - [ ] Passphrase is accepted both in the URL path and as a tool parameter, with
       the parameter taking precedence
+- [ ] `GET /health` reports DB status and ingest freshness; the container
+      healthcheck goes unhealthy when the server stops responding
 
 ## P1 (fast follow, not v1)
 
