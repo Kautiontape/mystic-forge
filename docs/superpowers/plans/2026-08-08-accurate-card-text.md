@@ -126,7 +126,9 @@ async def test_not_found_reported_with_fuzzy_hint(monkeypatch):
 
 
 async def test_chunks_at_75_identifiers(monkeypatch):
-    names = [f"Card Number {i}" for i in range(100)]
+    # Names must not end in ' <digits>' — the decklist parser reads that as
+    # a collector number and strips it, collapsing every line to one name.
+    names = [f"Test Card Alpha{i}" for i in range(100)]
     cards = [{"name": n, "oracle_text": f"Text {n}", "color_identity": []}
              for n in names]
     calls = _install_collection(monkeypatch, cards)
@@ -135,7 +137,7 @@ async def test_chunks_at_75_identifiers(monkeypatch):
     assert len(calls) == 2
     assert len(calls[0]["identifiers"]) == 75
     assert len(calls[1]["identifiers"]) == 25
-    assert "Text Card Number 99" in out
+    assert "Text Test Card Alpha99" in out
 
 
 async def test_total_failure_returns_error(monkeypatch):

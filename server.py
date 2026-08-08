@@ -432,6 +432,20 @@ class PriceListInput(BaseModel):
     )
 
 
+class CardTextInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    cards: str = Field(
+        ...,
+        description=(
+            "Cards to fetch exact oracle text for, one per line. Plain names "
+            "work ('Sol Ring'), and so do full Archidekt/Moxfield lines "
+            "('1x Sol Ring (ltc) 284 *F* [Ramp]') — quantities, finishes, and "
+            "categories are ignored. Max 500 lines."
+        ),
+        min_length=1, max_length=50000,
+    )
+
+
 # ── Scryfall Tools ───────────────────────────────────────────────────────────
 
 
@@ -743,6 +757,82 @@ async def scryfall_price_list(params: PriceListInput) -> str:
         parts.append(f"{uncovered} card(s) are not included in this total — see the sections above.")
 
     return "\n".join(parts)
+
+
+@mcp.tool(name="scryfall_card_text")
+async def scryfall_card_text(params: CardTextInput) -> str:
+    """Exact oracle text for a whole list of cards in one call.
+
+    Use this BEFORE discussing what specific cards do — never state rules
+    text from memory: distinct cards share similar names, and text gets
+    errata'd. Returns name, mana cost, type line, full rules text, and P/T
+    for every card. Cards Scryfall cannot match are listed explicitly under
+    'Not found', never silently dropped.
+    """
+    entries = _parse_decklist_entries(params.cards)
+    if not entries:
+        return "No card names found in input."
+    if len(entries) > 500:
+        return f"Too many lines ({len(entries)}). Maximum is 500."
+
+    identifiers = _dedupe_identifiers(entries)
+
+    found_cards: list[dict] = []
+    not_found: list[dict] = []
+    unchecked: list[dict] = []
+    errors: list[str] = []
+
+    for batch in _chunk(identifiers, 75):   # Scryfall's hard per-request cap
+        try:
+            data = await _scryfall_post("/cards/collection", {"identifiers": batch})
+        except Exception as e:
+            # Keep what other batches returned. These identifiers are
+            # unchecked, NOT missing — a transient API failure must not read
+            # as "this card does not exist".
+            unchecked.extend(batch)
+            errors.append(_scryfall_error(e))
+            continue
+        found_cards.extend(data.get("data", []))
+        not_found.extend(data.get("not_found", []))
+
+    if unchecked and not found_cards:
+        return errors[0]
+
+    index = _index_collection_results(found_cards)
+
+    # One block per unique card, in the order the input asked for them.
+    blocks: list[str] = []
+    seen_cards: set[int] = set()
+    for entry in entries:
+        card = _lookup_entry(index, entry)
+        if card is None or id(card) in seen_cards:
+            continue
+        seen_cards.add(id(card))
+        blocks.append(_format_card(card, verbose=False))
+
+    parts: list[str] = [f"# Card Text ({len(blocks)} card(s))", ""]
+    for i, block in enumerate(blocks, 1):
+        parts.append(f"--- {i} ---")
+        parts.append(block)
+        parts.append("")
+
+    if not_found:
+        parts.append(f"## Not found ({len(not_found)})")
+        parts.extend(f"- {_identifier_label(ident)}" for ident in not_found)
+        parts.append(
+            "(Bulk lookup needs exact names — retry these one at a time with "
+            "scryfall_named, which fuzzy-matches.)"
+        )
+        parts.append("")
+
+    if unchecked:
+        parts.append(
+            f"## Could not be checked — Scryfall request failed ({len(unchecked)})")
+        parts.extend(f"- {_identifier_label(ident)}" for ident in unchecked)
+        parts.append(f"({errors[0]})")
+        parts.append("")
+
+    return "\n".join(parts).rstrip()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
