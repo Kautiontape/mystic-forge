@@ -2855,4 +2855,5 @@ if __name__ == "__main__":
         mcp.run(transport="stdio")
     else:
         import uvicorn
-        uvicorn.run(build_app(), host="0.0.0.0", port=8000)
+        uvicorn.run(build_app(), host="0.0.0.0",
+                    port=int(os.environ.get("MYSTIC_FORGE_PORT", "8000")))

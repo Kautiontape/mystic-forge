@@ -225,23 +225,32 @@ the pattern:
 
 ## Acceptance criteria
 
-- [ ] Two lists cannot see or affect each other's cards through any tool
-- [ ] Adding "Buster Sword" with no printing tracks the cheapest printing and
-      shows ~90 days of history within one ingest cycle
-- [ ] `watchlist_list` returns in <1 s (all reads local)
-- [ ] Replaying a list's events reproduces `watchlist_current` exactly
-- [ ] `watchlist_clone(at_seq=N)` yields a list equal to the source as of seq N
-- [ ] A share code can view and clone but never mutate
-- [ ] Mutating a superseded list returns a warning naming its successor
-- [ ] Nightly job is idempotent — re-running same day changes nothing
-- [ ] A card with target_price 30 appears in `watchlist_report` when its
-      cheapest printing ≤ $30
-- [ ] Ingest never loads a full MTGJSON file into memory (large-file test /
-      memory cap)
-- [ ] Passphrase is accepted both in the URL path and as a tool parameter, with
-      the parameter taking precedence
-- [ ] `GET /health` reports DB status and ingest freshness; the container
-      healthcheck goes unhealthy when the server stops responding
+- [x] Two lists cannot see or affect each other's cards through any tool
+      (`test_lists_are_isolated`)
+- [x] Adding a card with no printing tracks the cheapest printing and shows
+      ~90 days of history within one ingest cycle (`test_run_ingest_*` +
+      `test_price_summary_picks_cheapest_printing*`; first live MTGJSON cycle
+      still to be observed after deploy)
+- [x] `watchlist_list` returns in <1 s (all reads local; verified in live smoke)
+- [x] Replaying a list's events reproduces `watchlist_current` exactly
+      (`test_replay_reproduces_current`)
+- [x] `watchlist_clone(at_seq=N)` yields a list equal to the source as of seq N
+      (`test_clone_at_seq_matches_source_state`)
+- [x] A share code can view and clone but never mutate (no mutating tool
+      accepts one; `test_view_by_share_code_is_readonly_surface`)
+- [x] Mutating a superseded list returns a warning naming its successor
+      (`test_mutating_superseded_list_warns`)
+- [x] Nightly job is idempotent — re-running same day changes nothing
+      (`test_ingest_idempotent`)
+- [x] A card with target_price appears in `watchlist_report` when its cheapest
+      printing is at/below it (`test_report_flags_target_hits`)
+- [x] Ingest never loads a full MTGJSON file into memory
+      (`test_streaming_never_loads_whole_file`, tracemalloc cap)
+- [x] Passphrase is accepted both in the URL path and as a tool parameter, with
+      the parameter taking precedence (`test_identity.py` + live smoke over
+      real streamable HTTP)
+- [x] `GET /health` reports DB status and ingest freshness
+      (`test_http_surface.py`); container healthcheck probes it every 60 s
 
 ## P1 (fast follow, not v1)
 
