@@ -173,3 +173,57 @@ async def test_refresh_spawned_once_per_interval(monkeypatch, small_corpus_ok):
         await server._get_rules_index()
     await asyncio.sleep(0.01)  # let the spawned refresh task run
     assert calls.count(server.RULES_PAGE_URL) == 1
+
+
+# ── rules_get: numbers ───────────────────────────────────────────────────────
+
+async def test_get_subrule_includes_parent_heading(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_get(server.RulesGetInput(ref="702.2b"))
+    assert "effective August 7, 2026" in out
+    assert "702.2. Deathtouch" in out
+    assert "destroyed as a state-based action" in out
+    assert "702.2a" not in out  # siblings stay out of a subrule lookup
+
+
+async def test_get_rule_includes_all_subrules(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_get(server.RulesGetInput(ref="702.2"))
+    for expected in ("702.2. Deathtouch", "702.2a", "702.2b", "702.2c"):
+        assert expected in out
+
+
+async def test_get_tolerates_trailing_period(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_get(server.RulesGetInput(ref="702.2."))
+    assert "702.2a Deathtouch is a static ability." in out
+
+
+async def test_get_subsection_lists_children_only(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_get(server.RulesGetInput(ref="702"))
+    assert "702. Keyword Abilities" in out
+    assert "- 702.2. Deathtouch" in out
+    assert "702.2a" not in out  # titles only, no subrule bodies
+    assert "rules_get" in out   # pointer to drill down
+
+
+async def test_get_section_lists_subsections(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_get(server.RulesGetInput(ref="7"))
+    assert "7. Additional Rules" in out
+    assert "- 702. Keyword Abilities" in out
+
+
+async def test_get_unknown_number_suggests(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_get(server.RulesGetInput(ref="702.9"))
+    assert "No rule or glossary entry" in out
+    assert "702.2" in out
+
+
+async def test_get_when_no_rules_available(monkeypatch):
+    monkeypatch.setitem(server._rules_state, "index", None)
+    monkeypatch.setitem(server._rules_state, "checked_at", time.time())
+    out = await server.rules_get(server.RulesGetInput(ref="702.2"))
+    assert "unavailable" in out

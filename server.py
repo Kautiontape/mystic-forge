@@ -2850,6 +2850,105 @@ async def _refresh_rules() -> None:
             _rules_state["checked_at"] = time.time() - CR_REFRESH_INTERVAL + CR_RETRY_INTERVAL
 
 
+RULES_GET_MAX_CHARS = 10000
+
+_RULES_NUM_RE = re.compile(r"^\d{1,3}(?:\.\d+)?[a-z]{0,2}$")
+
+
+class RulesGetInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    ref: str = Field(
+        ...,
+        description=(
+            "A Comprehensive Rules number at any depth ('7', '702', '702.2', "
+            "'702.2b'; a trailing period is fine) or a keyword/glossary term "
+            "('deathtouch', 'exploit')."
+        ),
+        min_length=1, max_length=100,
+    )
+
+
+def _rule_line(rule: rulebook.Rule) -> str:
+    sep = " " if rule.number[-1].isalpha() else ". "
+    return f"{rule.number}{sep}{rule.text}"
+
+
+def _rule_with_subrules(idx: rulebook.RulesIndex, rule: rulebook.Rule) -> list[str]:
+    parts = [_rule_line(rule)]
+    for child in rule.children:
+        parts.append("")
+        parts.append(_rule_line(idx.rules[child]))
+    return parts
+
+
+def _rules_header(idx: rulebook.RulesIndex) -> str:
+    return f"Comprehensive Rules, effective {idx.effective_date}"
+
+
+def _rules_unavailable() -> str:
+    return ("Comprehensive Rules are unavailable: no local copy could be "
+            "loaded and the download from Wizards has not succeeded yet. "
+            "Try again in a moment.")
+
+
+def _rules_not_found(idx: rulebook.RulesIndex, ref: str) -> str:
+    suggestions = idx.suggest(ref)
+    if not suggestions:
+        return f"No rule or glossary entry matches '{ref}'. Try rules_search instead."
+    lines = [f"No rule or glossary entry matches '{ref}'. Closest matches:", ""]
+    lines += [f"- {s}" for s in suggestions]
+    lines += ["", "Or use rules_search for full-text search."]
+    return "\n".join(lines)
+
+
+def _rules_glossary_get(idx: rulebook.RulesIndex, ref: str) -> str:
+    return _rules_not_found(idx, ref)
+
+
+@mcp.tool(name="rules_get")
+async def rules_get(params: RulesGetInput) -> str:
+    """Look up Magic's Comprehensive Rules by rule number or keyword.
+
+    Use this INSTEAD of memory or web search for what the rulebook says.
+    A rule number ('702.2b', '601.2') returns exact rule text — '702.2'
+    includes its subrules, '702' lists that subsection's rules. A keyword
+    or glossary term ('deathtouch') returns the glossary entry plus the
+    rules it cites. Cite rule numbers in answers.
+    """
+    idx = await _get_rules_index()
+    if idx is None:
+        return _rules_unavailable()
+    ref = params.ref.rstrip(".")
+
+    if _RULES_NUM_RE.fullmatch(ref):
+        rule = idx.rules.get(ref)
+        if rule is None:
+            return _rules_not_found(idx, ref)
+        parts = [_rules_header(idx), ""]
+        if len(ref) <= 3:  # section or subsection: children as one-liners
+            parts.append(_rule_line(rule))
+            parts.extend(f"- {_rule_line(idx.rules[c])}" for c in rule.children)
+            if rule.children:
+                parts += ["", f"Call rules_get with a specific number "
+                              f"(e.g. '{rule.children[0]}') for full text."]
+        elif ref[-1].isalpha():  # subrule: parent heading for context
+            parent = idx.rules.get(rule.parent or "")
+            if parent is not None:
+                parts.append(_rule_line(parent))
+            parts.append(_rule_line(rule))
+        else:  # rule: full text with subrules, capped
+            body = _rule_with_subrules(idx, rule)
+            if sum(len(p) for p in body) > RULES_GET_MAX_CHARS:
+                body = [_rule_line(rule), ""]
+                body += [f"- {c}" for c in rule.children]
+                body += ["", "(Too long to include every subrule — call "
+                             "rules_get on a specific subrule number.)"]
+            parts.extend(body)
+        return "\n".join(parts)
+
+    return _rules_glossary_get(idx, ref)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PRECON DECKS — Preconstructed deck lookup via MTGJSON
 # ═══════════════════════════════════════════════════════════════════════════════
