@@ -3004,6 +3004,49 @@ async def rules_get(params: RulesGetInput) -> str:
     return _rules_glossary_get(idx, ref)
 
 
+class RulesSearchInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    query: str = Field(
+        ...,
+        description=(
+            "Words or a phrase to find in Comprehensive Rules and glossary "
+            "text. Prefer the CR's own wording — singular forms and rules "
+            "vocabulary ('replacement effect order', not 'ordering of "
+            "replacement effects')."
+        ),
+        min_length=1, max_length=300,
+    )
+    limit: int = Field(default=10, ge=1, le=25, description="Max hits to return.")
+
+
+@mcp.tool(name="rules_search")
+async def rules_search(params: RulesSearchInput) -> str:
+    """Full-text search of Magic's Comprehensive Rules and glossary.
+
+    Use this INSTEAD of memory or web search when a rules-interaction
+    question (stack, layers, replacement effects, state-based actions)
+    doesn't start from a known rule number; then cite the rule numbers
+    it returns, or drill in with rules_get.
+    """
+    idx = await _get_rules_index()
+    if idx is None:
+        return _rules_unavailable()
+    hits, total = idx.search(params.query, limit=params.limit)
+    if not hits:
+        return (f"No Comprehensive Rules matches for '{params.query}'. Try "
+                "different terms, or rules_get with a rule number or keyword.")
+    parts = [_rules_header(idx),
+             f"{total} rules/glossary entries mention these terms; "
+             f"showing the {len(hits)} most relevant:", ""]
+    for h in hits:
+        if h.kind == "glossary":
+            parts.append(f"Glossary: {h.ref} — {idx.glossary[h.ref.lower()]}")
+        else:
+            parts.append(_rule_line(idx.rules[h.ref]))
+        parts.append("")
+    return "\n".join(parts)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PRECON DECKS — Preconstructed deck lookup via MTGJSON
 # ═══════════════════════════════════════════════════════════════════════════════

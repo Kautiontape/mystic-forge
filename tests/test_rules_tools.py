@@ -331,3 +331,33 @@ async def test_glossary_renders_all_real_terms(monkeypatch):
         assert "Glossary:" in out, key
         assert len(out) <= server.RULES_GET_MAX_CHARS + 200, key
         assert not out.rstrip().endswith("as follows:"), key  # no dangling list intros
+
+
+# ── rules_search ─────────────────────────────────────────────────────────────
+
+async def test_search_tool_lists_rule_and_glossary_hits(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_search(server.RulesSearchInput(query="deathtouch"))
+    assert "effective August 7, 2026" in out
+    assert "702.2" in out
+    assert "Glossary: Deathtouch" in out
+    assert "mention these terms" in out
+
+
+async def test_search_tool_respects_limit(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_search(server.RulesSearchInput(query="deathtouch", limit=1))
+    assert "showing the 1 " in out
+
+
+async def test_search_tool_no_hits(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_search(server.RulesSearchInput(query="zzzznope"))
+    assert "No Comprehensive Rules matches" in out
+
+
+async def test_search_tool_unavailable(monkeypatch):
+    monkeypatch.setitem(server._rules_state, "index", None)
+    monkeypatch.setitem(server._rules_state, "checked_at", time.time())
+    out = await server.rules_search(server.RulesSearchInput(query="deathtouch"))
+    assert "unavailable" in out
