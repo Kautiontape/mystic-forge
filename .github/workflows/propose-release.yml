@@ -4,6 +4,10 @@ name: propose release
 # submodule pin. Merging that PR is what deploys — this workflow never touches
 # production itself.
 #
+# Only proposes when VERSION differs from the version at the current pin, so
+# docs- and CI-only pushes do not raise a release PR that would then fail the
+# "version increased" check.
+#
 # Requires the repo secret MCP_SERVERS_RELEASE_TOKEN: a fine-grained PAT owned by
 # the Kautiontape org, scoped to Kautiontape/mcp-servers only, with
 # Contents: read+write and Pull requests: read+write. The built-in GITHUB_TOKEN
@@ -53,23 +57,48 @@ jobs:
             exit 0
           fi
 
+          git -C mystic-forge fetch origin
+
+          OLD_VERSION=$(git -C mystic-forge show "${OLD_SHA}:VERSION" 2>/dev/null \
+            | tr -d '[:space:]' || true)
+          NEW_VERSION=$(git -C mystic-forge show "${NEW_SHA}:VERSION" \
+            | tr -d '[:space:]')
+          echo "version: ${OLD_VERSION:-none} -> ${NEW_VERSION}"
+
+          # A release is a version change. Without this, every docs or CI push
+          # would raise a PR that fails the "version increased" check, and red
+          # checks you are meant to ignore are worse than no checks.
+          if [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::VERSION is unchanged at ${NEW_VERSION}; not proposing a release."
+            exit 0
+          fi
+
           git config user.name  'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
-          # Build on top of an existing release branch rather than resetting to
-          # main, so hand-written changelog commits pushed to the open PR survive
-          # a later bump.
+          # Reuse the release branch only while a release is genuinely in flight,
+          # so hand-written changelog commits on an open PR survive a later bump.
+          # Once it has been merged (or squashed away) start clean from main --
+          # building on a squash-merged tip would replay merged changes into the
+          # next PR.
+          REUSE=false
           if git ls-remote --exit-code --heads origin "$RELEASE_BRANCH" >/dev/null 2>&1; then
             git fetch origin "$RELEASE_BRANCH"
+            if [ -n "$(git rev-list "origin/main..origin/$RELEASE_BRANCH")" ]; then
+              REUSE=true
+            fi
+          fi
+
+          if [ "$REUSE" = true ]; then
+            echo "Release in flight; committing onto the existing branch."
             git checkout -B "$RELEASE_BRANCH" "origin/$RELEASE_BRANCH"
           else
+            echo "No release in flight; starting the branch from main."
             git checkout -B "$RELEASE_BRANCH" origin/main
           fi
 
-          git -C mystic-forge fetch origin
           git -C mystic-forge checkout --detach "$NEW_SHA"
-
-          VERSION=$(tr -d '[:space:]' < mystic-forge/VERSION)
 
           git add mystic-forge
           if git diff --cached --quiet; then
@@ -78,12 +107,12 @@ jobs:
             exit 0
           fi
 
-          git commit -m "mystic-forge: Bump to ${VERSION} (${NEW_SHA:0:7})"
-          git push origin "$RELEASE_BRANCH"
+          git commit -m "mystic-forge: Bump to ${NEW_VERSION} (${NEW_SHA:0:7})"
+          git push --force-with-lease origin "$RELEASE_BRANCH"
 
           {
             echo "skip=false"
-            echo "version=$VERSION"
+            echo "version=$NEW_VERSION"
             echo "old_sha=$OLD_SHA"
           } >> "$GITHUB_OUTPUT"
 
@@ -110,11 +139,21 @@ jobs:
             printf '`release-checks` enforces all three. Push changelog edits to this branch.\n'
           } > /tmp/pr-body.md
 
-          if gh pr view "$RELEASE_BRANCH" --repo "$TARGET_REPO" >/dev/null 2>&1; then
-            gh pr edit "$RELEASE_BRANCH" --repo "$TARGET_REPO" \
+          # Match OPEN pull requests only. `gh pr view <branch>` resolves by head
+          # branch name and happily returns a merged PR, and GitHub accepts
+          # title/body edits on merged PRs -- so the obvious version of this
+          # silently rewrites the last release's description and never opens a
+          # new one.
+          OPEN_PR=$(gh pr list --repo "$TARGET_REPO" --head "$RELEASE_BRANCH" \
+            --state open --json number --jq '.[0].number // empty')
+
+          if [ -n "$OPEN_PR" ]; then
+            echo "Updating open PR #${OPEN_PR}."
+            gh pr edit "$OPEN_PR" --repo "$TARGET_REPO" \
               --title "mystic-forge: Release ${VERSION}" \
               --body-file /tmp/pr-body.md
           else
+            echo "No open release PR; creating one."
             gh pr create --repo "$TARGET_REPO" \
               --base main --head "$RELEASE_BRANCH" \
               --title "mystic-forge: Release ${VERSION}" \
