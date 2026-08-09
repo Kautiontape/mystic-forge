@@ -6,3 +6,4 @@ __pycache__/
 *.png
 !og.png
 nohup.out
+cr_cache.txt

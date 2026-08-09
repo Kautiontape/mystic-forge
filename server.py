@@ -32,6 +32,7 @@ from mcp.server.fastmcp import FastMCP
 import watchlist_db
 import watchlist_ingest
 import watchlist_pages
+import rulebook
 
 from goldfish import ENGINE_VERSION, autoderive, metrics, report
 from goldfish.cards import (CONDITIONS, COST_REDUCTION_FILTERS, DAMAGE_TARGETS,
@@ -61,6 +62,7 @@ EDHREC_API = "https://edhrec.com/api"
 ARCHIDEKT_API = "https://archidekt.com/api"
 SPELLBOOK_API = "https://backend.commanderspellbook.com"
 MTGJSON_API = "https://mtgjson.com/api/v5"
+RULES_PAGE_URL = "https://magic.wizards.com/en/rules"
 USER_AGENT = f"MysticForge/{VERSION}"
 REQUEST_TIMEOUT = 15.0
 
@@ -113,6 +115,10 @@ mcp = FastMCP(
         "the community cuts/adds and how often), and precon_diff for the exact cut/added "
         "cards between a precon and a specific deck. Never estimate cut/added percentages from memory. "
         "Use scryfall_rulings for official card rulings instead of web search or memory. "
+        "Use rules_get for exact Comprehensive Rules text by rule number or keyword, and "
+        "rules_search to find rules by content. For rules-interaction questions (stack, "
+        "layers, replacement effects, state-based actions) use these instead of memory "
+        "or web search, and cite rule numbers. "
         "Use edhrec_commander/edhrec_recommendations for deck recommendations instead of web search. "
         "Use scryfall_search/scryfall_named for card lookups instead of web search. "
         "NEVER state or reason about a card's rules text from memory — many "
@@ -2812,6 +2818,346 @@ async def scryfall_rulings(params: RulingsInput) -> str:
         parts.append(f"**{date}** ({source}): {comment}")
         parts.append("")
 
+    return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RULEBOOK — Comprehensive Rules lookup and search
+# ═══════════════════════════════════════════════════════════════════════════════
+
+CR_VENDORED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MagicCompRules.txt")
+CR_CACHE_PATH = os.environ.get("MYSTIC_FORGE_CR", "cr_cache.txt")
+CR_REFRESH_INTERVAL = 86400.0
+CR_RETRY_INTERVAL = 300.0  # retry window when we have nothing to serve
+CR_MIN_RULES = 1000  # a real CR has ~3,300 numbered rules; reject partial downloads
+
+_rules_state: dict[str, Any] = {"index": None, "checked_at": 0.0, "source_date": "", "refresh_task": None}
+_rules_lock = asyncio.Lock()
+
+_CR_TXT_RE = re.compile(r"https://media\.wizards\.com/[^\"']*?\.txt")
+_CR_DATE_RE = re.compile(r"(\d{8})\.txt$")
+
+
+def _rules_plausible(idx: rulebook.RulesIndex) -> bool:
+    return len(idx.rules) >= CR_MIN_RULES and bool(idx.glossary)
+
+
+def _load_rules_from_disk() -> Optional[rulebook.RulesIndex]:
+    """Best available local copy: the newer of the refresh cache and the
+    vendored snapshot (a git pull can leapfrog a stale cache)."""
+    log = logging.getLogger("mystic_forge")
+    best = None
+    for path in (CR_CACHE_PATH, CR_VENDORED_PATH):
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                text = f.read()
+        except OSError:
+            continue
+        try:
+            idx = rulebook.parse(text)
+        except ValueError:
+            log.warning("CR copy at %s is malformed; skipping", path)
+            continue
+        if not _rules_plausible(idx):
+            log.warning("CR copy at %s failed the sanity check; skipping", path)
+            continue
+        if best is None or idx.effective_yyyymmdd > best.effective_yyyymmdd:
+            best = idx
+    return best
+
+
+async def _fetch_page_text(url: str, timeout: float = REQUEST_TIMEOUT) -> str:
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        resp = await client.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+        resp.raise_for_status()
+        return resp.text
+
+
+def _discover_cr_url(page_html: str) -> Optional[tuple[str, str]]:
+    """Extract (fetchable txt URL, YYYYMMDD stamp) from the rules page.
+
+    The href contains a literal space ('MagicCompRules 20260807.txt') that
+    must be percent-encoded before fetching. If several .txt links appear,
+    the one with the newest filename date wins.
+    """
+    best = None  # (date, raw url)
+    for raw in _CR_TXT_RE.findall(page_html):
+        raw = urllib.parse.unquote(raw)
+        dm = _CR_DATE_RE.search(raw)
+        date = dm.group(1) if dm else ""
+        if best is None or date > best[0]:
+            best = (date, raw)
+    if best is None:
+        return None
+    return urllib.parse.quote(best[1], safe=":/"), best[0]
+
+
+async def _get_rules_index() -> Optional[rulebook.RulesIndex]:
+    """Serve the current index; load from disk on first call and kick a
+    background refresh at most once per CR_REFRESH_INTERVAL. Never blocks
+    on the network."""
+    async with _rules_lock:
+        if _rules_state["index"] is None:
+            loaded = await asyncio.to_thread(_load_rules_from_disk)
+            if _rules_state["index"] is None:  # a refresh may have landed meanwhile
+                _rules_state["index"] = loaded
+        if time.time() - _rules_state["checked_at"] >= CR_REFRESH_INTERVAL:
+            _rules_state["checked_at"] = time.time()
+            _rules_state["refresh_task"] = asyncio.create_task(_refresh_rules())  # strong ref: keeps the task from being GC'd mid-flight
+    return _rules_state["index"]
+
+
+async def _refresh_rules() -> None:
+    log = logging.getLogger("mystic_forge")
+    try:
+        found = _discover_cr_url(await _fetch_page_text(RULES_PAGE_URL))
+        if not found:
+            log.warning("CR refresh: no .txt link found on %s", RULES_PAGE_URL)
+            return
+        url, new_date = found
+        cur = _rules_state["index"]
+        cur_date = _rules_state["source_date"] or (cur.effective_yyyymmdd if cur else "")
+        if cur is not None and new_date and cur_date and new_date <= cur_date:
+            return
+        text = await _fetch_page_text(url, timeout=60.0)
+        idx = await asyncio.to_thread(rulebook.parse, text)
+        if not _rules_plausible(idx):
+            log.warning("CR refresh: download failed the sanity check; keeping current rules")
+            return
+        _rules_state["index"] = idx
+        # Deliberately not persisted to disk: on a process restart the effective
+        # date is recomputed from the loaded text, so at worst one extra
+        # download happens if filename and effective dates diverge.
+        _rules_state["source_date"] = new_date
+        try:
+            tmp_path = CR_CACHE_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp_path, CR_CACHE_PATH)
+        except OSError:
+            log.warning("CR refresh: could not write cache to %s", CR_CACHE_PATH, exc_info=True)
+        log.info("CR refreshed; now effective %s", idx.effective_date)
+    except Exception:
+        log.warning("CR refresh failed; keeping current rules", exc_info=True)
+        if _rules_state["index"] is None:
+            # Nothing to serve; allow a retry after CR_RETRY_INTERVAL, not immediately.
+            _rules_state["checked_at"] = time.time() - CR_REFRESH_INTERVAL + CR_RETRY_INTERVAL
+
+
+RULES_GET_MAX_CHARS = 10000
+RULES_SEARCH_HIT_CHARS = 400
+
+_RULES_NUM_RE = re.compile(r"^\d{1,3}(?:\.\d+)?[a-z]{0,2}$")
+
+
+class RulesGetInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    ref: str = Field(
+        ...,
+        description=(
+            "A Comprehensive Rules number at any depth ('7', '702', '702.2', "
+            "'702.2b'; a trailing period is fine) or a keyword/glossary term "
+            "('deathtouch', 'exploit')."
+        ),
+        min_length=1, max_length=100,
+    )
+
+
+def _rule_line(rule: rulebook.Rule) -> str:
+    sep = " " if rule.number[-1].isalpha() else ". "
+    return f"{rule.number}{sep}{rule.text}"
+
+
+def _first_sentence(text: str) -> str:
+    """First sentence of a rule's first line, for compact listings."""
+    first_line = text.split("\n", 1)[0]
+    dot = first_line.find(". ")
+    return first_line[: dot + 1] if dot != -1 else first_line
+
+
+def _child_listing(idx: rulebook.RulesIndex, rule: rulebook.Rule, brief: bool) -> list[str]:
+    """One line per child; brief mode trims each to its first sentence."""
+    lines = []
+    for c in rule.children:
+        child = idx.rules[c]
+        sep = " " if child.number[-1].isalpha() else ". "
+        text = _first_sentence(child.text) if brief else child.text.split("\n", 1)[0]
+        lines.append(f"- {child.number}{sep}{text}")
+    return lines
+
+
+def _rule_with_subrules(idx: rulebook.RulesIndex, rule: rulebook.Rule) -> list[str]:
+    parts = [_rule_line(rule)]
+    for child in rule.children:
+        parts.append("")
+        parts.append(_rule_line(idx.rules[child]))
+    return parts
+
+
+def _rules_header(idx: rulebook.RulesIndex) -> str:
+    return f"Comprehensive Rules, effective {idx.effective_date}"
+
+
+def _rules_unavailable() -> str:
+    return ("Comprehensive Rules are unavailable: no local copy could be "
+            "loaded and the download from Wizards has not succeeded yet. "
+            "Try again in a moment.")
+
+
+def _rules_not_found(idx: rulebook.RulesIndex, ref: str) -> str:
+    suggestions = idx.suggest(ref)
+    if not suggestions:
+        return f"No rule or glossary entry matches '{ref}'. Try rules_search instead."
+    lines = [f"No rule or glossary entry matches '{ref}'. Closest matches:", ""]
+    lines += [f"- {s}" for s in suggestions]
+    lines += ["", "Or use rules_search for full-text search."]
+    return "\n".join(lines)
+
+
+def _rules_glossary_get(idx: rulebook.RulesIndex, ref: str) -> str:
+    definition = idx.glossary.get(ref.lower())
+    if definition is None:
+        return _rules_not_found(idx, ref)
+    display = idx.glossary_display[ref.lower()]
+    parts = [_rules_header(idx), "", f"Glossary: {display}", definition]
+    omitted: list[str] = []
+    for num in idx.glossary_refs(ref):
+        rule = idx.rules.get(num)
+        if rule is None:
+            continue
+        if len(num) <= 3 and rule.children:
+            # Cited section/subsection: list its rules like rules_get(num) would.
+            block = [_rule_line(rule)]
+            block += _child_listing(idx, rule, brief=False)
+            block += [f"Call rules_get with a specific number "
+                      f"(e.g. '{rule.children[0]}') to expand it."]
+        else:
+            block = _rule_with_subrules(idx, rule)
+        budget = RULES_GET_MAX_CHARS - len("\n".join(parts))
+        if len("\n".join(block)) > budget:
+            if rule.children:
+                block = [_rule_line(rule)]
+                block += _child_listing(idx, rule, brief=True)
+                block += [f"(Trimmed — call rules_get('{num}') for full text.)"]
+            if not rule.children or len("\n".join(block)) > budget:
+                omitted.append(num)
+                continue
+        parts.append("")
+        parts.extend(block)
+    for num in omitted:
+        parts += ["", f"(Rule {num} omitted for length — call rules_get('{num}').)"]
+    return "\n".join(parts)
+
+
+@mcp.tool(name="rules_get")
+async def rules_get(params: RulesGetInput) -> str:
+    """Look up Magic's Comprehensive Rules by rule number or keyword.
+
+    Use this INSTEAD of memory or web search for what the rulebook says.
+    A rule number ('702.2b', '601.2') returns exact rule text — '702.2'
+    includes its subrules, '702' lists that subsection's rules. A keyword
+    or glossary term ('deathtouch') returns the glossary entry plus the
+    rules it cites. Cite rule numbers in answers.
+    """
+    idx = await _get_rules_index()
+    if idx is None:
+        return _rules_unavailable()
+    ref = params.ref.rstrip(".")
+    nref = ref.lower()
+
+    if _RULES_NUM_RE.fullmatch(nref):
+        rule = idx.rules.get(nref)
+        if rule is None:
+            return _rules_not_found(idx, ref)
+        parts = [_rules_header(idx), ""]
+        if len(ref) <= 3:  # section or subsection: children as one-liners
+            parts.append(_rule_line(rule))
+            if not rule.children:
+                parts += ["", f"(No numbered rules under {ref} — try a more "
+                              "specific number or rules_search.)"]
+            else:
+                listing = _child_listing(idx, rule, brief=False)
+                if len("\n".join(parts + listing)) > RULES_GET_MAX_CHARS:
+                    listing = _child_listing(idx, rule, brief=True)
+                parts.extend(listing)
+                parts += ["", f"Call rules_get with a specific number "
+                              f"(e.g. '{rule.children[0]}') to expand it."]
+        elif ref[-1].isalpha():  # subrule: parent heading for context
+            parent = idx.rules.get(rule.parent or "")
+            if parent is not None:
+                parts.append(_rule_line(parent))
+            parts.append(_rule_line(rule))
+        else:  # rule: full text with subrules; trim to snippets when too large
+            body = _rule_with_subrules(idx, rule)
+            if len("\n".join(body)) > RULES_GET_MAX_CHARS:
+                body = [_rule_line(rule)]
+                body += _child_listing(idx, rule, brief=True)
+                body += ["", "(Subrules trimmed to first sentences — call "
+                             "rules_get on a subrule number for full text.)"]
+            parts.extend(body)
+        return "\n".join(parts)
+
+    return _rules_glossary_get(idx, ref)
+
+
+class RulesSearchInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    query: str = Field(
+        ...,
+        description=(
+            "Words or a phrase to find in Comprehensive Rules and glossary "
+            "text. Prefer the CR's own wording — singular forms and rules "
+            "vocabulary ('replacement effect order', not 'ordering of "
+            "replacement effects')."
+        ),
+        min_length=1, max_length=300,
+    )
+    limit: int = Field(default=10, ge=1, le=25, description="Max hits to return.")
+
+
+@mcp.tool(name="rules_search")
+async def rules_search(params: RulesSearchInput) -> str:
+    """Full-text search of Magic's Comprehensive Rules and glossary.
+
+    Use this INSTEAD of memory or web search when a rules-interaction
+    question (stack, layers, replacement effects, state-based actions)
+    doesn't start from a known rule number; then cite the rule numbers
+    it returns, or drill in with rules_get.
+    """
+    idx = await _get_rules_index()
+    if idx is None:
+        return _rules_unavailable()
+    hits, total = idx.search(params.query, limit=params.limit)
+    if not hits:
+        return (f"No Comprehensive Rules matches for '{params.query}'. Try "
+                "different terms, or rules_get with a rule number or keyword.")
+    lines: list[str] = []
+    used = 0
+    trimmed = 0
+    for h in hits:
+        if h.kind == "glossary":
+            line = f"Glossary: {h.ref} — {idx.glossary[h.ref.lower()]}"
+        else:
+            # First line only: Example blocks belong in rules_get output.
+            line = _rule_line(idx.rules[h.ref]).split("\n", 1)[0]
+        if len(line) > RULES_SEARCH_HIT_CHARS:
+            suffix = f" … (rules_get('{h.ref}') for the rest)"
+            line = line[:RULES_SEARCH_HIT_CHARS - len(suffix)].rsplit(" ", 1)[0] + suffix
+        if used + len(line) > RULES_GET_MAX_CHARS:
+            trimmed = len(hits) - len(lines)
+            break
+        lines.append(line)
+        used += len(line) + 2
+    noun = "CR entry mentions" if total == 1 else "CR entries mention"
+    parts = [_rules_header(idx),
+             f"{total} {noun} these terms; showing the {len(lines)} most relevant:", ""]
+    for line in lines:
+        parts.append(line)
+        parts.append("")
+    if trimmed:
+        hit_word = "hit" if trimmed == 1 else "hits"
+        parts.append(f"({trimmed} more {hit_word} trimmed for length — "
+                     "narrow the query or lower the limit.)")
     return "\n".join(parts)
 
 

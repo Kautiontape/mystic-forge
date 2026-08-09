@@ -60,6 +60,12 @@ A unified MCP (Model Context Protocol) server for Magic: The Gathering. Combines
 
 Workflow: run `goldfish_annotate` on the deck first — it auto-derives what the engine models on its own and hands back the short list of cards that need a manual annotation. Pass those annotations to `goldfish_run` (or `goldfish_ab` for a paired swap comparison), then publish the numbers with `goldfish_report` — reports are rendered from the stored run's metrics, never hand-authored. Goldfish sims measure speed and consistency only; they cannot value interaction. For hosted reports, set `GOLDFISH_REPORT_DIR` to persist each run's HTML (served at `/goldfish/r/<run_code>`), and `GOLDFISH_PUBLIC_BASE_URL` to have run outputs include the public report link; leave both unset and reports are served from memory via `goldfish_report` only.
 
+### Comprehensive Rules
+| Tool | Description |
+|---|---|
+| `rules_get` | Exact CR text by rule number (`702.2b`) or keyword/glossary term |
+| `rules_search` | Ranked full-text search over rules and glossary |
+
 ## Quick Start
 
 ### Docker
@@ -105,6 +111,8 @@ cp .env.example .env
 ```
 
 **Important:** Never deploy credentials on a shared/public server. Private deck access is for self-hosted instances only.
+
+`MYSTIC_FORGE_CR` is optional: it sets where the auto-refreshed Comprehensive Rules cache is written; it defaults to the working directory.
 
 ## Price watchlist
 

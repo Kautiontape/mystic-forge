@@ -6,6 +6,7 @@ services:
       - "8000:8000"
     environment:
       - MYSTIC_FORGE_DB=/data/mystic_forge.db
+      - MYSTIC_FORGE_CR=/data/cr_cache.txt
       # Hosted goldfish run reports (optional). Set BOTH to serve reports at
       # {GOLDFISH_PUBLIC_BASE_URL}/goldfish/r/<run_code>; set only the DIR to
       # persist HTML without advertising links. Unset: reports stay in-memory
