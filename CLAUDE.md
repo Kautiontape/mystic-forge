@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Mystic Forge is an MCP (Model Context Protocol) server for Magic: The Gathering. It exposes 46 tools that wrap several public MTG APIs (Scryfall, EDHRec, Archidekt, Commander Spellbook, MTGJSON) behind a unified FastMCP server, plus a deck simulator and a price watchlist of its own.
 
-All tool declarations live in `server.py` at the repo root; supporting code lives in the `mystic_forge/` package: `mystic_forge/rulebook.py` (Comprehensive Rules parsing), `mystic_forge/watchlist/` (`db.py` / `ingest.py` / `pages.py`), `mystic_forge/goldfish/` (simulation engine), and `mystic_forge/data/` (vendored assets: `MagicCompRules.txt`, `watchlist_words.txt`, `og.png`). The `@mcp.tool(name=...)` declarations must stay in root `server.py` — `mcp-servers/scripts/check_release.py` greps that exact path at the pinned commit; moving them breaks the release gate. There is no build step, but there **is** a SQLite database backing the watchlist — path from `MYSTIC_FORGE_DB`, defaulting to `mystic_forge.db`.
+All tool declarations live in `server.py` at the repo root; supporting code lives in the `mystic_forge/` package: `mystic_forge/rulebook.py` (Comprehensive Rules parsing), `mystic_forge/watchlist/` (`db.py` / `ingest.py` / `pages.py` / `mtgstocks.py`), `mystic_forge/goldfish/` (simulation engine), and `mystic_forge/data/` (vendored assets: `MagicCompRules.txt`, `watchlist_words.txt`, `og.png`). The `@mcp.tool(name=...)` declarations must stay in root `server.py` — `mcp-servers/scripts/check_release.py` greps that exact path at the pinned commit; moving them breaks the release gate. There is no build step, but there **is** a SQLite database backing the watchlist — path from `MYSTIC_FORGE_DB`, defaulting to `mystic_forge.db`.
 
 ## Commands
 
@@ -62,7 +62,7 @@ Verify a release with `curl -s https://mcp.kautiontape.com/mtg/health` — it re
 - **RULEBOOK** — Comprehensive Rules lookup and search (`rules_*`), parsing via `mystic_forge/rulebook.py` against the vendored `mystic_forge/data/MagicCompRules.txt`
 - **PRECON DECKS** — preconstructed decks via MTGJSON (`precon_*`)
 - **GOLDFISH** — deck simulation (`goldfish_*`), engine in the `mystic_forge/goldfish/` package
-- **WATCHLIST** — passphrase-named price watchlists (`watchlist_*`, `price_history`), backed by SQLite and served as HTML pages under `/w/` and `/s/`
+- **WATCHLIST** — passphrase-named price watchlists (`watchlist_*`, `price_history`), backed by SQLite and served as HTML pages under `/w/` and `/s/`. The MTGStocks hop-out badge needs a per-printing id that no dataset we ingest carries, so `mtgstocks.py` resolves and caches it during ingest; pages read that cache only and drop the badge when it's empty
 - **ENTRYPOINT** — `mcp.run()` with transport chosen by the `--stdio` flag
 
 Sections past RULINGS do more than wrap an API: RULEBOOK, GOLDFISH, and WATCHLIST own local state (a vendored rules file, a simulation engine, a database). They do not follow the three-layer transport/error/tool shape below.

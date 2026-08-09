@@ -65,6 +65,14 @@ CREATE TABLE IF NOT EXISTS card_uuids (
   scryfall_id TEXT,
   PRIMARY KEY (card_name, uuid)
 );
+CREATE TABLE IF NOT EXISTS mtgstocks_prints (
+  card_name TEXT NOT NULL,
+  set_code TEXT NOT NULL,
+  print_id INTEGER,
+  slug TEXT,
+  checked_at TEXT NOT NULL,
+  PRIMARY KEY (card_name, set_code)
+);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS idx_prices_pfud
   ON prices(provider, finish, uuid, date);

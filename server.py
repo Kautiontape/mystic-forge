@@ -5876,7 +5876,7 @@ async def api_resolve(request: Request):
             "name": name, "set_code": set_code, "collector_number": cn,
             "usd": (card.get("prices") or {}).get("usd"),
             "chart": watchlist_pages._big_svg(points, name, "$") if points else "",
-            "sites": watchlist_pages._site_links(entry),
+            "sites": watchlist_pages._site_links(entry, db),
         })
     finally:
         db.close()
