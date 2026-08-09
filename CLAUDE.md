@@ -40,7 +40,7 @@ A previous `deploy.yml` in this repo ran `git submodule update --remote` plus an
 To release:
 
 1. Bump `VERSION` (semver). It feeds the image tag, the outbound `User-Agent`, and `/health`.
-2. Push to `main`. `ci.yml` runs the tests; `propose-release.yml` opens or updates a PR in `mcp-servers` bumping the submodule pin.
+2. Push to `main`. `ci.yml` runs the tests, and only on a green run does `propose-release.yml` open or update a PR in `mcp-servers` bumping the submodule pin. Red tests propose nothing — the parent's release checks never run this suite, so this is the only test gate before a deploy.
 3. Add a changelog entry in the parent repo at `landing/mtg/changelog/index.html`, tagged `data-version="<VERSION>"`, and update the teaser in `landing/mtg/index.html` to match. Push those to the release PR branch.
 4. Merge the PR. That builds the image from the pin and deploys it.
 

@@ -1,7 +1,8 @@
 name: CI
 
 # Tests only. Pushing to this repo does NOT deploy — releases happen by bumping
-# the submodule pin in Kautiontape/mcp-servers (see propose-release.yml).
+# the submodule pin in Kautiontape/mcp-servers. A green run on main triggers
+# propose-release.yml, which raises that PR; a red run proposes nothing.
 
 on:
   push:
