@@ -60,7 +60,7 @@ class SearchHit:
 
 
 def _tokenize(s: str) -> list[str]:
-    return _TOKEN_RE.findall(s.lower())
+    return _TOKEN_RE.findall(s.lower().replace("’", "'"))
 
 
 class RulesIndex:
@@ -100,9 +100,8 @@ class RulesIndex:
         Scoring: term frequency dampened by document length, x3 when every
         query term is present, x2 when the terms appear as a phrase. Stop
         words are dropped from the query before matching, unless doing so
-        would leave nothing to search on. total = documents containing
-        every significant query term (falls back to the any-term count
-        when none has all).
+        would leave nothing to search on. total = documents matching at
+        least one significant query term.
         """
         raw = _tokenize(query)
         if not raw:
@@ -110,7 +109,6 @@ class RulesIndex:
         q = [t for t in raw if t not in _STOPWORDS] or raw
         phrase = " ".join(q)
         hits: list[SearchHit] = []
-        strict_total = 0
         for ref, kind, text in self._documents():
             tokens = _tokenize(text)
             if not tokens:
@@ -120,16 +118,13 @@ class RulesIndex:
             if not matched:
                 continue
             score = matched / (1.0 + len(tokens) / 200.0)
-            all_present = all(counts[t] for t in q)
-            if all_present:
-                strict_total += 1
+            if all(counts[t] for t in q):
                 score *= 3.0
             if len(q) > 1 and f" {phrase} " in f" {' '.join(tokens)} ":
                 score *= 2.0
             hits.append(SearchHit(ref=ref, kind=kind, text=text, score=score))
         hits.sort(key=lambda h: (-h.score, h.ref))
-        total = strict_total or len(hits)
-        return hits[:max(0, limit)], total
+        return hits[:max(0, limit)], len(hits)
 
 
 def parse(text: str) -> RulesIndex:

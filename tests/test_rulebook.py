@@ -87,7 +87,7 @@ def test_suggest_close_matches(idx):
 def test_search_all_terms_ranked_first(idx):
     hits, total = idx.search("deathtouch state-based actions")
     assert hits[0].ref == "702.2b"
-    assert total == 2  # 702.2b and 704.5m contain every significant term
+    assert total == 8  # any-match count on the fixture corpus
 
 
 def test_search_phrase_match_wins(idx):
