@@ -88,10 +88,50 @@ prices (main db)          watched cards only — schema unchanged
 watchlist pages           unchanged
 ```
 
-The duplication into `prices` is small — a 17-card list is roughly 6k rows —
-and it buys total insulation of the read path. `_envelope`,
+`prices` is global, keyed `(uuid, date, provider, finish)` with no list
+reference, so two lists watching the same card share rows rather than
+duplicating them. The multiplier that does apply is printings: a name-only
+entry tracks every printing through `uuids_for_entry`, which for a
+representative 17-card list is 156 uuids (avg 9.2 printings per card,
+measured against Scryfall). That works out to ~100k rows over the 90-day
+window and ~135k at the steady-state 120 days — single-digit MB, negligible
+next to the sidecar itself.
+
+Tracking all printings is deliberate, not incidental: `_envelope` takes the
+per-date minimum across them so the series reflects what a buyer would
+actually pay, and stays correct when a reprint changes which printing is
+cheapest.
+
+The projection buys total insulation of the read path. `_envelope`,
 `_cheapest_latest`, `price_summary`, and `price_series` are not touched, and
 neither are their tests.
+
+### Why a separate file rather than tables in the main database
+
+1. **Maintenance isolation.** Downsampling deletes millions of rows. Reclaiming
+   that space means `VACUUM`, which takes a write lock on the entire file. In
+   the main database every watchlist page would block behind it.
+2. **WAL contention.** ~600k inserts a night into the file the pages read
+   grows the WAL and forces checkpoints while readers are active. Isolated,
+   the main database's WAL stays small.
+3. **Page-cache eviction.** SQLite's cache is per-connection and shared across
+   the file. A multi-GB, scan-heavy table would evict the small hot tables
+   (`watchlist_current`, `events`) that every page load touches.
+4. **Backup asymmetry.** The main database is small, precious and worth
+   backing up often; the sidecar is gigabytes. Merging them imposes the
+   expensive cadence on both.
+
+The honest counter-argument is that past 90 days the sidecar is *also*
+irreplaceable, and irreplaceable data usually belongs with the other
+irreplaceable data. That is answered by backing it up, not by merging an
+append-heavy multi-GB table into a file that page loads read synchronously.
+Precious and hot-path are different properties.
+
+The usual argument for a single file — cross-table joins — does not apply,
+because the design is a one-way projection rather than a query-time join.
+
+This is also a low-regret decision: folding the sidecar into the main database
+later is an `ATTACH` plus `INSERT … SELECT`, with no schema change.
 
 ## New module: `price_sidecar.py`
 
