@@ -20,6 +20,7 @@ from html import escape as esc
 
 from . import db as watchlist_db
 from . import ingest as watchlist_ingest
+from . import mtgstocks
 
 EVENTS_PER_PAGE = 15
 CARDS_PER_PAGE = 24
@@ -706,8 +707,13 @@ def _tail_table(points, cur):
             + rows + "</table>") if rows else ""
 
 
-def _site_links(entry) -> str:
-    """External hop-out badges. Pinned printings deep-link where possible."""
+def _site_links(entry, db=None) -> str:
+    """External hop-out badges. Pinned printings deep-link where possible.
+
+    MTGStocks is the odd one out: it has no name-addressable URL, only
+    `/prints/<id>`, so its badge appears only once the ingest has resolved and
+    cached that id (see `watchlist/mtgstocks.py`). Omitted rather than linked
+    to a search page that 404s."""
     name = entry["card_name"]
     q = urllib.parse.quote(name)
     slug = "".join(ch for ch in name.lower().replace(" ", "-") if ch.isalnum() or ch == "-")
@@ -716,10 +722,11 @@ def _site_links(entry) -> str:
                 f"{urllib.parse.quote(entry['collector_number'])}")
     else:
         scry = f"https://scryfall.com/search?q={urllib.parse.quote(f'!\"{name}\"')}"
+    stocks = mtgstocks.cached_url(db, name, entry.get("set_code"))
     links = [
         ("Scryfall", scry),
         ("EDHREC", f"https://edhrec.com/cards/{slug}"),
-        ("MTGStocks", f"https://www.mtgstocks.com/search?query={q}"),
+        *([("MTGStocks", stocks)] if stocks else []),
         ("TCGplayer", f"https://www.tcgplayer.com/search/magic/product?q={q}"),
     ]
     return '<div class="sites">' + "".join(
@@ -781,7 +788,7 @@ def _card_html(db, entry, s, hit, idx, shop, cur, filling=False):
             f' data-target="{tgt_attr}"'
             f' data-note="{esc(entry["note"] or "")}"'
             f' data-bought="{esc(bought_at) if bought_at else ""}"'
-            f' data-sites="{esc(_site_links(entry))}"'
+            f' data-sites="{esc(_site_links(entry, db))}"'
             f' data-pts="{esc(json.dumps(points))}"'
             f' data-chart="{esc(_big_svg(points, entry["card_name"], cur, entry.get("target_price") if shop == "tcgplayer" and not bought_at else None, bought_at))}"'
             f' data-tail="{esc(_tail_table(points, cur))}"')
