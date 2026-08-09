@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Mystic Forge is an MCP (Model Context Protocol) server for Magic: The Gathering. It exposes 46 tools that wrap several public MTG APIs (Scryfall, EDHRec, Archidekt, Commander Spellbook, MTGJSON) behind a unified FastMCP server, plus a deck simulator and a price watchlist of its own.
 
-Most of it lives in `server.py`, with supporting modules alongside: `rulebook.py` (Comprehensive Rules parsing), `watchlist_db.py` / `watchlist_ingest.py` / `watchlist_pages.py`, and the `goldfish/` package (simulation engine). There is no build step, but there **is** a SQLite database backing the watchlist — path from `MYSTIC_FORGE_DB`, defaulting to `mystic_forge.db`.
+All tool declarations live in `server.py` at the repo root; supporting code lives in the `mystic_forge/` package: `mystic_forge/rulebook.py` (Comprehensive Rules parsing), `mystic_forge/watchlist/` (`db.py` / `ingest.py` / `pages.py`), `mystic_forge/goldfish/` (simulation engine), and `mystic_forge/data/` (vendored assets: `MagicCompRules.txt`, `watchlist_words.txt`, `og.png`). The `@mcp.tool(name=...)` declarations must stay in root `server.py` — `mcp-servers/scripts/check_release.py` greps that exact path at the pinned commit; moving them breaks the release gate. There is no build step, but there **is** a SQLite database backing the watchlist — path from `MYSTIC_FORGE_DB`, defaulting to `mystic_forge.db`.
 
 ## Commands
 
@@ -59,9 +59,9 @@ Verify a release with `curl -s https://mcp.kautiontape.com/mtg/health` — it re
 - **VALIDATION** — `validate_decklist`, `validate_archidekt_deck`
 - **COMMANDER SPELLBOOK** — combo search (`spellbook_*`)
 - **RULINGS** — `scryfall_rulings`
-- **RULEBOOK** — Comprehensive Rules lookup and search (`rules_*`), parsing via `rulebook.py` against the vendored `MagicCompRules.txt`
+- **RULEBOOK** — Comprehensive Rules lookup and search (`rules_*`), parsing via `mystic_forge/rulebook.py` against the vendored `mystic_forge/data/MagicCompRules.txt`
 - **PRECON DECKS** — preconstructed decks via MTGJSON (`precon_*`)
-- **GOLDFISH** — deck simulation (`goldfish_*`), engine in the `goldfish/` package
+- **GOLDFISH** — deck simulation (`goldfish_*`), engine in the `mystic_forge/goldfish/` package
 - **WATCHLIST** — passphrase-named price watchlists (`watchlist_*`, `price_history`), backed by SQLite and served as HTML pages under `/w/` and `/s/`
 - **ENTRYPOINT** — `mcp.run()` with transport chosen by the `--stdio` flag
 
@@ -95,4 +95,4 @@ Every source follows the same three-layer shape, so match it when adding tools:
 
 - The `README.md` tool tables are not exhaustive. `server.py` is the source of truth for the current tool set; `landing/mtg/index.html` in the parent repo is the source of truth for what is advertised, and CI keeps the two in sync.
 - Requires Python 3.14 (per Dockerfile) but only uses stdlib + `httpx`, `pydantic`, and `mcp[cli]`.
-- The Dockerfile copies an **explicit file list**, not `COPY . .`. A new top-level file or data asset must be added to that line or it silently will not exist in the image.
+- The Dockerfile copies `VERSION`, `server.py`, and the `mystic_forge/` package. Anything inside the package — including `mystic_forge/data/` assets — ships automatically; a new file **outside** the package must be added to the `COPY` line or it silently will not exist in the image.

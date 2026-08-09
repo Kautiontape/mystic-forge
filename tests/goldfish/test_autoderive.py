@@ -7,7 +7,7 @@ Task 17 Step-1 block verbatim. Fetch lands follow the spec's semantics via
 the engine's sac_self mechanism (see
 test_fetch_derives_sac_self_ramp_activation).
 """
-from goldfish.autoderive import derive
+from mystic_forge.goldfish.autoderive import derive
 
 PLAINS = {"name": "Plains", "type_line": "Basic Land — Plains",
           "oracle_text": "({T}: Add {W}.)", "produced_mana": ["W"], "keywords": []}
@@ -307,7 +307,7 @@ def test_land_saga_is_unmodeled_other():
 
 
 def test_karoo_bounce_land_quantity_flows_through_engine():
-    from goldfish.engine import new_game, untapped_producers
+    from mystic_forge.goldfish.engine import new_game, untapped_producers
     from tests.goldfish.helpers import mini_cards
 
     d = derive([AZORIUS_CHANCERY])
@@ -579,7 +579,7 @@ def test_all_notes_use_documented_kinds():
     # and no card may carry a duplicate note.
     import re
 
-    from goldfish.autoderive import _NOTE_KINDS
+    from mystic_forge.goldfish.autoderive import _NOTE_KINDS
 
     for fixture in ALL_FIXTURES:
         for got in derive([fixture]).values():

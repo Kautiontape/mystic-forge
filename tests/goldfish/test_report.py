@@ -12,10 +12,10 @@ from types import SimpleNamespace
 import pytest
 
 import server as srv
-from goldfish import ENGINE_VERSION
-from goldfish import metrics as gmetrics
-from goldfish.report import render_report, run_code
-from goldfish.runner import run_ab, run_batch
+from mystic_forge.goldfish import ENGINE_VERSION
+from mystic_forge.goldfish import metrics as gmetrics
+from mystic_forge.goldfish.report import render_report, run_code
+from mystic_forge.goldfish.runner import run_ab, run_batch
 from tests.goldfish.helpers import (
     MINI_DECK_TEXT,
     _patch_fetch_minideck,

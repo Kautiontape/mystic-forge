@@ -1,7 +1,7 @@
 """Task 12: greedy policy — rule order, reasons, guards, determinism."""
-from goldfish.cards import SimCard, parse_cost
-from goldfish.engine import IllegalAction, new_game, step
-from goldfish.policy import choose_action
+from mystic_forge.goldfish.cards import SimCard, parse_cost
+from mystic_forge.goldfish.engine import IllegalAction, new_game, step
+from mystic_forge.goldfish.policy import choose_action
 from tests.goldfish.helpers import annotated, make_data, mini_cards, started
 
 

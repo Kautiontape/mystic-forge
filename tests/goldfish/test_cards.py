@@ -1,6 +1,6 @@
 import pytest
 
-from goldfish.cards import (
+from mystic_forge.goldfish.cards import (
     Annotation,
     AnnotationError,
     CostParseError,

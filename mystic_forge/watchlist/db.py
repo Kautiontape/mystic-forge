@@ -15,7 +15,7 @@ from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = os.environ.get("MYSTIC_FORGE_DB", "mystic_forge.db")
-_WORDS_FILE = Path(__file__).parent / "watchlist_words.txt"
+_WORDS_FILE = Path(__file__).parent.parent / "data" / "watchlist_words.txt"
 _SHARE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"  # no 0/O/1/I/L/U confusables
 
 SCHEMA = """

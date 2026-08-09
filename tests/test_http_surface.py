@@ -1,7 +1,7 @@
 from starlette.testclient import TestClient
 
 import server
-import watchlist_db
+from mystic_forge.watchlist import db as watchlist_db
 
 
 def client():

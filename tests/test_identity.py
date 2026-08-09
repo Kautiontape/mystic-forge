@@ -1,6 +1,6 @@
 import asyncio
 
-import watchlist_db
+from mystic_forge.watchlist import db as watchlist_db
 import server
 
 

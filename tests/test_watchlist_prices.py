@@ -1,4 +1,4 @@
-import watchlist_db
+from mystic_forge.watchlist import db as watchlist_db
 
 
 def seed(db):

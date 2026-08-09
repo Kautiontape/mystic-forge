@@ -13,7 +13,7 @@ import pydantic
 import pytest
 
 import server as srv
-from goldfish.engine import legal_actions, new_game
+from mystic_forge.goldfish.engine import legal_actions, new_game
 from tests.goldfish.helpers import MINI_DECK_TEXT, _patch_fetch_minideck, mini_cards
 
 

@@ -3,8 +3,8 @@ import json
 import sqlite3
 import tracemalloc
 
-import watchlist_db
-import watchlist_ingest
+from mystic_forge.watchlist import db as watchlist_db
+from mystic_forge.watchlist import ingest as watchlist_ingest
 
 
 def make_allprintings(tmp_path):

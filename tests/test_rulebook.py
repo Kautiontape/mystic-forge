@@ -2,7 +2,7 @@ import pathlib
 
 import pytest
 
-import rulebook
+from mystic_forge import rulebook
 
 FIXTURE = (pathlib.Path(__file__).parent / "fixtures" / "cr_fixture.txt").read_text(encoding="utf-8")
 
@@ -85,7 +85,7 @@ def test_suggest_close_matches(idx):
 
 
 def test_suggest_case_folds_and_recovers_obsolete_terms():
-    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    real = (pathlib.Path(__file__).parent.parent / "mystic_forge" / "data" / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
     idx = rulebook.parse(real)
     assert any("Mana Burn" in s for s in idx.suggest("mana burn"))
     assert "Stack" in idx.suggest("the stack")
@@ -120,7 +120,7 @@ def test_search_no_token_query(idx):
 
 
 def test_real_cr_parses_structurally():
-    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    real = (pathlib.Path(__file__).parent.parent / "mystic_forge" / "data" / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
     idx = rulebook.parse(real)
     assert len(idx.rules) > 3300
     assert len(idx.glossary) > 730
@@ -146,7 +146,7 @@ def test_real_cr_parses_structurally():
 
 
 def test_search_ranking_real_cr():
-    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    real = (pathlib.Path(__file__).parent.parent / "mystic_forge" / "data" / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
     idx = rulebook.parse(real)
 
     def top(query, n=5):
@@ -165,6 +165,6 @@ def test_search_ranking_real_cr():
 
 
 def test_glossary_ascii_quote_aliases_real_cr():
-    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    real = (pathlib.Path(__file__).parent.parent / "mystic_forge" / "data" / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
     idx = rulebook.parse(real)
     assert 'banding, "bands with other"' in idx.glossary

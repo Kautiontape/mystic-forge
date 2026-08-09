@@ -3,7 +3,10 @@ __pycache__/
 *.pyc
 .venv/
 .playwright-mcp/
+.pytest_cache/
+.benchmarks/
 *.png
-!og.png
+!mystic_forge/data/og.png
 nohup.out
 cr_cache.txt
+mystic_forge.db

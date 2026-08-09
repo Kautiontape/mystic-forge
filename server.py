@@ -29,23 +29,23 @@ import httpx
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from mcp.server.fastmcp import FastMCP
 
-import watchlist_db
-import watchlist_ingest
-import watchlist_pages
-import rulebook
+from mystic_forge.watchlist import db as watchlist_db
+from mystic_forge.watchlist import ingest as watchlist_ingest
+from mystic_forge.watchlist import pages as watchlist_pages
+from mystic_forge import rulebook
 
-from goldfish import ENGINE_VERSION, autoderive, metrics, report
-from goldfish.cards import (CONDITIONS, COST_REDUCTION_FILTERS, DAMAGE_TARGETS,
+from mystic_forge.goldfish import ENGINE_VERSION, autoderive, metrics, report
+from mystic_forge.goldfish.cards import (CONDITIONS, COST_REDUCTION_FILTERS, DAMAGE_TARGETS,
                             GLOBAL_EVENTS, SELF_EVENTS, SPELL_CAST_FILTERS,
                             STATIC_KINDS, SYMBOLIC_COUNTS, TUTOR_FILTERS, VERBS,
                             SimCard, merge_card, validate_annotations)
-from goldfish.engine import (Game, IllegalAction, MulliganRules,
+from mystic_forge.goldfish.engine import (Game, IllegalAction, MulliganRules,
                              auto_mulligan, effective_power,
                              ensure_synthetic_cards, legal_actions, new_game,
                              step)
-from goldfish.odds import odds_at_least, odds_groups
-from goldfish.policy import choose_action
-from goldfish.runner import is_binary_ab_metric, run_ab, run_batch
+from mystic_forge.goldfish.odds import odds_at_least, odds_groups
+from mystic_forge.goldfish.policy import choose_action
+from mystic_forge.goldfish.runner import is_binary_ab_metric, run_ab, run_batch
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -2825,7 +2825,8 @@ async def scryfall_rulings(params: RulingsInput) -> str:
 # RULEBOOK — Comprehensive Rules lookup and search
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CR_VENDORED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MagicCompRules.txt")
+CR_VENDORED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "mystic_forge", "data", "MagicCompRules.txt")
 CR_CACHE_PATH = os.environ.get("MYSTIC_FORGE_CR", "cr_cache.txt")
 CR_REFRESH_INTERVAL = 86400.0
 CR_RETRY_INTERVAL = 300.0  # retry window when we have nothing to serve
@@ -5613,7 +5614,8 @@ async def og_image(request: Request):
     """Static Open Graph banner for link previews (no perishable data)."""
     from starlette.responses import FileResponse
     return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                     "og.png"), media_type="image/png")
+                                     "mystic_forge", "data", "og.png"),
+                        media_type="image/png")
 
 
 @mcp.custom_route("/health", methods=["GET"])

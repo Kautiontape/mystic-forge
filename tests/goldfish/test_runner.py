@@ -6,9 +6,9 @@ from collections import Counter
 
 import pytest
 
-from goldfish.cards import SimCard, parse_cost
-from goldfish.engine import MulliganRules, auto_mulligan, new_game
-from goldfish.runner import align_decks, play_one_game, run_ab, run_batch
+from mystic_forge.goldfish.cards import SimCard, parse_cost
+from mystic_forge.goldfish.engine import MulliganRules, auto_mulligan, new_game
+from mystic_forge.goldfish.runner import align_decks, play_one_game, run_ab, run_batch
 from tests.goldfish.helpers import annotated, make_data, mini_cards, small_deck
 
 # -- plan tests ---------------------------------------------------------------

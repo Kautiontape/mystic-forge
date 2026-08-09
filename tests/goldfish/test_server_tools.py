@@ -13,10 +13,10 @@ import pydantic
 import pytest
 
 import server as srv
-from goldfish.cards import AnnotationError, validate_annotations
-from goldfish.odds import odds_at_least
-from goldfish.report import run_code
-from goldfish.runner import AB_BINARY_METRICS, is_binary_ab_metric
+from mystic_forge.goldfish.cards import AnnotationError, validate_annotations
+from mystic_forge.goldfish.odds import odds_at_least
+from mystic_forge.goldfish.report import run_code
+from mystic_forge.goldfish.runner import AB_BINARY_METRICS, is_binary_ab_metric
 from tests.goldfish.helpers import (
     MINI_DECK_TEXT,
     MINI_SCRYFALL,
@@ -383,7 +383,7 @@ def test_goldfish_run_mulligan_input_validated():
 def test_goldfish_mulligan_model_mirrors_rules_fields():
     from dataclasses import fields as dc_fields
 
-    from goldfish.engine import MulliganRules
+    from mystic_forge.goldfish.engine import MulliganRules
     assert (set(srv.GoldfishMulliganInput.model_fields)
             == {f.name for f in dc_fields(MulliganRules)})
 

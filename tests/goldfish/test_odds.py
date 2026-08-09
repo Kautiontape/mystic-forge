@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from goldfish.odds import odds_at_least, odds_groups
+from mystic_forge.goldfish.odds import odds_at_least, odds_groups
 
 
 def test_single_group_matches_closed_form():
@@ -88,8 +88,8 @@ def test_single_group_via_odds_groups_matches_odds_at_least():
 def test_sim_matches_hypergeometric_within_1pct():
     # Acceptance criterion 3: >=1 Runner in the opening 7 (mulligans skew the
     # kept-hand distribution, so disable them via a wide-open keep window).
-    from goldfish.engine import MulliganRules
-    from goldfish.runner import run_batch
+    from mystic_forge.goldfish.engine import MulliganRules
+    from mystic_forge.goldfish.runner import run_batch
     from tests.goldfish.helpers import mini_cards
 
     cards = mini_cards()

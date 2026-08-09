@@ -18,8 +18,8 @@ import urllib.parse
 from datetime import datetime, timezone
 from html import escape as esc
 
-import watchlist_db
-import watchlist_ingest
+from . import db as watchlist_db
+from . import ingest as watchlist_ingest
 
 EVENTS_PER_PAGE = 15
 CARDS_PER_PAGE = 24

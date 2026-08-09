@@ -15,7 +15,7 @@ from datetime import date
 import httpx
 import ijson
 
-import watchlist_db
+from . import db as watchlist_db
 
 log = logging.getLogger("mystic_forge.ingest")
 
