@@ -48,13 +48,20 @@ from goldfish.runner import is_binary_ab_metric, run_ab, run_batch
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
+# Release version, single source of truth for the image tag, /health, and the
+# outbound User-Agent. Read from the file rather than duplicated in code so the
+# release checks in mcp-servers can resolve it at any pinned commit.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "VERSION"), encoding="utf-8") as _version_file:
+    VERSION = _version_file.read().strip()
+
 SCRYFALL_API = "https://api.scryfall.com"
 EDHREC_JSON = "https://json.edhrec.com"
 EDHREC_API = "https://edhrec.com/api"
 ARCHIDEKT_API = "https://archidekt.com/api"
 SPELLBOOK_API = "https://backend.commanderspellbook.com"
 MTGJSON_API = "https://mtgjson.com/api/v5"
-USER_AGENT = "MysticForge/1.0"
+USER_AGENT = f"MysticForge/{VERSION}"
 REQUEST_TIMEOUT = 15.0
 
 # Precon name → slug fuzzy-match gate (Decision D3). Tunable.
@@ -5274,7 +5281,8 @@ async def health(request: Request):
         row = db.execute("SELECT value FROM meta WHERE key='last_ingest'").fetchone()
         db.close()
     except Exception as e:
-        return JSONResponse({"status": "error", "db": False, "error": str(e)},
+        return JSONResponse({"status": "error", "version": VERSION,
+                             "db": False, "error": str(e)},
                             status_code=500)
     last = row["value"] if row else None
     stale = False
@@ -5285,6 +5293,7 @@ async def health(request: Request):
         stale = True
     return JSONResponse({
         "status": "degraded" if stale else "ok",
+        "version": VERSION,
         "db": True, "lists": lists, "watched_cards": cards,
         "last_ingest": last, "ingest_stale": stale,
     })
