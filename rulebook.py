@@ -32,6 +32,11 @@ _SECTION_RE = re.compile(r"^(\d)\. (.*)$")
 _RULE_REF_RE = re.compile(r"(?<!\d)(\d{3}(?:\.\d+)?[a-z]{0,2})(?!\d)")
 _EFFECTIVE_RE = re.compile(r"effective as of (\w+) (\d{1,2}), (\d{4})")
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
+_STOPWORDS = frozenset(
+    "a an and are as at be by can do does for from had has have how i if in "
+    "into is it its of on or that the their them then there this to was were "
+    "what when where which who whose why will with you your".split()
+)
 
 _MONTHS = {name: i for i, name in enumerate(
     ["January", "February", "March", "April", "May", "June", "July",
@@ -90,16 +95,22 @@ class RulesIndex:
             yield display, "glossary", f"{display} {definition}"
 
     def search(self, query: str, limit: int = 10) -> tuple[list[SearchHit], int]:
-        """Ranked hits over rules + glossary and the total match count.
+        """Ranked hits over rules + glossary.
 
         Scoring: term frequency dampened by document length, x3 when every
-        query term is present, x2 when the terms appear as a phrase.
+        query term is present, x2 when the terms appear as a phrase. Stop
+        words are dropped from the query before matching, unless doing so
+        would leave nothing to search on. total = documents containing
+        every significant query term (falls back to the any-term count
+        when none has all).
         """
-        q = _tokenize(query)
-        if not q:
+        raw = _tokenize(query)
+        if not raw:
             return [], 0
+        q = [t for t in raw if t not in _STOPWORDS] or raw
         phrase = " ".join(q)
         hits: list[SearchHit] = []
+        strict_total = 0
         for ref, kind, text in self._documents():
             tokens = _tokenize(text)
             if not tokens:
@@ -109,13 +120,16 @@ class RulesIndex:
             if not matched:
                 continue
             score = matched / (1.0 + len(tokens) / 200.0)
-            if all(counts[t] for t in q):
+            all_present = all(counts[t] for t in q)
+            if all_present:
+                strict_total += 1
                 score *= 3.0
-            if len(q) > 1 and phrase in " ".join(tokens):
+            if len(q) > 1 and f" {phrase} " in f" {' '.join(tokens)} ":
                 score *= 2.0
             hits.append(SearchHit(ref=ref, kind=kind, text=text, score=score))
         hits.sort(key=lambda h: (-h.score, h.ref))
-        return hits[:limit], len(hits)
+        total = strict_total or len(hits)
+        return hits[:max(0, limit)], total
 
 
 def parse(text: str) -> RulesIndex:

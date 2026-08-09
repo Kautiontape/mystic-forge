@@ -86,8 +86,8 @@ def test_suggest_close_matches(idx):
 
 def test_search_all_terms_ranked_first(idx):
     hits, total = idx.search("deathtouch state-based actions")
-    assert hits[0].ref in {"702.2b", "704.5m"}
-    assert total >= 2
+    assert hits[0].ref == "702.2b"
+    assert total == 2  # 702.2b and 704.5m contain every significant term
 
 
 def test_search_phrase_match_wins(idx):
@@ -136,3 +136,22 @@ def test_real_cr_parses_structurally():
     hits, _ = idx.search("bands with other", limit=10)
     gl = [h for h in hits if h.kind == "glossary" and "Bands with Other" in h.ref]
     assert len(gl) == 1
+
+
+def test_search_ranking_real_cr():
+    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    idx = rulebook.parse(real)
+
+    def top(query, n=5):
+        hits, _ = idx.search(query, limit=n)
+        return [h.ref for h in hits]
+
+    assert any(r.startswith("704") for r in top("state-based actions"))
+    assert any(r.startswith("613") for r in top("layers continuous effects"))
+    assert any(r.startswith("601.2") for r in top("casting a spell"))
+    assert "103.5" in top("mulligan")
+    # Stopword handling: natural-language phrasing must reach the token rules.
+    assert any(r.startswith("111") for r in top("when does a token cease to exist"))
+    # Deterministic ordering: same query, same ranked refs, across parses.
+    idx2 = rulebook.parse(real)
+    assert top("deathtouch", 10) == [h.ref for h in idx2.search("deathtouch", limit=10)[0]]
