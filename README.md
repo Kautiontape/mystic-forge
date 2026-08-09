@@ -46,6 +46,12 @@ A unified MCP (Model Context Protocol) server for Magic: The Gathering. Combines
 | `precon_export` | Export a precon in Archidekt import format |
 | `precon_diff` | Exact cut/added cards between a precon and a specific deck |
 
+### Comprehensive Rules
+| Tool | Description |
+|---|---|
+| `rules_get` | Exact CR text by rule number (`702.2b`) or keyword/glossary term |
+| `rules_search` | Ranked full-text search over rules and glossary |
+
 ## Quick Start
 
 ### Docker
