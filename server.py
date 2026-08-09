@@ -2873,6 +2873,24 @@ def _rule_line(rule: rulebook.Rule) -> str:
     return f"{rule.number}{sep}{rule.text}"
 
 
+def _first_sentence(text: str) -> str:
+    """First sentence of a rule's first line, for compact listings."""
+    first_line = text.split("\n", 1)[0]
+    dot = first_line.find(". ")
+    return first_line[: dot + 1] if dot != -1 else first_line
+
+
+def _child_listing(idx: rulebook.RulesIndex, rule: rulebook.Rule, brief: bool) -> list[str]:
+    """One line per child; brief mode trims each to its first sentence."""
+    lines = []
+    for c in rule.children:
+        child = idx.rules[c]
+        sep = " " if child.number[-1].isalpha() else ". "
+        text = _first_sentence(child.text) if brief else child.text.split("\n", 1)[0]
+        lines.append(f"- {child.number}{sep}{text}")
+    return lines
+
+
 def _rule_with_subrules(idx: rulebook.RulesIndex, rule: rulebook.Rule) -> list[str]:
     parts = [_rule_line(rule)]
     for child in rule.children:
@@ -2927,22 +2945,28 @@ async def rules_get(params: RulesGetInput) -> str:
         parts = [_rules_header(idx), ""]
         if len(ref) <= 3:  # section or subsection: children as one-liners
             parts.append(_rule_line(rule))
-            parts.extend(f"- {_rule_line(idx.rules[c])}" for c in rule.children)
-            if rule.children:
+            if not rule.children:
+                parts += ["", f"(No numbered rules under {ref} — try a more "
+                              "specific number or rules_search.)"]
+            else:
+                listing = _child_listing(idx, rule, brief=False)
+                if len("\n".join(parts + listing)) > RULES_GET_MAX_CHARS:
+                    listing = _child_listing(idx, rule, brief=True)
+                parts.extend(listing)
                 parts += ["", f"Call rules_get with a specific number "
-                              f"(e.g. '{rule.children[0]}') for full text."]
+                              f"(e.g. '{rule.children[0]}') to expand it."]
         elif ref[-1].isalpha():  # subrule: parent heading for context
             parent = idx.rules.get(rule.parent or "")
             if parent is not None:
                 parts.append(_rule_line(parent))
             parts.append(_rule_line(rule))
-        else:  # rule: full text with subrules, capped
+        else:  # rule: full text with subrules; trim to snippets when too large
             body = _rule_with_subrules(idx, rule)
-            if sum(len(p) for p in body) > RULES_GET_MAX_CHARS:
+            if len("\n".join(body)) > RULES_GET_MAX_CHARS:
                 body = [_rule_line(rule), ""]
-                body += [f"- {c}" for c in rule.children]
-                body += ["", "(Too long to include every subrule — call "
-                             "rules_get on a specific subrule number.)"]
+                body += _child_listing(idx, rule, brief=True)
+                body += ["", "(Subrules trimmed to first sentences — call "
+                             "rules_get on a subrule number for full text.)"]
             parts.extend(body)
         return "\n".join(parts)
 

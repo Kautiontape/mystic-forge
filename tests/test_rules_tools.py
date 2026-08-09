@@ -227,3 +227,33 @@ async def test_get_when_no_rules_available(monkeypatch):
     monkeypatch.setitem(server._rules_state, "checked_at", time.time())
     out = await server.rules_get(server.RulesGetInput(ref="702.2"))
     assert "unavailable" in out
+
+
+async def test_get_rule_over_cap_lists_subrule_snippets(monkeypatch):
+    _install_index(monkeypatch)
+    monkeypatch.setattr(server, "RULES_GET_MAX_CHARS", 120)
+    out = await server.rules_get(server.RulesGetInput(ref="702.2"))
+    assert "702.2. Deathtouch" in out
+    assert "- 702.2a Deathtouch is a static ability." in out
+    assert "Subrules trimmed" in out
+    assert "See rule 704" not in out  # 702.2b trimmed to its first sentence
+
+
+async def test_get_subsection_listing_is_single_line_per_child(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_get(server.RulesGetInput(ref="702"))
+    assert "Example:" not in out  # 702.1's attached Example stays out of listings
+
+
+async def test_get_childless_subsection_points_elsewhere(monkeypatch):
+    text = FIXTURE.replace("creature is destroyed.\n",
+                           "creature is destroyed.\n\n705. Dead End\n", 1)
+    _install_index(monkeypatch, text)
+    out = await server.rules_get(server.RulesGetInput(ref="705"))
+    assert "705. Dead End" in out
+    assert "rules_search" in out
+
+
+def test_rules_num_re_accepts_two_letter_subrules():
+    assert server._RULES_NUM_RE.fullmatch("704.5aa")
+    assert not server._RULES_NUM_RE.fullmatch("704.5aaa")
