@@ -2736,11 +2736,11 @@ CR_CACHE_PATH = os.environ.get("MYSTIC_FORGE_CR", "cr_cache.txt")
 CR_REFRESH_INTERVAL = 86400.0
 CR_MIN_RULES = 1000  # a real CR has ~3,300 numbered rules; reject partial downloads
 
-_rules_state: dict[str, Any] = {"index": None, "checked_at": 0.0}
+_rules_state: dict[str, Any] = {"index": None, "checked_at": 0.0, "source_date": ""}
 _rules_lock = asyncio.Lock()
 
 _CR_TXT_RE = re.compile(r"https://media\.wizards\.com/[^\"']*?\.txt")
-_CR_DATE_RE = re.compile(r"(\d{8})")
+_CR_DATE_RE = re.compile(r"(\d{8})\.txt$")
 
 
 def _rules_plausible(idx: rulebook.RulesIndex) -> bool:
@@ -2748,8 +2748,10 @@ def _rules_plausible(idx: rulebook.RulesIndex) -> bool:
 
 
 def _load_rules_from_disk() -> Optional[rulebook.RulesIndex]:
-    """Newest first: the refresh cache, then the vendored snapshot."""
+    """Best available local copy: the newer of the refresh cache and the
+    vendored snapshot (a git pull can leapfrog a stale cache)."""
     log = logging.getLogger("mystic_forge")
+    best = None
     for path in (CR_CACHE_PATH, CR_VENDORED_PATH):
         try:
             with open(path, encoding="utf-8-sig") as f:
@@ -2761,10 +2763,12 @@ def _load_rules_from_disk() -> Optional[rulebook.RulesIndex]:
         except ValueError:
             log.warning("CR copy at %s is malformed; skipping", path)
             continue
-        if _rules_plausible(idx):
-            return idx
-        log.warning("CR copy at %s failed the sanity check; skipping", path)
-    return None
+        if not _rules_plausible(idx):
+            log.warning("CR copy at %s failed the sanity check; skipping", path)
+            continue
+        if best is None or idx.effective_yyyymmdd > best.effective_yyyymmdd:
+            best = idx
+    return best
 
 
 async def _fetch_page_text(url: str, timeout: float = REQUEST_TIMEOUT) -> str:
@@ -2778,14 +2782,19 @@ def _discover_cr_url(page_html: str) -> Optional[tuple[str, str]]:
     """Extract (fetchable txt URL, YYYYMMDD stamp) from the rules page.
 
     The href contains a literal space ('MagicCompRules 20260807.txt') that
-    must be percent-encoded before fetching.
+    must be percent-encoded before fetching. If several .txt links appear,
+    the one with the newest filename date wins.
     """
-    m = _CR_TXT_RE.search(page_html)
-    if not m:
+    best = None  # (date, raw url)
+    for raw in _CR_TXT_RE.findall(page_html):
+        raw = urllib.parse.unquote(raw)
+        dm = _CR_DATE_RE.search(raw)
+        date = dm.group(1) if dm else ""
+        if best is None or date > best[0]:
+            best = (date, raw)
+    if best is None:
         return None
-    raw = m.group(0)
-    dm = _CR_DATE_RE.search(raw)
-    return urllib.parse.quote(raw, safe=":/"), (dm.group(1) if dm else "")
+    return urllib.parse.quote(best[1], safe=":/"), best[0]
 
 
 async def _get_rules_index() -> Optional[rulebook.RulesIndex]:
@@ -2794,10 +2803,12 @@ async def _get_rules_index() -> Optional[rulebook.RulesIndex]:
     on the network."""
     async with _rules_lock:
         if _rules_state["index"] is None:
-            _rules_state["index"] = await asyncio.to_thread(_load_rules_from_disk)
+            loaded = await asyncio.to_thread(_load_rules_from_disk)
+            if _rules_state["index"] is None:  # a refresh may have landed meanwhile
+                _rules_state["index"] = loaded
         if time.time() - _rules_state["checked_at"] >= CR_REFRESH_INTERVAL:
             _rules_state["checked_at"] = time.time()
-            asyncio.create_task(_refresh_rules())
+            _rules_state["refresh_task"] = asyncio.create_task(_refresh_rules())
     return _rules_state["index"]
 
 
@@ -2810,7 +2821,8 @@ async def _refresh_rules() -> None:
             return
         url, new_date = found
         cur = _rules_state["index"]
-        if cur is not None and new_date and new_date <= cur.effective_yyyymmdd:
+        cur_date = _rules_state["source_date"] or (cur.effective_yyyymmdd if cur else "")
+        if cur is not None and new_date and cur_date and new_date <= cur_date:
             return
         text = await _fetch_page_text(url, timeout=60.0)
         idx = await asyncio.to_thread(rulebook.parse, text)
@@ -2818,14 +2830,19 @@ async def _refresh_rules() -> None:
             log.warning("CR refresh: download failed the sanity check; keeping current rules")
             return
         _rules_state["index"] = idx
+        _rules_state["source_date"] = new_date
         try:
-            with open(CR_CACHE_PATH, "w", encoding="utf-8") as f:
+            tmp_path = CR_CACHE_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(text)
+            os.replace(tmp_path, CR_CACHE_PATH)
         except OSError:
             log.warning("CR refresh: could not write cache to %s", CR_CACHE_PATH, exc_info=True)
         log.info("CR refreshed; now effective %s", idx.effective_date)
     except Exception:
         log.warning("CR refresh failed; keeping current rules", exc_info=True)
+        if _rules_state["index"] is None:
+            _rules_state["checked_at"] = 0.0  # nothing to serve; allow a prompt retry
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
