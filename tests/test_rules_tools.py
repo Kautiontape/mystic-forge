@@ -186,6 +186,12 @@ async def test_get_subrule_includes_parent_heading(monkeypatch):
     assert "702.2a" not in out  # siblings stay out of a subrule lookup
 
 
+async def test_get_uppercase_subrule_letter(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_get(server.RulesGetInput(ref="702.2B"))
+    assert "destroyed as a state-based action" in out
+
+
 async def test_get_rule_includes_all_subrules(monkeypatch):
     _install_index(monkeypatch)
     out = await server.rules_get(server.RulesGetInput(ref="702.2"))

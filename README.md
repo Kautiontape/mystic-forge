@@ -98,6 +98,8 @@ cp .env.example .env
 
 **Important:** Never deploy credentials on a shared/public server. Private deck access is for self-hosted instances only.
 
+`MYSTIC_FORGE_CR` is optional: it sets where the auto-refreshed Comprehensive Rules cache is written; it defaults to the working directory.
+
 ## Price watchlist
 
 Personal MTG price watchlists with ~90 days of MTGJSON daily history.

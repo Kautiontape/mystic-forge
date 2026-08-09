@@ -55,7 +55,6 @@ class Rule:
 class SearchHit:
     ref: str
     kind: str  # "rule" | "glossary"
-    text: str
     score: float
 
 
@@ -125,7 +124,7 @@ class RulesIndex:
                 score *= 3.0
             if len(q) > 1 and f" {phrase} " in f" {' '.join(tokens)} ":
                 score *= 2.0
-            hits.append(SearchHit(ref=ref, kind=kind, text=text, score=score))
+            hits.append(SearchHit(ref=ref, kind=kind, score=score))
         hits.sort(key=lambda h: (-h.score, h.ref))
         return hits[:max(0, limit)], len(hits)
 

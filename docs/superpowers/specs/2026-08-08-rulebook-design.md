@@ -70,8 +70,10 @@ network, unit-testable against a fixture file.
     carry a title; subrules (`702.2a …`) attach to their parent; subsections
     (`100. General`) and sections (`1. Game Concepts`) keep child lists.
   - `glossary`: case-insensitive term → definition (original casing preserved
-    for display), with rule references extracted from each definition via a
-    `rule NNN(.N)(x)` regex.
+    for display), with rule references extracted from each definition by
+    matching any rule-shaped number token (not anchored to the word "rule"),
+    which also catches list forms like "rules 702.2, 702.3, and 702.4";
+    verified zero false positives across the full corpus.
   - `effective_date`: parsed from the "effective as of" line.
 - `RulesIndex.search(query, limit)`: tokenized scoring over rules plus glossary
   entries — term frequency, an all-terms-present boost, and an adjacency bonus

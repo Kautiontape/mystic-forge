@@ -6,6 +6,7 @@ services:
       - "8000:8000"
     environment:
       - MYSTIC_FORGE_DB=/data/mystic_forge.db
+      - MYSTIC_FORGE_CR=/data/cr_cache.txt
     volumes:
       - mystic_forge_data:/data
     healthcheck:

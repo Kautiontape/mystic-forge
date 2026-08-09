@@ -2813,7 +2813,7 @@ async def _get_rules_index() -> Optional[rulebook.RulesIndex]:
                 _rules_state["index"] = loaded
         if time.time() - _rules_state["checked_at"] >= CR_REFRESH_INTERVAL:
             _rules_state["checked_at"] = time.time()
-            _rules_state["refresh_task"] = asyncio.create_task(_refresh_rules())
+            _rules_state["refresh_task"] = asyncio.create_task(_refresh_rules())  # strong ref: keeps the task from being GC'd mid-flight
     return _rules_state["index"]
 
 
@@ -2973,9 +2973,10 @@ async def rules_get(params: RulesGetInput) -> str:
     if idx is None:
         return _rules_unavailable()
     ref = params.ref.rstrip(".")
+    nref = ref.lower()
 
-    if _RULES_NUM_RE.fullmatch(ref):
-        rule = idx.rules.get(ref)
+    if _RULES_NUM_RE.fullmatch(nref):
+        rule = idx.rules.get(nref)
         if rule is None:
             return _rules_not_found(idx, ref)
         parts = [_rules_header(idx), ""]
@@ -2999,7 +3000,7 @@ async def rules_get(params: RulesGetInput) -> str:
         else:  # rule: full text with subrules; trim to snippets when too large
             body = _rule_with_subrules(idx, rule)
             if len("\n".join(body)) > RULES_GET_MAX_CHARS:
-                body = [_rule_line(rule), ""]
+                body = [_rule_line(rule)]
                 body += _child_listing(idx, rule, brief=True)
                 body += ["", "(Subrules trimmed to first sentences — call "
                              "rules_get on a subrule number for full text.)"]
