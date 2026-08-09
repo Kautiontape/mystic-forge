@@ -2925,16 +2925,32 @@ def _rules_glossary_get(idx: rulebook.RulesIndex, ref: str) -> str:
         return _rules_not_found(idx, ref)
     display = idx.glossary_display[ref.lower()]
     parts = [_rules_header(idx), "", f"Glossary: {display}", definition]
+    omitted: list[str] = []
     for num in idx.glossary_refs(ref):
         rule = idx.rules.get(num)
         if rule is None:
             continue
-        block = _rule_with_subrules(idx, rule)
-        if len("\n".join(parts)) + len("\n".join(block)) > RULES_GET_MAX_CHARS:
-            parts += ["", f"(Rule {num} omitted for length — call rules_get('{num}').)"]
-            continue
+        if len(num) <= 3 and rule.children:
+            # Cited section/subsection: list its rules like rules_get(num) would.
+            block = [_rule_line(rule)]
+            block += _child_listing(idx, rule, brief=False)
+            block += [f"Call rules_get with a specific number "
+                      f"(e.g. '{rule.children[0]}') to expand it."]
+        else:
+            block = _rule_with_subrules(idx, rule)
+        budget = RULES_GET_MAX_CHARS - len("\n".join(parts))
+        if len("\n".join(block)) > budget:
+            if rule.children:
+                block = [_rule_line(rule)]
+                block += _child_listing(idx, rule, brief=True)
+                block += [f"(Trimmed — call rules_get('{num}') for full text.)"]
+            if not rule.children or len("\n".join(block)) > budget:
+                omitted.append(num)
+                continue
         parts.append("")
         parts.extend(block)
+    for num in omitted:
+        parts += ["", f"(Rule {num} omitted for length — call rules_get('{num}').)"]
     return "\n".join(parts)
 
 

@@ -84,6 +84,13 @@ def test_suggest_close_matches(idx):
     assert any(s.startswith("702.2") for s in idx.suggest("702.9"))
 
 
+def test_suggest_case_folds_and_recovers_obsolete_terms():
+    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    idx = rulebook.parse(real)
+    assert any("Mana Burn" in s for s in idx.suggest("mana burn"))
+    assert "Stack" in idx.suggest("the stack")
+
+
 def test_search_all_terms_ranked_first(idx):
     hits, total = idx.search("deathtouch state-based actions")
     assert hits[0].ref == "702.2b"

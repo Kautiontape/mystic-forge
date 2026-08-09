@@ -295,3 +295,39 @@ async def test_get_glossary_caps_expansion(monkeypatch):
     assert "Glossary: Deathtouch" in out
     assert "702.2a Deathtouch is a static ability." not in out
     assert "omitted for length" in out
+
+
+async def test_get_glossary_subsection_citation_lists_rules(monkeypatch):
+    text = FIXTURE.replace(
+        "Dies\n", "Dead\nSee rule 704, “State-Based Actions.”\n \nDies\n", 1)
+    _install_index(monkeypatch, text)
+    out = await server.rules_get(server.RulesGetInput(ref="dead"))
+    assert "- 704.5. The state-based actions are as follows:" in out
+    assert "to expand it" in out
+    assert "704.5k" not in out  # grandchildren stay behind the pointer
+
+
+async def test_get_glossary_omission_notice_comes_last(monkeypatch):
+    text = FIXTURE.replace(
+        "Dies\n", "Both\nSee rule 702.2 and rule 100.1.\n \nDies\n", 1)
+    _install_index(monkeypatch, text)
+    # Pinned at 450: 702.2's full block (450 chars) and its brief fallback
+    # (470 chars, longer here because the fixture rules are already short)
+    # both exceed the 358-char budget left after the glossary header, so
+    # 702.2 is fully omitted; 100.1's full block (308 chars) fits and expands.
+    monkeypatch.setattr(server, "RULES_GET_MAX_CHARS", 450)
+    out = await server.rules_get(server.RulesGetInput(ref="both"))
+    assert "702.2a" not in out
+    assert out.index("100.1a") < out.index("omitted for length")
+
+
+async def test_glossary_renders_all_real_terms(monkeypatch):
+    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    idx = rulebook.parse(real)
+    monkeypatch.setitem(server._rules_state, "index", idx)
+    monkeypatch.setitem(server._rules_state, "checked_at", time.time())
+    for key in list(idx.glossary):
+        out = await server.rules_get(server.RulesGetInput(ref=key))
+        assert "Glossary:" in out, key
+        assert len(out) <= server.RULES_GET_MAX_CHARS + 200, key
+        assert not out.rstrip().endswith("as follows:"), key  # no dangling list intros

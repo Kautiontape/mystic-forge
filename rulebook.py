@@ -82,8 +82,11 @@ class RulesIndex:
 
     def suggest(self, ref: str, n: int = 5) -> list[str]:
         """Closest rule numbers and glossary terms for a failed lookup."""
-        pool = list(self.rules) + list(self.glossary_display.values())
-        return get_close_matches(ref, pool, n=n, cutoff=0.6)
+        pool: dict[str, str] = {num: num for num in self.rules}
+        for display in self.glossary_display.values():
+            pool.setdefault(display.lower(), display)
+        matches = get_close_matches(ref.lower(), list(pool), n=n, cutoff=0.6)
+        return [pool[m] for m in matches]
 
     def _documents(self):
         for number, rule in self.rules.items():
@@ -205,10 +208,47 @@ def _parse_glossary(idx: RulesIndex, lines: list[str]) -> None:
         display = idx.glossary_display[key]
         if "," not in display:
             continue
-        for part in display.split(","):
-            alias_display = part.strip().strip("“”\"")
+        for part in _split_headword_parts(display):
+            alias_display = part.strip().strip("“”\"").strip().rstrip(",;:").strip()
             alias = alias_display.lower()
             if alias and alias not in idx.glossary:
                 idx.glossary[alias] = idx.glossary[key]
                 idx.glossary_display[alias] = alias_display
                 idx.glossary_aliases.add(alias)
+
+
+def _split_headword_parts(display: str) -> list[str]:
+    """Split a compound headword into its comma-separated alternatives.
+
+    Commas act as separators, except inside a "curly-quoted" phrase — CR
+    style places trailing punctuation inside the closing quote (e.g.
+    'Partner, "Partner—[text]," "Partner with [name]"'), so a naive
+    str.split(",") would fracture that quoted phrase at its internal comma.
+    Each quoted span is instead kept intact as a single part.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(display)
+    while i < n:
+        ch = display[i]
+        if ch == "“":
+            if buf and "".join(buf).strip(" ,"):
+                parts.append("".join(buf))
+            buf = []
+            j = display.find("”", i + 1)
+            if j == -1:
+                j = n - 1
+            parts.append(display[i:j + 1])
+            i = j + 1
+            continue
+        if ch == ",":
+            if buf and "".join(buf).strip(" ,"):
+                parts.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    if buf and "".join(buf).strip(" ,"):
+        parts.append("".join(buf))
+    return parts
