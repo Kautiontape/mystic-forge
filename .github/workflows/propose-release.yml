@@ -1,0 +1,122 @@
+name: propose release
+
+# Opens (or updates) a PR in Kautiontape/mcp-servers bumping this repo's
+# submodule pin. Merging that PR is what deploys — this workflow never touches
+# production itself.
+#
+# Requires the repo secret MCP_SERVERS_RELEASE_TOKEN: a fine-grained PAT owned by
+# the Kautiontape org, scoped to Kautiontape/mcp-servers only, with
+# Contents: read+write and Pull requests: read+write. The built-in GITHUB_TOKEN
+# is repo-scoped and cannot write to another repository.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: propose-release
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_REPO: Kautiontape/mcp-servers
+      RELEASE_BRANCH: release/mystic-forge
+      NEW_SHA: ${{ github.sha }}
+    steps:
+      - name: Check out mcp-servers
+        uses: actions/checkout@v4
+        with:
+          repository: Kautiontape/mcp-servers
+          token: ${{ secrets.MCP_SERVERS_RELEASE_TOKEN }}
+          fetch-depth: 0
+          submodules: recursive
+          path: mcp-servers
+
+      - name: Bump the submodule pin
+        id: bump
+        working-directory: mcp-servers
+        run: |
+          set -euo pipefail
+
+          OLD_SHA=$(git ls-tree HEAD mystic-forge | awk '{print $3}')
+          echo "current pin: $OLD_SHA"
+          echo "proposed:    $NEW_SHA"
+
+          if [ "$OLD_SHA" = "$NEW_SHA" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Pin is already current; nothing to propose."
+            exit 0
+          fi
+
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # Build on top of an existing release branch rather than resetting to
+          # main, so hand-written changelog commits pushed to the open PR survive
+          # a later bump.
+          if git ls-remote --exit-code --heads origin "$RELEASE_BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$RELEASE_BRANCH"
+            git checkout -B "$RELEASE_BRANCH" "origin/$RELEASE_BRANCH"
+          else
+            git checkout -B "$RELEASE_BRANCH" origin/main
+          fi
+
+          git -C mystic-forge fetch origin
+          git -C mystic-forge checkout --detach "$NEW_SHA"
+
+          VERSION=$(tr -d '[:space:]' < mystic-forge/VERSION)
+
+          git add mystic-forge
+          if git diff --cached --quiet; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release branch already points at $NEW_SHA."
+            exit 0
+          fi
+
+          git commit -m "mystic-forge: Bump to ${VERSION} (${NEW_SHA:0:7})"
+          git push origin "$RELEASE_BRANCH"
+
+          {
+            echo "skip=false"
+            echo "version=$VERSION"
+            echo "old_sha=$OLD_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the release PR
+        if: steps.bump.outputs.skip == 'false'
+        working-directory: mcp-servers
+        env:
+          GH_TOKEN: ${{ secrets.MCP_SERVERS_RELEASE_TOKEN }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          OLD_SHA: ${{ steps.bump.outputs.old_sha }}
+        run: |
+          set -euo pipefail
+
+          {
+            printf 'Bumps the `mystic-forge` pin to `%s` (version **%s**).\n\n' "$NEW_SHA" "$VERSION"
+            printf 'Merging this deploys. Nothing reaches production until then.\n\n'
+            printf '### Commits\n\n'
+            git -C mystic-forge log --format='- %s' "${OLD_SHA}..${NEW_SHA}" \
+              || printf -- '- (range unavailable)\n'
+            printf '\n### Before merging\n\n'
+            printf -- '- [ ] `landing/mtg/changelog/index.html` has an entry with `data-version="%s"`\n' "$VERSION"
+            printf -- '- [ ] The teaser in `landing/mtg/index.html` carries the same `data-version`\n'
+            printf -- '- [ ] Tool tags on the page match the tool list at this pin\n\n'
+            printf '`release-checks` enforces all three. Push changelog edits to this branch.\n'
+          } > /tmp/pr-body.md
+
+          if gh pr view "$RELEASE_BRANCH" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            gh pr edit "$RELEASE_BRANCH" --repo "$TARGET_REPO" \
+              --title "mystic-forge: Release ${VERSION}" \
+              --body-file /tmp/pr-body.md
+          else
+            gh pr create --repo "$TARGET_REPO" \
+              --base main --head "$RELEASE_BRANCH" \
+              --title "mystic-forge: Release ${VERSION}" \
+              --body-file /tmp/pr-body.md
+          fi
