@@ -3046,8 +3046,8 @@ async def rules_search(params: RulesSearchInput) -> str:
             # First line only: Example blocks belong in rules_get output.
             line = _rule_line(idx.rules[h.ref]).split("\n", 1)[0]
         if len(line) > RULES_SEARCH_HIT_CHARS:
-            line = (line[:RULES_SEARCH_HIT_CHARS].rsplit(" ", 1)[0]
-                    + f" … (rules_get('{h.ref}') for the rest)")
+            suffix = f" … (rules_get('{h.ref}') for the rest)"
+            line = line[:RULES_SEARCH_HIT_CHARS - len(suffix)].rsplit(" ", 1)[0] + suffix
         if used + len(line) > RULES_GET_MAX_CHARS:
             trimmed = len(hits) - len(lines)
             break
@@ -3060,7 +3060,9 @@ async def rules_search(params: RulesSearchInput) -> str:
         parts.append(line)
         parts.append("")
     if trimmed:
-        parts.append(f"({trimmed} more hits trimmed for length — narrow the query or lower the limit.)")
+        hit_word = "hit" if trimmed == 1 else "hits"
+        parts.append(f"({trimmed} more {hit_word} trimmed for length — "
+                     "narrow the query or lower the limit.)")
     return "\n".join(parts)
 
 
