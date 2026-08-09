@@ -361,3 +361,32 @@ async def test_search_tool_unavailable(monkeypatch):
     monkeypatch.setitem(server._rules_state, "checked_at", time.time())
     out = await server.rules_search(server.RulesSearchInput(query="deathtouch"))
     assert "unavailable" in out
+
+
+async def test_search_tool_singular_grammar(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_search(server.RulesSearchInput(query="interchangeably"))
+    assert "1 CR entry mentions these terms" in out
+
+
+async def test_search_output_stays_bounded_real_cr(monkeypatch):
+    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    idx = rulebook.parse(real)
+    monkeypatch.setitem(server._rules_state, "index", idx)
+    monkeypatch.setitem(server._rules_state, "checked_at", time.time())
+    for q in ("what happens when a creature dies", "battlefield", "counter a spell"):
+        out = await server.rules_search(server.RulesSearchInput(query=q, limit=25))
+        assert len(out) <= server.RULES_GET_MAX_CHARS + 500, q
+        assert "Example:" not in out, q  # hits are first-line only
+
+
+async def test_search_compound_headword_roundtrips_real_cr(monkeypatch):
+    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    idx = rulebook.parse(real)
+    monkeypatch.setitem(server._rules_state, "index", idx)
+    monkeypatch.setitem(server._rules_state, "checked_at", time.time())
+    out = await server.rules_search(server.RulesSearchInput(query="bands with other"))
+    label = next(l for l in out.splitlines() if l.startswith("Glossary: Banding"))
+    ref = label[len("Glossary: "):].split(" — ")[0]
+    out2 = await server.rules_get(server.RulesGetInput(ref=ref))
+    assert "Glossary:" in out2

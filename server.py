@@ -2851,6 +2851,7 @@ async def _refresh_rules() -> None:
 
 
 RULES_GET_MAX_CHARS = 10000
+RULES_SEARCH_HIT_CHARS = 400
 
 _RULES_NUM_RE = re.compile(r"^\d{1,3}(?:\.\d+)?[a-z]{0,2}$")
 
@@ -3035,15 +3036,31 @@ async def rules_search(params: RulesSearchInput) -> str:
     if not hits:
         return (f"No Comprehensive Rules matches for '{params.query}'. Try "
                 "different terms, or rules_get with a rule number or keyword.")
-    parts = [_rules_header(idx),
-             f"{total} rules/glossary entries mention these terms; "
-             f"showing the {len(hits)} most relevant:", ""]
+    lines: list[str] = []
+    used = 0
+    trimmed = 0
     for h in hits:
         if h.kind == "glossary":
-            parts.append(f"Glossary: {h.ref} — {idx.glossary[h.ref.lower()]}")
+            line = f"Glossary: {h.ref} — {idx.glossary[h.ref.lower()]}"
         else:
-            parts.append(_rule_line(idx.rules[h.ref]))
+            # First line only: Example blocks belong in rules_get output.
+            line = _rule_line(idx.rules[h.ref]).split("\n", 1)[0]
+        if len(line) > RULES_SEARCH_HIT_CHARS:
+            line = (line[:RULES_SEARCH_HIT_CHARS].rsplit(" ", 1)[0]
+                    + f" … (rules_get('{h.ref}') for the rest)")
+        if used + len(line) > RULES_GET_MAX_CHARS:
+            trimmed = len(hits) - len(lines)
+            break
+        lines.append(line)
+        used += len(line) + 2
+    noun = "CR entry mentions" if total == 1 else "CR entries mention"
+    parts = [_rules_header(idx),
+             f"{total} {noun} these terms; showing the {len(lines)} most relevant:", ""]
+    for line in lines:
+        parts.append(line)
         parts.append("")
+    if trimmed:
+        parts.append(f"({trimmed} more hits trimmed for length — narrow the query or lower the limit.)")
     return "\n".join(parts)
 
 

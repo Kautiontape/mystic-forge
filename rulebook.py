@@ -216,6 +216,15 @@ def _parse_glossary(idx: RulesIndex, lines: list[str]) -> None:
                 idx.glossary_display[alias] = alias_display
                 idx.glossary_aliases.add(alias)
 
+    # Straight-quote variants: clients re-typing curly-quoted headwords must
+    # still resolve them.
+    for key in list(idx.glossary):
+        ascii_key = key.replace("“", '"').replace("”", '"').replace("’", "'")
+        if ascii_key != key and ascii_key not in idx.glossary:
+            idx.glossary[ascii_key] = idx.glossary[key]
+            idx.glossary_display[ascii_key] = idx.glossary_display[key]
+            idx.glossary_aliases.add(ascii_key)
+
 
 def _split_headword_parts(display: str) -> list[str]:
     """Split a compound headword into its comma-separated alternatives.

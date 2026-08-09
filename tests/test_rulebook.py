@@ -162,3 +162,9 @@ def test_search_ranking_real_cr():
     # Deterministic ordering: same query, same ranked refs, across parses.
     idx2 = rulebook.parse(real)
     assert top("deathtouch", 10) == [h.ref for h in idx2.search("deathtouch", limit=10)[0]]
+
+
+def test_glossary_ascii_quote_aliases_real_cr():
+    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    idx = rulebook.parse(real)
+    assert 'banding, "bands with other"' in idx.glossary
