@@ -2920,7 +2920,22 @@ def _rules_not_found(idx: rulebook.RulesIndex, ref: str) -> str:
 
 
 def _rules_glossary_get(idx: rulebook.RulesIndex, ref: str) -> str:
-    return _rules_not_found(idx, ref)
+    definition = idx.glossary.get(ref.lower())
+    if definition is None:
+        return _rules_not_found(idx, ref)
+    display = idx.glossary_display[ref.lower()]
+    parts = [_rules_header(idx), "", f"Glossary: {display}", definition]
+    for num in idx.glossary_refs(ref):
+        rule = idx.rules.get(num)
+        if rule is None:
+            continue
+        block = _rule_with_subrules(idx, rule)
+        if len("\n".join(parts)) + len("\n".join(block)) > RULES_GET_MAX_CHARS:
+            parts += ["", f"(Rule {num} omitted for length — call rules_get('{num}').)"]
+            continue
+        parts.append("")
+        parts.extend(block)
+    return "\n".join(parts)
 
 
 @mcp.tool(name="rules_get")

@@ -257,3 +257,41 @@ async def test_get_childless_subsection_points_elsewhere(monkeypatch):
 def test_rules_num_re_accepts_two_letter_subrules():
     assert server._RULES_NUM_RE.fullmatch("704.5aa")
     assert not server._RULES_NUM_RE.fullmatch("704.5aaa")
+
+
+# ── rules_get: glossary ──────────────────────────────────────────────────────
+
+async def test_get_glossary_expands_cited_rules(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_get(server.RulesGetInput(ref="deathtouch"))
+    assert "Glossary: Deathtouch" in out
+    assert "especially effective" in out
+    assert "702.2a Deathtouch is a static ability." in out  # cited rule expanded
+
+
+async def test_get_glossary_case_insensitive(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_get(server.RulesGetInput(ref="DEATHTOUCH"))
+    assert "Glossary: Deathtouch" in out
+
+
+async def test_get_glossary_missing_cited_rule_is_skipped(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_get(server.RulesGetInput(ref="destroy"))
+    assert "Glossary: Destroy" in out
+    assert "owner’s graveyard" in out  # definition present; missing 701.7 is no crash
+
+
+async def test_get_glossary_typo_suggests_term(monkeypatch):
+    _install_index(monkeypatch)
+    out = await server.rules_get(server.RulesGetInput(ref="deathtuch"))
+    assert "Deathtouch" in out
+
+
+async def test_get_glossary_caps_expansion(monkeypatch):
+    _install_index(monkeypatch)
+    monkeypatch.setattr(server, "RULES_GET_MAX_CHARS", 200)
+    out = await server.rules_get(server.RulesGetInput(ref="deathtouch"))
+    assert "Glossary: Deathtouch" in out
+    assert "702.2a Deathtouch is a static ability." not in out
+    assert "omitted for length" in out
