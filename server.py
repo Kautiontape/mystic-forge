@@ -2734,9 +2734,10 @@ async def scryfall_rulings(params: RulingsInput) -> str:
 CR_VENDORED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MagicCompRules.txt")
 CR_CACHE_PATH = os.environ.get("MYSTIC_FORGE_CR", "cr_cache.txt")
 CR_REFRESH_INTERVAL = 86400.0
+CR_RETRY_INTERVAL = 300.0  # retry window when we have nothing to serve
 CR_MIN_RULES = 1000  # a real CR has ~3,300 numbered rules; reject partial downloads
 
-_rules_state: dict[str, Any] = {"index": None, "checked_at": 0.0, "source_date": ""}
+_rules_state: dict[str, Any] = {"index": None, "checked_at": 0.0, "source_date": "", "refresh_task": None}
 _rules_lock = asyncio.Lock()
 
 _CR_TXT_RE = re.compile(r"https://media\.wizards\.com/[^\"']*?\.txt")
@@ -2830,6 +2831,9 @@ async def _refresh_rules() -> None:
             log.warning("CR refresh: download failed the sanity check; keeping current rules")
             return
         _rules_state["index"] = idx
+        # Deliberately not persisted to disk: on a process restart the effective
+        # date is recomputed from the loaded text, so at worst one extra
+        # download happens if filename and effective dates diverge.
         _rules_state["source_date"] = new_date
         try:
             tmp_path = CR_CACHE_PATH + ".tmp"
@@ -2842,7 +2846,8 @@ async def _refresh_rules() -> None:
     except Exception:
         log.warning("CR refresh failed; keeping current rules", exc_info=True)
         if _rules_state["index"] is None:
-            _rules_state["checked_at"] = 0.0  # nothing to serve; allow a prompt retry
+            # Nothing to serve; allow a retry after CR_RETRY_INTERVAL, not immediately.
+            _rules_state["checked_at"] = time.time() - CR_REFRESH_INTERVAL + CR_RETRY_INTERVAL
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

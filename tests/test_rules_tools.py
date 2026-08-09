@@ -27,6 +27,7 @@ def small_corpus_ok(monkeypatch, tmp_path):
     monkeypatch.setitem(server._rules_state, "index", None)
     monkeypatch.setitem(server._rules_state, "checked_at", 0.0)
     monkeypatch.setitem(server._rules_state, "source_date", "")
+    monkeypatch.setitem(server._rules_state, "refresh_task", None)
     return tmp_path
 
 
@@ -136,6 +137,14 @@ async def test_refresh_malformed_download_rejected(monkeypatch, small_corpus_ok)
     _install_fetch(monkeypatch, {server.RULES_PAGE_URL: html, url: "garbage"})
     await server._refresh_rules()
     assert server._rules_state["index"] is idx
+
+
+async def test_refresh_failure_backs_off_not_zero(monkeypatch, small_corpus_ok):
+    # No disk copy, network down: retry is rate-limited, not immediate.
+    _install_fetch(monkeypatch, {server.RULES_PAGE_URL: httpx.ConnectError("boom")})
+    await server._refresh_rules()
+    remaining = server._rules_state["checked_at"] + server.CR_REFRESH_INTERVAL - time.time()
+    assert server.CR_RETRY_INTERVAL - 5 <= remaining <= server.CR_RETRY_INTERVAL
 
 
 # ── Concurrency ──────────────────────────────────────────────────────────────
