@@ -125,3 +125,97 @@ def daily_through(path: str):
         return _get_meta(db, "daily_through")
     finally:
         db.close()
+
+
+def _iter_points(gz_path: str):
+    """Yield (uuid, src, day, cents) from an MTGJSON prices .gz.
+
+    Shape: data.<uuid>.paper.<provider>.retail.<finish>.<date> = price.
+    Streams with ijson, so peak memory is independent of file size. Unknown
+    providers/finishes and unparseable values are skipped, not fatal — MTGJSON
+    adds providers without warning."""
+    with gzip.open(gz_path, "rb") as f:
+        for uuid, obj in ijson.kvitems(f, "data"):
+            paper = (obj or {}).get("paper") or {}
+            for provider, pdata in paper.items():
+                retail = (pdata or {}).get("retail") or {}
+                for finish, series in retail.items():
+                    src = pack_src(provider, finish)
+                    if src is None:
+                        continue
+                    for d, price in (series or {}).items():
+                        try:
+                            yield uuid, src, to_day(d), to_cents(price)
+                        except (ValueError, TypeError):
+                            continue
+
+
+def _free_bytes(directory: str) -> int:
+    st = os.statvfs(directory)
+    return st.f_bavail * st.f_frsize
+
+
+def build_from_allprices(path: str, gz_path: str) -> int:
+    """Full load from AllPrices.json.gz. Returns points written.
+
+    Builds into <path>.part and atomically renames, so an interrupted build
+    can never leave a file that is_ready() would accept."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    if _free_bytes(directory) < BUILD_HEADROOM:
+        raise OSError(f"not enough free space in {directory} to build the "
+                      f"sidecar ({BUILD_HEADROOM} bytes needed)")
+    part = path + ".part"
+    if os.path.exists(part):
+        os.remove(part)
+    db = sqlite3.connect(part)
+    db.row_factory = sqlite3.Row
+    try:
+        db.executescript(SCHEMA)
+        db.execute("PRAGMA journal_mode=OFF")     # disposable until the rename
+        db.execute("PRAGMA synchronous=OFF")
+        ids: dict[str, int] = {}
+        batch: list[tuple] = []
+        rows = 0
+        for uuid, src, day, cents in _iter_points(gz_path):
+            cid = ids.get(uuid)
+            if cid is None:
+                cid = len(ids) + 1
+                ids[uuid] = cid
+                db.execute("INSERT INTO cards (card_id, uuid) VALUES (?,?)",
+                           (cid, uuid))
+            batch.append((cid, src, day, cents))
+            if len(batch) >= BATCH:
+                db.executemany(
+                    "INSERT OR REPLACE INTO points (card_id,src,day,cents,agg)"
+                    " VALUES (?,?,?,?,0)", batch)
+                rows += len(batch)
+                batch.clear()
+        if batch:
+            db.executemany(
+                "INSERT OR REPLACE INTO points (card_id,src,day,cents,agg)"
+                " VALUES (?,?,?,?,0)", batch)
+            rows += len(batch)
+        newest = db.execute("SELECT MAX(day) AS d FROM points").fetchone()["d"]
+        _set_meta(db, "schema_version", SCHEMA_VERSION)
+        if newest is not None:
+            _set_meta(db, "daily_through", from_day(newest))
+        _set_meta(db, "built_at",
+                  datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        db.commit()
+    except BaseException:
+        db.close()
+        if os.path.exists(part):
+            os.remove(part)
+        raise
+    db.close()
+    # A WAL-mode database is a three-file unit; os.replace is atomic for only
+    # one of them. A stale -wal left by an unclean shutdown would be replayed
+    # over the file we just built, silently resurrecting the old database.
+    for suffix in ("-wal", "-shm"):
+        stale = path + suffix
+        if os.path.exists(stale):
+            os.remove(stale)
+    os.replace(part, path)
+    log.info("sidecar built: %d cards, %d points", len(ids), rows)
+    return rows
