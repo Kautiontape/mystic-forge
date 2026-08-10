@@ -217,3 +217,24 @@ def test_run_ingest_records_last_ingest(db, db_path, tmp_path, monkeypatch):
                        ).fetchone() is not None
     assert db2.execute("SELECT COUNT(*) FROM prices").fetchone()[0] > 0
     db2.close()
+
+
+MANAPOOL_OBJ = {"paper": {"manapool": {"currency": "USD", "retail": {
+    "normal": {"2026-08-08": 4.25}}}}}
+
+
+def test_manapool_is_ingested(db, tmp_path):
+    """MTGJSON added a fourth paper provider; it must be tracked like the rest."""
+    ap = make_allprintings(tmp_path)
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    watchlist_ingest.resolve_watched(db, ap)
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": MANAPOOL_OBJ})
+    watchlist_ingest.ingest_prices_file(db, gz)
+    row = db.execute("SELECT price FROM prices WHERE provider='manapool'").fetchone()
+    assert row is not None and row["price"] == 4.25
+
+
+def test_manapool_is_a_selectable_shop():
+    import watchlist_pages
+    assert watchlist_pages.SHOPS["manapool"] == "$"

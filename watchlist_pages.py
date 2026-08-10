@@ -24,7 +24,8 @@ import watchlist_ingest
 EVENTS_PER_PAGE = 15
 CARDS_PER_PAGE = 24
 
-SHOPS = {"tcgplayer": "$", "cardkingdom": "$", "cardmarket": "€"}
+SHOPS = {"tcgplayer": "$", "cardkingdom": "$", "cardmarket": "€",
+         "manapool": "$"}
 
 # Public path prefix stripped by the gateway (set from PUBLIC_BASE by server.py).
 # Every emitted link and fetch must include it; empty when served at the root.
@@ -1003,7 +1004,7 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
         f'<p class="nodata">{empty_msg}</p>'
 
     shop_names = {"tcgplayer": "TCGplayer", "cardkingdom": "Card Kingdom",
-                  "cardmarket": "Cardmarket"}
+                  "cardmarket": "Cardmarket", "manapool": "Mana Pool"}
     shop_links = "".join(
         f'<a href="{_url(shop=s)}" class="{"on" if s == shop else ""}">{shop_names[s]}</a>'
         for s in SHOPS)

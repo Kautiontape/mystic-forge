@@ -5469,7 +5469,7 @@ class PriceHistoryInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(..., description="Card name")
     days: int = Field(90, description="Days of history")
-    provider: str = Field("tcgplayer", description="tcgplayer | cardkingdom | cardmarket")
+    provider: str = Field("tcgplayer", description="tcgplayer | cardkingdom | cardmarket | manapool")
     set_code: Optional[str] = Field(None, description="Pin a specific printing: set code")
     collector_number: Optional[str] = Field(None, description="Pin a specific printing: collector number")
 
@@ -5733,12 +5733,13 @@ async def export_csv(request: Request):
         out = io.StringIO()
         w = csv.writer(out)
         w.writerow(["card", "set_code", "collector_number", "tcgplayer_usd",
-                    "cardkingdom_usd", "cardmarket_eur", "d7", "d7_pct",
-                    "d30", "d30_pct", "target_usd", "pct_to_target",
-                    "price_date"])
+                    "cardkingdom_usd", "cardmarket_eur", "manapool_usd",
+                    "d7", "d7_pct", "d30", "d30_pct", "target_usd",
+                    "pct_to_target", "price_date"])
         for e in watchlist_db.current_entries(db, row["id"]):
             per_shop = {shop: watchlist_db.entry_price_summary(db, e, provider=shop)
-                        for shop in ("tcgplayer", "cardkingdom", "cardmarket")}
+                        for shop in ("tcgplayer", "cardkingdom", "cardmarket",
+                                     "manapool")}
             s = per_shop["tcgplayer"]
 
             def pct(delta):
@@ -5751,7 +5752,8 @@ async def export_csv(request: Request):
             w.writerow([
                 e["card_name"], e["set_code"] or "", e["collector_number"] or "",
                 *(per_shop[shop]["current"] if per_shop[shop] else ""
-                  for shop in ("tcgplayer", "cardkingdom", "cardmarket")),
+                  for shop in ("tcgplayer", "cardkingdom", "cardmarket",
+                               "manapool")),
                 s["d7"] if s else "", pct(s["d7"]) if s else "",
                 s["d30"] if s else "", pct(s["d30"]) if s else "",
                 tgt if tgt is not None else "",

@@ -20,7 +20,7 @@ import watchlist_db
 log = logging.getLogger("mystic_forge.ingest")
 
 MTGJSON = "https://mtgjson.com/api/v5"
-PROVIDERS = ("tcgplayer", "cardkingdom", "cardmarket")
+PROVIDERS = ("tcgplayer", "cardkingdom", "cardmarket", "manapool")
 NTFY_BASE = os.environ.get("MYSTIC_FORGE_NTFY", "https://ntfy.sh")
 
 
