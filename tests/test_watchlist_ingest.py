@@ -1,8 +1,10 @@
 import gzip
 import json
+import os
 import sqlite3
 import tracemalloc
 
+import price_sidecar
 import watchlist_db
 import watchlist_ingest
 
@@ -238,3 +240,224 @@ def test_manapool_is_ingested(db, tmp_path):
 def test_manapool_is_a_selectable_shop():
     import watchlist_pages
     assert watchlist_pages.SHOPS["manapool"] == "$"
+
+
+# 0.015 is deliberate: round(x, 2) and cents quantization round at different
+# scales and disagree on ~4% of three-decimal prices, 0.015 among them.
+# 7.129 alone (the value the plan named) happens to agree, which would let an
+# exact-equality equivalence assertion pass while still being wrong.
+THREE_DP_OBJ = {"paper": {"tcgplayer": {"retail": {
+    "normal": {"2026-08-01": 8.0, "2026-08-08": 7.129, "2026-08-09": 0.015}}}}}
+
+
+def test_sidecar_path_sits_beside_the_database(tmp_path):
+    assert watchlist_ingest._sidecar_path(str(tmp_path)) == \
+        os.path.join(str(tmp_path), "price_sidecar.sqlite")
+
+
+def test_ensure_history_uses_the_sidecar_without_touching_mtgjson(
+        db, db_path, tmp_path, monkeypatch):
+    """The whole point: a ready sidecar means no file scan and no download."""
+    ap = make_allprintings(tmp_path)
+    gz = make_prices_gz(tmp_path, "src-allprices.json.gz", {"uuid-a": PRICE_OBJ})
+    price_sidecar.build_from_allprices(
+        watchlist_ingest._sidecar_path(str(tmp_path)), gz)
+
+    def boom(*a, **k):
+        raise AssertionError("must not download with a ready sidecar")
+    monkeypatch.setattr(watchlist_ingest, "_download", boom)
+    monkeypatch.setattr(watchlist_ingest, "ingest_prices_file", boom)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+    watchlist_ingest.resolve_watched(db, ap)
+    db.commit()
+
+    n = watchlist_ingest.ensure_history(db_path, str(tmp_path))
+    assert n == 3
+    got = {(r["provider"], r["finish"], r["date"], r["price"])
+           for r in db.execute("SELECT * FROM prices")}
+    assert ("tcgplayer", "normal", "2026-08-08", 7.0) in got
+
+
+def test_sidecar_projection_matches_the_legacy_scan(db, db_path, tmp_path):
+    """Equivalence — the safety net for the whole feature.
+
+    Rows must match exactly; prices must match to within the one cent the
+    sidecar's quantization is documented to cost. NOT exact equality: the
+    legacy scan stores the raw float and round(x, 2) rounds at a different
+    scale than round(x * 100), so the two disagree by a cent on ~4% of
+    three-decimal prices. The fixture carries one such price (0.015) so the
+    tolerance is exercised rather than dodged."""
+    ap = make_allprintings(tmp_path)
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": THREE_DP_OBJ})
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+    watchlist_ingest.resolve_watched(db, ap)
+    db.commit()
+
+    watchlist_ingest.ingest_prices_file(db, gz)
+    legacy = {(r["uuid"], r["date"], r["provider"], r["finish"]): r["price"]
+              for r in db.execute("SELECT * FROM prices")}
+    assert legacy, "nothing to compare — the legacy scan wrote no rows"
+    db.execute("DELETE FROM prices")
+    db.commit()
+
+    side = watchlist_ingest._sidecar_path(str(tmp_path))
+    price_sidecar.build_from_allprices(side, gz)
+    watchlist_ingest._project(db, side, ["uuid-a"])
+    projected = {(r["uuid"], r["date"], r["provider"], r["finish"]): r["price"]
+                 for r in db.execute("SELECT * FROM prices")}
+
+    # A dropped or invented point is a failure, not a rounding difference.
+    assert projected.keys() == legacy.keys()
+    for key, want in legacy.items():
+        assert abs(projected[key] - want) <= 0.01, key
+
+
+def test_projection_quantizes_a_three_decimal_price_to_the_nearest_cent(
+        db, db_path, tmp_path):
+    """Pins the one divergence the equivalence test tolerates, so the cent of
+    slack stays a known quantization and cannot quietly widen."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": THREE_DP_OBJ})
+    side = watchlist_ingest._sidecar_path(str(tmp_path))
+    price_sidecar.build_from_allprices(side, gz)
+    watchlist_ingest._project(db, side, ["uuid-a"])
+
+    got = {r["date"]: r["price"] for r in db.execute(
+        "SELECT date, price FROM prices WHERE finish='normal'")}
+    assert got["2026-08-08"] == 7.13
+    assert got["2026-08-09"] == 0.02      # the legacy scan stores 0.015
+
+
+def test_ensure_history_falls_back_when_no_sidecar(db, db_path, tmp_path,
+                                                   monkeypatch):
+    """With no sidecar, behaviour is exactly what it was before this feature."""
+    src = tmp_path / "src"
+    src.mkdir()
+    ap = make_allprintings(src)
+    gz = make_prices_gz(src, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    fetched = []
+
+    def fake_download(url, dest, _db):
+        import shutil
+        fetched.append(url.rsplit("/", 1)[-1])
+        shutil.copy(ap if url.endswith(".sqlite") else gz, dest)
+        return dest
+    monkeypatch.setattr(watchlist_ingest, "_download", fake_download)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    n = watchlist_ingest.ensure_history(db_path, str(tmp_path))
+    assert n > 0
+    assert "AllPrices.json.gz" in fetched
+
+
+def test_ensure_history_falls_back_when_sidecar_disabled(
+        db, db_path, tmp_path, monkeypatch):
+    """MYSTIC_FORGE_NO_SIDECAR is the operator escape hatch."""
+    ap = make_allprintings(tmp_path)
+    gz = make_prices_gz(tmp_path, "src.json.gz", {"uuid-a": PRICE_OBJ})
+    price_sidecar.build_from_allprices(
+        watchlist_ingest._sidecar_path(str(tmp_path)), gz)
+    monkeypatch.setenv("MYSTIC_FORGE_NO_SIDECAR", "1")
+
+    scanned = []
+    real = watchlist_ingest.ingest_prices_file
+    monkeypatch.setattr(watchlist_ingest, "ingest_prices_file",
+                        lambda *a, **k: (scanned.append(1), real(*a, **k))[1])
+    monkeypatch.setattr(watchlist_ingest, "_download",
+                        lambda url, dest, _db: __import__("shutil").copy(gz, dest) or dest)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+    watchlist_ingest.ensure_history(db_path, str(tmp_path))
+    assert scanned, "disabled sidecar must take the legacy path"
+
+
+def test_ensure_history_falls_back_on_a_corrupt_sidecar(db, db_path, tmp_path,
+                                                        monkeypatch):
+    """A damaged sidecar must degrade to the scan, never raise into a page."""
+    src = tmp_path / "src"
+    src.mkdir()
+    ap = make_allprintings(src)
+    gz = make_prices_gz(src, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    with open(watchlist_ingest._sidecar_path(str(tmp_path)), "wb") as f:
+        f.write(b"not a database at all")
+
+    def fake_download(url, dest, _db):
+        import shutil
+        shutil.copy(ap if url.endswith(".sqlite") else gz, dest)
+        return dest
+    monkeypatch.setattr(watchlist_ingest, "_download", fake_download)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    n = watchlist_ingest.ensure_history(db_path, str(tmp_path))
+    assert n > 0
+    assert db.execute("SELECT COUNT(*) FROM prices").fetchone()[0] > 0
+
+
+def test_ensure_history_falls_back_when_the_sidecar_read_raises(
+        db, db_path, tmp_path, monkeypatch):
+    """A *ready* sidecar that fails mid-read must still degrade to the scan.
+
+    is_ready() only proves the file opens; it says nothing about the read that
+    follows. Letting that read's exception escape is worse than a 500 — the
+    caller (_schedule_backfill) swallows it, so `missing` stays missing and
+    every later page load re-fires a fill that fails identically forever."""
+    ap = make_allprintings(tmp_path)
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    price_sidecar.build_from_allprices(
+        watchlist_ingest._sidecar_path(str(tmp_path)), gz)
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(price_sidecar, "series_for_uuids", boom)
+
+    def no_download(*a, **k):
+        raise AssertionError("both files are already cached")
+    monkeypatch.setattr(watchlist_ingest, "_download", no_download)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    n = watchlist_ingest.ensure_history(db_path, str(tmp_path))
+    assert n == 3
+    assert db.execute("SELECT COUNT(*) FROM prices").fetchone()[0] == 3
+
+
+def test_projection_carries_both_daily_and_weekly_points(db, db_path, tmp_path):
+    """Spec acceptance 3: a card with history past the window projects daily
+    points inside it and weekly means beyond, and price_series returns both."""
+    ap = make_allprintings(tmp_path)
+    old = {"uuid-a": {"paper": {"tcgplayer": {"retail": {"normal": {
+        **{f"2026-01-{d:02d}": 5.0 for d in range(5, 12)},     # one whole week
+        "2026-08-08": 7.0}}}}}}
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", old)
+    side = watchlist_ingest._sidecar_path(str(tmp_path))
+    price_sidecar.build_from_allprices(side, gz)
+    price_sidecar.downsample(side, keep_daily_days=120, today="2026-08-09")
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+    watchlist_ingest.resolve_watched(db, ap)
+    db.commit()
+    watchlist_ingest._project(db, side, ["uuid-a"])
+
+    dates = {r["date"] for r in db.execute("SELECT date FROM prices")}
+    assert "2026-01-11" in dates          # the collapsed week's Sunday mean
+    assert "2026-08-08" in dates          # still daily inside the window
+    assert "2026-01-06" not in dates      # collapsed away
+    series = watchlist_db.price_series(db, ["uuid-a"], days=400,
+                                       today="2026-08-09")
+    assert len(series["points"]) == 2

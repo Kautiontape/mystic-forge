@@ -15,6 +15,7 @@ from datetime import date
 import httpx
 import ijson
 
+import price_sidecar
 import watchlist_db
 
 log = logging.getLogger("mystic_forge.ingest")
@@ -166,6 +167,31 @@ def ingest_prices_file(db, gz_path: str, only_uuids=None) -> int:
     return rows
 
 
+def _sidecar_path(data_dir: str | None = None) -> str:
+    """Where the price sidecar lives. Computed here, not in price_sidecar, so
+    that module stays free of any import back into this one."""
+    return os.path.join(data_dir or _data_dir(), "price_sidecar.sqlite")
+
+
+def _project(db, sidecar_path: str, uuids, since: str | None = None) -> int:
+    """Copy sidecar history for `uuids` into the main database's prices table.
+
+    The one-way seam: the sidecar is the only writer of `prices`, and nothing
+    downstream of `prices` knows the sidecar exists.
+
+    Writes with commit=False and commits once, so a failure part-way leaves
+    the transaction uncommitted and `prices` untouched — which is what lets
+    callers treat a raised exception as "nothing happened" and fall back."""
+    n = 0
+    for uuid, d, provider, finish, price in price_sidecar.series_for_uuids(
+            sidecar_path, uuids, since=since):
+        watchlist_db.upsert_price(db, uuid, d, provider, finish, price,
+                                  commit=False)
+        n += 1
+    db.commit()
+    return n
+
+
 def ensure_history(db_path: str, data_dir: str | None = None) -> int:
     """Guarantee every watched card has its ~90 days of history, downloading
     the MTGJSON files if they aren't cached yet.
@@ -193,12 +219,27 @@ def ensure_history(db_path: str, data_dir: str | None = None) -> int:
                WHERE NOT EXISTS (SELECT 1 FROM prices p WHERE p.uuid=cu.uuid)""")}
         if not missing:
             return 0
+        # is_ready() only proves the file opens; the read that follows can
+        # still fail. Catching it here is what keeps a sick sidecar from being
+        # worse than no sidecar: the caller only logs, so an escaping
+        # exception would leave `missing` missing and re-fail on every page
+        # load forever, instead of falling through to the scan below.
+        side = _sidecar_path(data_dir)
+        if price_sidecar.is_ready(side):
+            try:
+                n = _project(db, side, missing)
+            except Exception:
+                log.exception("sidecar projection failed; falling back to scan")
+            else:
+                log.info("history fill from sidecar: %d uuid(s), %d rows",
+                         len(missing), n)
+                return n
         allp = os.path.join(data_dir, "AllPrices.json.gz")
         if not os.path.exists(allp):
             log.info("bootstrap: fetching AllPrices")
             _download(f"{MTGJSON}/AllPrices.json.gz", allp, db)
         n = ingest_prices_file(db, allp, only_uuids=missing)
-        log.info("history fill: %d uuid(s), %d rows", len(missing), n)
+        log.info("history fill by scan: %d uuid(s), %d rows", len(missing), n)
         return n
     finally:
         db.close()
