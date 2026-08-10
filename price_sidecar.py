@@ -14,8 +14,11 @@ know where it lives, which keeps it free of a circular import.
 import gzip
 import logging
 import os
+import pathlib
 import sqlite3
+import time
 from collections import Counter
+from collections.abc import Iterator
 from datetime import date as _date, datetime, timedelta, timezone
 
 import ijson
@@ -37,6 +40,11 @@ BATCH = 50_000
 DOWNSAMPLE_CARDS = 2_000  # card_ids per downsample transaction; bounds the WAL
 BUILD_HEADROOM = 2_500_000_000     # bytes of free space a full build needs
 READ_CHUNK = 500          # uuids per read query; well under SQLite's 32766 parameter cap
+STALE_PART_SECONDS = 6 * 3600
+# How old an abandoned .part sibling must be before a build deletes it. A full
+# build takes 10-30 minutes, so anything younger than this may well belong to a
+# live process; deleting that is the very hazard per-pid part names exist to
+# avoid (see build_from_allprices).
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cards (
@@ -59,13 +67,19 @@ _FIN_IDX = {f: i for i, f in enumerate(FINISHES)}
 
 
 def connect(path: str) -> sqlite3.Connection:
+    """Open the sidecar read-write.
+
+    Warning: this creates an empty database if `path` does not exist, and an
+    empty database is not a sidecar -- is_ready() reports it `corrupt`. Every
+    caller inside this module gates on is_ready() first; anything outside it
+    should do the same rather than relying on the open to fail."""
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     return db
 
 
-def pack_src(provider: str, finish: str):
+def pack_src(provider: str, finish: str) -> int | None:
     """Packed provider/finish code, or None if either is unknown upstream."""
     p = _PROV_IDX.get(provider)
     f = _FIN_IDX.get(finish)
@@ -74,7 +88,7 @@ def pack_src(provider: str, finish: str):
     return p * FINISH_SLOTS + f
 
 
-def unpack_src(src: int):
+def unpack_src(src: int) -> tuple[str, str] | None:
     """Decode a packed src, or None if it names a slot this build reserves.
 
     Mirrors pack_src, which already returns None for unknowns. A newer build
@@ -95,7 +109,16 @@ def from_day(day: int) -> str:
 
 
 def to_cents(price) -> int:
-    """Quantize to cents. Deliberately lossy past two decimals — see the spec."""
+    """Quantize to cents. Deliberately lossy past two decimals — see the spec.
+
+    Python's round() is half-to-even; the ROUND() downsample uses to average a
+    week is SQLite's, which is half-away-from-zero. The two therefore disagree
+    by one cent on a mean landing exactly on .5 -- unreachable for a whole
+    seven-day week, reachable for a partial boundary week. Left alone
+    deliberately: it is inside the quantization loss the spec already accepts,
+    and unifying it would mean either rounding weekly means in Python (a row
+    at a time, over tens of millions) or reimplementing banker's rounding in
+    SQL."""
     return int(round(float(price) * 100))
 
 
@@ -103,36 +126,68 @@ def from_cents(cents: int) -> float:
     return cents / 100.0
 
 
-def _get_meta(db, key):
+def _get_meta(db: sqlite3.Connection, key: str) -> str | None:
     row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     return row["value"] if row else None
 
 
-def _set_meta(db, key, value):
+def _set_meta(db: sqlite3.Connection, key: str, value) -> None:
     db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)",
                (key, str(value)))
 
 
-def is_ready(path: str) -> bool:
-    """A completed build of the current schema, openable and uncorrupted."""
+def _readiness(path: str) -> str | None:
+    """None when the sidecar is usable, else why not.
+
+    One of "disabled" (the env-var escape hatch), "absent" (no completed
+    build at that path -- either no file, or one carrying no built_at),
+    "corrupt" (it will not open, or holds no meta table), or "schema" (a
+    complete build of a version this code does not read).
+
+    Corrupt and schema warn; absent and disabled do not. The distinction is
+    the point: the system's response to not-ready is a full rebuild, which
+    permanently discards the weekly tier -- and past ~90 days MTGJSON cannot
+    replay it. A first boot losing nothing and a SCHEMA_VERSION bump throwing
+    away years of weekly means must not look alike in the log."""
     if os.environ.get("MYSTIC_FORGE_NO_SIDECAR"):
-        return False
+        return "disabled"
     if not path or not os.path.exists(path):
-        return False
+        return "absent"
     try:
-        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        # as_uri() percent-encodes; interpolating the raw path would let a `?`
+        # or `#` in it truncate the URI, dropping mode=ro and creating a stray
+        # database at the truncated name.
+        uri = pathlib.Path(path).absolute().as_uri() + "?mode=ro"
+        db = sqlite3.connect(uri, uri=True)
         db.row_factory = sqlite3.Row
         try:
             version = _get_meta(db, "schema_version")
             built = _get_meta(db, "built_at")
         finally:
             db.close()
-    except sqlite3.DatabaseError:
-        return False
-    return bool(built) and version == str(SCHEMA_VERSION)
+    except sqlite3.DatabaseError as e:
+        log.warning("sidecar at %s will not open (%s); falling back to the "
+                    "full-scan path. Delete it to force a rebuild -- note "
+                    "that a rebuild recovers only MTGJSON's ~90-day window, "
+                    "not the weekly tier.", path, e)
+        return "corrupt"
+    if not built:
+        return "absent"
+    if version != str(SCHEMA_VERSION):
+        log.warning("sidecar at %s was built for schema version %s, but this "
+                    "build reads version %s; treating it as not ready. "
+                    "Rebuilding discards every weekly mean it holds, which "
+                    "MTGJSON cannot replay.", path, version, SCHEMA_VERSION)
+        return "schema"
+    return None
 
 
-def daily_through(path: str):
+def is_ready(path: str) -> bool:
+    """A completed build of the current schema, openable and uncorrupted."""
+    return _readiness(path) is None
+
+
+def daily_through(path: str) -> str | None:
     """Newest date applied, as an ISO string, or None."""
     if not is_ready(path):
         return None
@@ -143,13 +198,19 @@ def daily_through(path: str):
         db.close()
 
 
-def _iter_points(gz_path: str, counts: dict | None = None):
+def _iter_points(gz_path: str,
+                 counts: dict | None = None) -> Iterator[tuple[str, int, int, int]]:
     """Yield (uuid, src, day, cents) from an MTGJSON prices .gz.
 
     Shape: data.<uuid>.paper.<provider>.retail.<finish>.<date> = price.
-    Streams with ijson, so peak memory is independent of file size. Unknown
-    providers/finishes and unparseable values are skipped, not fatal — MTGJSON
-    adds providers without warning.
+    Streams with ijson, so peak memory is independent of file size.
+
+    Tolerance is narrow and deliberate. An unknown provider or finish is
+    skipped, and so is an unparseable date or price -- MTGJSON adds providers
+    without warning, and one bad value must not lose a night's ingest. A
+    structurally wrong document is not covered: `{"paper": "oops"}` raises,
+    because a shape change that broad means the assumptions behind every
+    other line here no longer hold and failing loudly is the safer answer.
 
     `counts`, if given, is updated in place: counts["kept"][src] += 1 per
     point yielded (keyed by the packed src), and
@@ -185,17 +246,72 @@ def _free_bytes(directory: str) -> int:
     return st.f_bavail * st.f_frsize
 
 
+def _next_card_id(ids: dict[str, int]) -> int:
+    """First free card_id, given the uuid -> card_id map already in hand.
+
+    max()+1, never len()+1: a hole in the sequence -- a deleted card, or any
+    future build that resumes rather than starting from empty -- makes
+    len()+1 collide with a live id. build_from_allprices starts from an empty
+    dict, where the two agree, so sharing this is alignment against that
+    future hazard rather than a fix for a live bug. Computed once and
+    incremented by the caller, so it stays O(1) per new uuid across the ~111k
+    of them a full build sees."""
+    return max(ids.values(), default=0) + 1
+
+
+def _sweep_stale_parts(path: str, directory: str) -> None:
+    """Delete abandoned .part siblings, leaving anything recent alone.
+
+    A build that is killed leaks its part file; without this they accumulate
+    at roughly a gigabyte each. Age is the only signal available here -- there
+    is no lock and no registry of live builds -- so the threshold is set well
+    past a build's runtime and nothing younger is touched."""
+    prefix = os.path.basename(path) + ".part."
+    now = time.time()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        stale = os.path.join(directory, name)
+        try:
+            if now - os.path.getmtime(stale) > STALE_PART_SECONDS:
+                os.remove(stale)
+                log.info("sidecar: removed abandoned build file %s", stale)
+        except OSError:
+            continue
+
+
 def build_from_allprices(path: str, gz_path: str) -> int:
     """Full load from AllPrices.json.gz. Returns points written.
 
-    Builds into <path>.part and atomically renames, so an interrupted build
-    can never leave a file that is_ready() would accept."""
+    Builds into a private <path>.part.<pid> and atomically renames, so an
+    interrupted build can never leave a file that is_ready() would accept.
+
+    The pid in that name is what keeps two concurrent builds from destroying
+    each other. With one shared `.part`, B's cleanup unlinks A's in-progress
+    file, B builds a fresh one under the same name, and A's os.replace then
+    publishes B's half-finished database as ready -- reproduced. Per-build
+    names make the two independent; each still races only on the final
+    os.replace, where last writer wins and every candidate is complete.
+
+    Known limitation: there is no cross-process mutual exclusion between
+    build, apply_daily and downsample. Nothing stops a nightly apply_daily
+    from running against a sidecar a second process is replacing underneath
+    it. An advisory lock over the whole file is the real answer and is a
+    larger design change than this."""
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
+    # Sweep before the headroom check, not after: a leaked part file is about
+    # the size of a whole sidecar, so two of them can hold the free-space
+    # check below permanently short of the space they are themselves wasting.
+    _sweep_stale_parts(path, directory)
     if _free_bytes(directory) < BUILD_HEADROOM:
         raise OSError(f"not enough free space in {directory} to build the "
                       f"sidecar ({BUILD_HEADROOM} bytes needed)")
-    part = path + ".part"
+    part = f"{path}.part.{os.getpid()}"
     if os.path.exists(part):
         os.remove(part)
     db = sqlite3.connect(part)
@@ -205,13 +321,15 @@ def build_from_allprices(path: str, gz_path: str) -> int:
         db.execute("PRAGMA journal_mode=OFF")     # disposable until the rename
         db.execute("PRAGMA synchronous=OFF")
         ids: dict[str, int] = {}
+        next_id = _next_card_id(ids)
         batch: list[tuple] = []
         rows = 0
         counts = {"kept": Counter(), "skipped": Counter()}
         for uuid, src, day, cents in _iter_points(gz_path, counts):
             cid = ids.get(uuid)
             if cid is None:
-                cid = len(ids) + 1
+                cid = next_id
+                next_id += 1
                 ids[uuid] = cid
                 db.execute("INSERT INTO cards (card_id, uuid) VALUES (?,?)",
                            (cid, uuid))
@@ -255,11 +373,29 @@ def build_from_allprices(path: str, gz_path: str) -> int:
     return rows
 
 
+_APPLY_SQL = (
+    "INSERT INTO points (card_id,src,day,cents,agg) VALUES (?,?,?,?,0)"
+    " ON CONFLICT(card_id,src,day) DO UPDATE SET cents=excluded.cents"
+    " WHERE points.agg = 0")
+# Not INSERT OR REPLACE. A weekly mean is stored at its week's Sunday, so a
+# late daily row for that Sunday collides with it on the primary key -- and a
+# REPLACE would overwrite the mean before downsample's guard could protect it,
+# after which the next downsample relabels the survivor agg=1 and the loss
+# becomes undetectable. The WHERE clause makes an agg=1 row untouchable while
+# still letting a revised price land on an existing agg=0 day.
+
+
 def apply_daily(path: str, gz_path: str) -> int:
     """Fold a day's AllPricesToday into a built sidecar. Returns points written.
 
     A no-op on an unbuilt sidecar: a partial file must never look like a
     complete one. New uuids are learned as they appear.
+
+    "Points written" counts points read out of the file, which is one more
+    than the rows that change whenever a point is dropped for colliding with
+    an established weekly mean. Restating it exactly would cost a per-row
+    changes() call across ~600k rows a night to report a number nothing
+    branches on.
 
     Commits per batch rather than once at the end. The primary key orders
     points by (card_id, src, day), so one card's rows all live on roughly
@@ -272,8 +408,8 @@ def apply_daily(path: str, gz_path: str) -> int:
     a crash mid-apply can leave some of the day's rows committed and others
     not. What survives is that this call never advances daily_through() past
     a day it left incomplete -- the watermark write is the last statement --
-    and INSERT OR REPLACE makes re-running this function over the *same*
-    file converge to the complete, correct state.
+    and the upsert below makes re-running this function over the *same* file
+    converge to the complete, correct state.
 
     That guarantee is per-invocation, not global. If a crash is followed by
     a run that applies a *different* day, the watermark advances past the
@@ -288,9 +424,10 @@ def apply_daily(path: str, gz_path: str) -> int:
     try:
         ids = {r["uuid"]: r["card_id"]
                for r in db.execute("SELECT uuid, card_id FROM cards")}
-        next_id = max(ids.values(), default=0) + 1
+        next_id = _next_card_id(ids)
         batch, rows, newest, oldest = [], 0, None, None
-        for uuid, src, day, cents in _iter_points(gz_path):
+        counts = {"kept": Counter(), "skipped": Counter()}
+        for uuid, src, day, cents in _iter_points(gz_path, counts):
             cid = ids.get(uuid)
             if cid is None:
                 cid = next_id
@@ -302,16 +439,12 @@ def apply_daily(path: str, gz_path: str) -> int:
             newest = day if newest is None else max(newest, day)
             oldest = day if oldest is None else min(oldest, day)
             if len(batch) >= BATCH:
-                db.executemany(
-                    "INSERT OR REPLACE INTO points (card_id,src,day,cents,agg)"
-                    " VALUES (?,?,?,?,0)", batch)
+                db.executemany(_APPLY_SQL, batch)
                 db.commit()
                 rows += len(batch)
                 batch.clear()
         if batch:
-            db.executemany(
-                "INSERT OR REPLACE INTO points (card_id,src,day,cents,agg)"
-                " VALUES (?,?,?,?,0)", batch)
+            db.executemany(_APPLY_SQL, batch)
             db.commit()
             rows += len(batch)
         if newest is not None:
@@ -330,8 +463,20 @@ def apply_daily(path: str, gz_path: str) -> int:
                 "it has already collapsed. KEEP_DAILY_DAYS must stay above the "
                 "span this file covers.",
                 from_day(oldest), KEEP_DAILY_DAYS, from_day(newest))
+        # build_from_allprices runs once, possibly years before this does;
+        # this is the path that sees a provider MTGJSON added in between, and
+        # dropping one silently every night forever is the failure to catch.
+        if counts["skipped"]:
+            log.warning(
+                "sidecar daily: skipped %s -- provider/finish pairs this "
+                "build has no slot for. Add them to PROVIDERS/FINISHES or "
+                "these points are dropped every night.",
+                dict(counts["skipped"]))
         db.commit()
-        log.info("sidecar daily: %d points, %d cards", rows, len(ids))
+        log.info("sidecar daily: %d points, %d cards; kept %s; skipped %s",
+                 rows, len(ids),
+                 {unpack_src(s): n for s, n in counts["kept"].items()},
+                 dict(counts["skipped"]))
         return rows
     finally:
         db.close()
@@ -342,7 +487,9 @@ def _chunks(items, size):
         yield items[i:i + size]
 
 
-def series_for_uuids(path: str, uuids, providers=None, since: str | None = None):
+def series_for_uuids(
+        path: str, uuids, providers=None, since: str | None = None
+) -> Iterator[tuple[str, str, str, str, float]]:
     """Yield (uuid, date_iso, provider, finish, price) for the given uuids.
 
     Shaped exactly for watchlist_db.upsert_price, so the projection into the
@@ -415,9 +562,16 @@ def downsample(path: str, keep_daily_days: int = KEEP_DAILY_DAYS,
     behind the cutoff. Only agg=0 rows are read as input, so a mean is never
     taken of means and repeat runs are no-ops.
 
-    A week that already carries an agg=1 row is skipped entirely, so a late
-    daily row can never overwrite an established weekly mean with itself.
-    That late row is still deleted along with the rest of its cohort.
+    A week that already carries an agg=1 row is skipped entirely, so nothing
+    here recomputes an established weekly mean. That guard alone is not
+    enough, though, and this docstring used to claim it was: the mean lives
+    at its week's Sunday, so a late daily row *for that Sunday* shares its
+    primary key, and an INSERT OR REPLACE in apply_daily destroyed the mean
+    before this ran -- leaving one row for the guard to find nothing wrong
+    with. apply_daily now refuses to overwrite an agg=1 row (see _APPLY_SQL),
+    which is where that case actually has to be stopped. The residual is
+    exact: a late row on any of the week's other six days is accepted by
+    apply_daily and then deleted here with the rest of its cohort, unmerged.
     Reweighting the stored mean to absorb it is not merely expensive but
     unsound: that needs to know whether the day is already inside the mean,
     which a count cannot answer -- re-applying an already-included day would
@@ -456,9 +610,21 @@ def downsample(path: str, keep_daily_days: int = KEEP_DAILY_DAYS,
             # daily_through is what the data itself says, so let it bound the
             # cutoff: a clock jump becomes a no-op, and a long ingest outage
             # stops collapsing rather than racing ahead of the data.
+            #
+            # No watermark means the data cannot say how far it runs, so
+            # nothing may be collapsed on its authority -- falling through to
+            # the raw clock here would restore exactly the hazard above, on
+            # the one irreversible operation in the module. It is reachable:
+            # a build whose points are all unparseable writes built_at but
+            # not daily_through, which is_ready() accepts.
             watermark = _get_meta(db, "daily_through")
-            if watermark:
-                ref = min(ref, _date.fromisoformat(watermark))
+            if not watermark:
+                log.warning(
+                    "sidecar at %s has no daily_through watermark; refusing "
+                    "to collapse anything, since only the wall clock would "
+                    "bound the cutoff and collapsing cannot be undone.", path)
+                return 0
+            ref = min(ref, _date.fromisoformat(watermark))
         cutoff = (ref - timedelta(days=keep_daily_days) - EPOCH).days
         # Two queries, not one: SQLite optimizes a lone MIN() or MAX() over the
         # leading primary-key column into a seek, but MIN(x), MAX(x) together
@@ -512,9 +678,16 @@ def stats(path: str) -> dict:
     `daily_through` is the stored watermark, reported alongside the computed
     `latest` rather than instead of it. The two agree under normal operation,
     so publishing both costs nothing and turns any divergence between them
-    into a free signal of a partial write."""
-    if not is_ready(path):
-        return {"ready": False}
+    into a free signal of a partial write.
+
+    When not ready, `reason` names which of the four states it is (see
+    _readiness) beside the unchanged `ready` key. Without it a truncated file
+    and a never-created one are byte-identical here, while the response to
+    them differs entirely: one means rebuild and lose the weekly tier, the
+    other means a build that was always going to happen."""
+    reason = _readiness(path)
+    if reason is not None:
+        return {"ready": False, "reason": reason}
     db = connect(path)
     try:
         span = db.execute("SELECT COUNT(*) AS n, MIN(day) AS lo, MAX(day) AS hi"

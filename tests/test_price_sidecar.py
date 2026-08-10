@@ -1,8 +1,10 @@
+import glob
 import gzip
 import json
 import math
 import os
 import sqlite3
+import time
 import tracemalloc
 import unittest.mock as mock
 from datetime import date, datetime, timedelta
@@ -119,7 +121,10 @@ def test_build_is_atomic_on_failure(tmp_path):
     with mock.patch.object(price_sidecar, "_iter_points", boom):
         with pytest.raises(RuntimeError):
             price_sidecar.build_from_allprices(p, gz)
-    assert not os.path.exists(p + ".part")
+    # Glob, not p + ".part": the part file is named per-pid, so a literal
+    # ".part" would assert on a path the build never creates and pass however
+    # much debris were actually left behind.
+    assert glob.glob(p + ".part*") == []
     assert os.path.getsize(p) == before      # previous build untouched
     assert price_sidecar.is_ready(p)
 
@@ -306,7 +311,7 @@ def test_apply_daily_crash_then_retry_converges(tmp_path, monkeypatch):
     monkeypatch.setattr(price_sidecar, "BATCH", 2)
     day9 = price_sidecar.to_day("2026-08-09")
 
-    def crashes_after_two_batches(_gz):
+    def crashes_after_two_batches(_gz, _counts=None):
         for i in range(4):
             yield f"uuid-{i}", 0, day9, 100 + i
         yield "uuid-4", 0, day9, 104          # appended, never committed
@@ -325,7 +330,7 @@ def test_apply_daily_crash_then_retry_converges(tmp_path, monkeypatch):
     db.close()
     assert partial == 4          # the first two committed batches, not the fifth
 
-    def full_day(_gz):
+    def full_day(_gz, _counts=None):
         for i in range(5):
             yield f"uuid-{i}", 0, day9, 100 + i
 
@@ -800,7 +805,11 @@ def test_stats_bytes_includes_a_live_wal(tmp_path):
 
 
 def test_stats_on_missing_file_is_not_ready(tmp_path):
-    assert price_sidecar.stats(str(tmp_path / "absent.sqlite")) == {"ready": False}
+    # `reason` is reported alongside `ready`, never instead of it: /health is
+    # the only operator surface, and not-ready triggers a rebuild that
+    # permanently discards the weekly tier.
+    assert price_sidecar.stats(str(tmp_path / "absent.sqlite")) == {
+        "ready": False, "reason": "absent"}
 
 
 def test_build_logs_skip_counts_for_unknown_provider(tmp_path, caplog):
@@ -847,3 +856,243 @@ def test_apply_daily_warns_on_a_day_older_than_the_daily_window(tmp_path, caplog
     with caplog.at_level("WARNING", logger="mystic_forge.sidecar"):
         price_sidecar.apply_daily(p, today)
     assert caplog.text == ""            # a normal one-day file stays quiet
+
+
+def _points(p):
+    db = price_sidecar.connect(p)
+    rows = [(price_sidecar.from_day(r["day"]), r["cents"], r["agg"]) for r in
+            db.execute("SELECT day, cents, agg FROM points ORDER BY day")]
+    db.close()
+    return rows
+
+
+def _late_file(tmp_path, name, iso, price):
+    return make_prices_gz(tmp_path, name, {"uuid-a": {"paper": {"tcgplayer": {
+        "retail": {"normal": {iso: price}}}}}})
+
+
+def _collapsed_two_weeks(tmp_path):
+    """Two whole ISO weeks already collapsed to means at 1300 and 2000."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        _daily_series("uuid-a", "2026-01-05", 14, price=10.0))
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    price_sidecar.downsample(p, keep_daily_days=30, today="2026-06-01")
+    assert _points(p) == [("2026-01-11", 1300, 1), ("2026-01-18", 2000, 1)]
+    return p
+
+
+def test_apply_daily_will_not_overwrite_a_weekly_mean_on_its_own_anchor(tmp_path):
+    """downsample's guard cannot see this one, and it fires 1 day in 7.
+
+    A weekly mean is stored at its week's Sunday, so a late daily row for
+    that Sunday shares the primary key (card_id, src, day) with it. An
+    INSERT OR REPLACE clobbers the agg=1 row *before* downsample runs, so
+    downsample's HAVING NOT EXISTS finds nothing left to protect and
+    recomputes the "mean" from the single surviving row -- then relabels it
+    agg=1, which is what makes the loss silent: stats() still counts it as a
+    weekly point. The neighbouring test uses 2026-01-07, a Wednesday, and so
+    covers only the 6/7 safe case. Past ~90 days MTGJSON cannot replay the
+    week, so this is unrecoverable.
+    """
+    p = _collapsed_two_weeks(tmp_path)
+    assert date.fromisoformat("2026-01-11").isoweekday() == 7   # the anchor
+
+    late = _late_file(tmp_path, "AllPricesLate.json.gz", "2026-01-11", 99.0)
+    price_sidecar.apply_daily(p, late)
+    assert _points(p) == [("2026-01-11", 1300, 1), ("2026-01-18", 2000, 1)], \
+        "the established weekly mean must survive a late row on its anchor"
+
+    price_sidecar.downsample(p, keep_daily_days=30, today="2026-06-01")
+    assert _points(p) == [("2026-01-11", 1300, 1), ("2026-01-18", 2000, 1)]
+
+
+def test_apply_daily_still_revises_a_price_for_a_day_already_stored(tmp_path):
+    """Protecting agg=1 rows must not also freeze agg=0 ones: MTGJSON does
+    restate a day's price, and re-applying a corrected file has to land."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+
+    revised = _late_file(tmp_path, "AllPricesRevised.json.gz", "2026-08-08", 7.5)
+    price_sidecar.apply_daily(p, revised)
+    db = price_sidecar.connect(p)
+    got = db.execute("SELECT cents, agg FROM points WHERE src=0 AND day=?",
+                     (price_sidecar.to_day("2026-08-08"),)).fetchone()
+    db.close()
+    assert (got["cents"], got["agg"]) == (750, 0)
+
+
+def test_apply_daily_logs_skip_counts_for_a_new_provider(tmp_path, caplog):
+    """build runs once, possibly years ago; this path runs every night. A
+    provider MTGJSON adds later is dropped silently here forever unless the
+    nightly log names it."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+
+    today = make_prices_gz(tmp_path, "AllPricesToday.json.gz", {"uuid-a": {
+        "paper": {
+            "brandnewshop": {"retail": {"normal": {"2026-08-09": 1.0,
+                                                   "2026-08-10": 1.5}}},
+            "tcgplayer": {"retail": {"normal": {"2026-08-09": 2.0}}}}}})
+    with caplog.at_level("WARNING", logger="mystic_forge.sidecar"):
+        price_sidecar.apply_daily(p, today)
+    assert "brandnewshop" in caplog.text
+    assert "{('brandnewshop', 'normal'): 2}" in caplog.text   # points, not groups
+
+
+def test_is_ready_survives_a_uri_metacharacter_in_the_path(tmp_path):
+    """`?` and `#` are URI syntax. Interpolating a raw path into
+    file:...?mode=ro truncates it at the first `?`, so the sidecar is never
+    seen as ready -- and because mode=ro is no longer parsed either, the
+    probe *creates* a stray database at the truncated path. Every other
+    function opens the plain path and works fine, so nothing else reveals it.
+    """
+    directory = tmp_path / "weird?x#y"
+    directory.mkdir()
+    p = str(directory / "side.sqlite")
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    price_sidecar.build_from_allprices(p, gz)
+
+    assert price_sidecar.is_ready(p) is True
+    assert not os.path.exists(str(tmp_path / "weird"))     # no stray database
+    assert len(list(price_sidecar.series_for_uuids(p, ["uuid-a"]))) == 4
+
+
+def test_is_ready_leaves_the_file_untouched(tmp_path):
+    """The readiness probe is a probe. It must not create, modify, or
+    upgrade anything -- it runs on paths that may not be sidecars at all."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    before = (os.path.getsize(p), sorted(os.listdir(str(tmp_path))))
+    assert price_sidecar.is_ready(p) is True
+    assert (os.path.getsize(p), sorted(os.listdir(str(tmp_path)))) == before
+
+
+def test_stats_names_why_the_sidecar_is_not_ready(tmp_path, monkeypatch,
+                                                  caplog):
+    """`{"ready": False}` collapses four unrelated states into one. The
+    system's answer to not-ready is a full rebuild that permanently discards
+    the weekly tier, so an operator must be able to tell "first boot" from
+    "your history was just thrown away."""
+    absent = str(tmp_path / "absent.sqlite")
+    assert price_sidecar.stats(absent) == {"ready": False, "reason": "absent"}
+
+    corrupt = str(tmp_path / "corrupt.sqlite")
+    with open(corrupt, "wb") as f:
+        f.write(b"this is not a database")
+    with caplog.at_level("WARNING", logger="mystic_forge.sidecar"):
+        assert price_sidecar.stats(corrupt) == {"ready": False,
+                                                "reason": "corrupt"}
+    assert corrupt in caplog.text
+
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    assert price_sidecar.stats(p)["ready"] is True
+
+    caplog.clear()
+    monkeypatch.setattr(price_sidecar, "SCHEMA_VERSION",
+                        price_sidecar.SCHEMA_VERSION + 1)
+    with caplog.at_level("WARNING", logger="mystic_forge.sidecar"):
+        assert price_sidecar.stats(p) == {"ready": False, "reason": "schema"}
+    # A version bump silently destroys the weekly tier; it must say so.
+    assert p in caplog.text
+    monkeypatch.undo()
+
+    caplog.clear()
+    monkeypatch.setenv("MYSTIC_FORGE_NO_SIDECAR", "1")
+    with caplog.at_level("WARNING", logger="mystic_forge.sidecar"):
+        assert price_sidecar.stats(p) == {"ready": False, "reason": "disabled"}
+    assert caplog.text == ""            # the escape hatch is normal operation
+
+
+def test_absent_and_disabled_sidecars_do_not_warn(tmp_path, monkeypatch,
+                                                  caplog):
+    """First boot and the operator escape hatch are both expected states.
+    Warning on them would train operators to ignore the log -- which is the
+    log that has to carry the schema-mismatch and corruption alarms."""
+    with caplog.at_level("WARNING", logger="mystic_forge.sidecar"):
+        assert price_sidecar.is_ready(str(tmp_path / "absent.sqlite")) is False
+    assert caplog.text == ""
+
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    caplog.clear()
+    monkeypatch.setenv("MYSTIC_FORGE_NO_SIDECAR", "1")
+    with caplog.at_level("WARNING", logger="mystic_forge.sidecar"):
+        assert price_sidecar.is_ready(p) is False
+    assert caplog.text == ""
+
+
+def test_next_card_id_skips_past_a_gap():
+    """build and apply_daily must allocate identically. len()+1 collides the
+    moment the sequence has a hole; max()+1 does not."""
+    assert price_sidecar._next_card_id({}) == 1
+    assert price_sidecar._next_card_id({"a": 1, "c": 3}) == 4   # not len()+1 == 3
+
+
+def test_build_uses_a_private_part_file_and_sweeps_only_stale_ones(tmp_path):
+    """A fixed `.part` name is shared state between builds. Reproduced: B's
+    os.remove unlinks A's in-progress file, B builds a fresh `.part`, and A's
+    os.replace then publishes B's half-finished database as ready. Per-pid
+    names remove the collision; sweeping only *old* siblings stops a crashed
+    build leaking files forever without touching a live one."""
+    p = str(tmp_path / "side.sqlite")
+    stale = p + ".part.999999"
+    fresh = p + ".part.999998"
+    for f in (stale, fresh):
+        with open(f, "wb") as fh:
+            fh.write(b"x")
+    old = time.time() - price_sidecar.STALE_PART_SECONDS - 60
+    os.utime(stale, (old, old))
+
+    seen = []
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    real_iter = price_sidecar._iter_points
+
+    def watching(gz_path, counts=None):
+        for row in real_iter(gz_path, counts):
+            seen.append(sorted(glob.glob(p + ".part*")))
+            yield row
+
+    with mock.patch.object(price_sidecar, "_iter_points", watching):
+        price_sidecar.build_from_allprices(p, gz)
+
+    mine = p + f".part.{os.getpid()}"
+    assert seen and all(mine in names for names in seen), \
+        "the build must write into a name no other process can pick"
+    assert not os.path.exists(stale)          # swept
+    assert os.path.exists(fresh)              # another build may be mid-write
+    assert not os.path.exists(mine)           # renamed onto the final path
+    assert price_sidecar.is_ready(p)
+
+
+def test_downsample_will_not_collapse_without_a_watermark(tmp_path):
+    """`if watermark:` falls through to the raw system clock when
+    daily_through is absent -- the unsafe default on the one irreversible
+    operation in the module. A missing watermark means the data cannot say
+    how far it runs, so nothing may be collapsed on its authority."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        _daily_series("uuid-a", "2026-01-05", 14, price=10.0))
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    db = price_sidecar.connect(p)
+    db.execute("DELETE FROM meta WHERE key='daily_through'")
+    db.commit()
+    db.close()
+    assert price_sidecar.daily_through(p) is None
+
+    class ClockAYearFast:
+        @staticmethod
+        def now(tz=None):
+            return datetime(2027, 1, 18, tzinfo=tz)
+
+    with mock.patch.object(price_sidecar, "datetime", ClockAYearFast):
+        assert price_sidecar.downsample(p) == 0
+    db = price_sidecar.connect(p)
+    assert db.execute("SELECT COUNT(*) FROM points WHERE agg=0").fetchone()[0] == 14
+    db.close()
