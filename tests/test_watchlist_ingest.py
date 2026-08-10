@@ -499,3 +499,344 @@ def test_projection_carries_both_daily_and_weekly_points(db, db_path, tmp_path):
     series = watchlist_db.price_series(db, ["uuid-a"], days=400,
                                        today="2026-08-09")
     assert len(series["points"]) == 2
+
+
+def test_run_ingest_feeds_the_sidecar_then_projects(db, db_path, tmp_path,
+                                                    monkeypatch):
+    """Nightly: AllPricesToday lands in the sidecar, and only the new dates
+    are projected into prices."""
+    src = tmp_path / "src"
+    src.mkdir()
+    ap = make_allprintings(src)
+    seed = make_prices_gz(src, "seed.json.gz", {"uuid-a": PRICE_OBJ})
+    today = make_prices_gz(src, "AllPricesToday.json.gz", {
+        "uuid-a": {"paper": {"tcgplayer": {"retail": {
+            "normal": {"2026-08-09": 6.75}}}}}})
+
+    side = watchlist_ingest._sidecar_path(str(tmp_path))
+    price_sidecar.build_from_allprices(side, seed)
+
+    def fake_download(url, dest, _db):
+        import shutil
+        shutil.copy(ap if url.endswith(".sqlite") else today, dest)
+        return dest
+    monkeypatch.setattr(watchlist_ingest, "_download", fake_download)
+    monkeypatch.setattr(watchlist_ingest, "notify_hits", lambda _db: 0)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+
+    assert price_sidecar.daily_through(side) == "2026-08-09"
+    fresh = db.execute(
+        "SELECT price FROM prices WHERE date='2026-08-09'").fetchone()
+    assert fresh is not None and fresh["price"] == 6.75
+
+
+def test_run_ingest_downsamples(db, db_path, tmp_path, monkeypatch):
+    """Aged daily rows must not accumulate forever."""
+    src = tmp_path / "src"
+    src.mkdir()
+    ap = make_allprintings(src)
+    old = make_prices_gz(src, "seed.json.gz",
+                         {"uuid-a": {"paper": {"tcgplayer": {"retail": {
+                             "normal": {f"2020-01-{d:02d}": 1.0
+                                        for d in range(6, 13)}}}}}})
+    today = make_prices_gz(src, "AllPricesToday.json.gz", {"uuid-a": PRICE_OBJ})
+    side = watchlist_ingest._sidecar_path(str(tmp_path))
+    price_sidecar.build_from_allprices(side, old)
+
+    def fake_download(url, dest, _db):
+        import shutil
+        shutil.copy(ap if url.endswith(".sqlite") else today, dest)
+        return dest
+    monkeypatch.setattr(watchlist_ingest, "_download", fake_download)
+    monkeypatch.setattr(watchlist_ingest, "notify_hits", lambda _db: 0)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+
+    sdb = price_sidecar.connect(side)
+    weekly = sdb.execute("SELECT COUNT(*) FROM points WHERE agg=1").fetchone()[0]
+    sdb.close()
+    assert weekly >= 1
+
+
+def _nightly_fixture(tmp_path, monkeypatch, today_data, seed_data=None):
+    """A built sidecar plus a stubbed _download serving AllPrintings and a
+    caller-supplied AllPricesToday. Returns (sidecar_path, fetched_names)."""
+    src = tmp_path / "src"
+    src.mkdir(exist_ok=True)
+    ap = make_allprintings(src)
+    seed = make_prices_gz(src, "seed.json.gz",
+                          seed_data or {"uuid-a": PRICE_OBJ})
+    today = make_prices_gz(src, "AllPricesToday.json.gz", today_data)
+    side = watchlist_ingest._sidecar_path(str(tmp_path))
+    price_sidecar.build_from_allprices(side, seed)
+
+    fetched = []
+
+    def fake_download(url, dest, _db):
+        import shutil
+        fetched.append(url.rsplit("/", 1)[-1])
+        shutil.copy(ap if url.endswith(".sqlite") else today, dest)
+        return dest
+    monkeypatch.setattr(watchlist_ingest, "_download", fake_download)
+    monkeypatch.setattr(watchlist_ingest, "notify_hits", lambda _db: 0)
+    return side, fetched
+
+
+def test_run_ingest_projects_only_the_new_dates(db, db_path, tmp_path,
+                                                monkeypatch):
+    """`since` is load-bearing, and this is the test that says so.
+
+    The projection covers the old watermark date and everything after it, and
+    nothing before. The watermark date is deliberately *included*: a same-date
+    revision is a changed price on exactly that day, and `since` being
+    exclusive would drop it forever (see
+    test_run_ingest_projects_a_same_date_revision). So the floor sits one day
+    below the old watermark, and the sentinels below check the other half of
+    the bargain — that widening the window by a day did not widen it by more.
+
+    They carry deliberately wrong values on dates the sidecar also holds, at
+    and below the floor. Drop the `since` argument and they are overwritten
+    with the sidecar's own values, and a foil point that has never been
+    projected appears out of nowhere."""
+    side, _ = _nightly_fixture(tmp_path, monkeypatch, {
+        "uuid-a": {"paper": {"tcgplayer": {"retail": {
+            "normal": {"2026-08-09": 6.75}}}}}},
+        seed_data={"uuid-a": {"paper": {"tcgplayer": {"retail": {
+            "normal": {"2026-08-01": 8.0, "2026-08-07": 7.5,
+                       "2026-08-08": 7.0},
+            "foil": {"2026-08-01": 30.0}}}}}})
+    assert price_sidecar.daily_through(side) == "2026-08-08"
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    watchlist_db.upsert_price(db, "uuid-a", "2026-08-01", "tcgplayer",
+                              "normal", 999.0)
+    watchlist_db.upsert_price(db, "uuid-a", "2026-08-07", "tcgplayer",
+                              "normal", 999.0)
+    db.commit()
+
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+
+    assert price_sidecar.daily_through(side) == "2026-08-09"
+    got = {(r["date"], r["finish"]): r["price"] for r in db.execute(
+        "SELECT * FROM prices WHERE uuid='uuid-a' AND provider='tcgplayer'")}
+    assert got[("2026-08-09", "normal")] == 6.75     # the day just applied
+    assert got[("2026-08-08", "normal")] == 7.0      # the watermark, re-projected
+    assert got[("2026-08-01", "normal")] == 999.0    # older: not re-projected
+    # The floor itself is exclusive, so this pins the step-back at exactly one
+    # day: step back two and this sentinel is overwritten with 7.5.
+    assert got[("2026-08-07", "normal")] == 999.0
+    # The sidecar holds foil/2026-08-01 (30.0) and nothing has ever projected
+    # it. It can only appear if the projection ignored `since`.
+    assert ("2026-08-01", "foil") not in got
+
+
+def test_run_ingest_projects_a_same_date_revision(db, db_path, tmp_path,
+                                                  monkeypatch):
+    """MTGJSON republishing the watermark date with a revised price must reach
+    `prices`.
+
+    `since` is exclusive, so projecting from the old watermark forward skips
+    that date entirely: the revision lands in the sidecar and no later run can
+    ever copy it, because every later run projects from a strictly greater
+    date. On a fresh watchlist it is worse still — the first nightly run after
+    a build sees AllPricesToday carrying the date the build already had, and
+    projects nothing at all, leaving `prices` empty. Stepping the floor back
+    one day is what closes both."""
+    side, _ = _nightly_fixture(tmp_path, monkeypatch, {
+        "uuid-a": {"paper": {"tcgplayer": {"retail": {
+            "normal": {"2026-08-08": 6.50}}}}}})     # same date, revised price
+    assert price_sidecar.daily_through(side) == "2026-08-08"
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+
+    # 7.0 was the seeded price for that day; 8.0 on 2026-08-01 sits below the
+    # floor and is ensure_history's job, not the nightly run's.
+    got = {r["date"]: r["price"] for r in db.execute(
+        "SELECT date, price FROM prices WHERE uuid='uuid-a'"
+        " AND provider='tcgplayer' AND finish='normal'")}
+    assert got == {"2026-08-08": 6.50}
+
+
+def test_run_ingest_catches_up_on_several_days_at_once(db, db_path, tmp_path,
+                                                       monkeypatch):
+    """The claim the `since` comment makes: because `previous` is exclusive
+    rather than "yesterday", a sidecar advanced by several days projects every
+    one of them in a single pass."""
+    side, _ = _nightly_fixture(tmp_path, monkeypatch, {
+        "uuid-a": {"paper": {"tcgplayer": {"retail": {"normal": {
+            "2026-08-09": 6.75, "2026-08-10": 6.50, "2026-08-11": 6.25}}}}}})
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    watchlist_db.upsert_price(db, "uuid-a", "2026-08-01", "tcgplayer",
+                              "normal", 999.0)
+    db.commit()
+
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+
+    assert price_sidecar.daily_through(side) == "2026-08-11"
+    got = {r["date"]: r["price"] for r in db.execute(
+        "SELECT date, price FROM prices WHERE uuid='uuid-a'"
+        " AND provider='tcgplayer' AND finish='normal'")}
+    assert got["2026-08-09"] == 6.75
+    assert got["2026-08-10"] == 6.50
+    assert got["2026-08-11"] == 6.25
+    assert got["2026-08-01"] == 999.0     # still bounded below by `since`
+
+
+def test_run_ingest_skips_the_allprices_scan_when_the_sidecar_is_ready(
+        db, db_path, tmp_path, monkeypatch):
+    """Regression: `_needs_backfill` alone must not gate the 1.4 GB scan.
+
+    Any watched printing MTGJSON never prices — a promo, a token — satisfies
+    `_needs_backfill` tonight, tomorrow night and forever, so on that gate
+    alone the nightly ingest downloads and full-scans AllPrices every single
+    night to accomplish nothing. A ready sidecar already holds every card
+    MTGJSON prices, so the projection covers it."""
+    _, fetched = _nightly_fixture(tmp_path, monkeypatch, {
+        "uuid-a": {"paper": {"tcgplayer": {"retail": {
+            "normal": {"2026-08-09": 6.75}}}}}})
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+
+    # uuid-b is a watched Sol Ring printing with no prices anywhere, so the
+    # condition that used to gate the scan is still true afterwards.
+    assert db.execute("SELECT 1 FROM prices WHERE uuid='uuid-b'"
+                      ).fetchone() is None
+    assert watchlist_ingest._needs_backfill(db)
+    assert fetched == ["AllPrintings.sqlite", "AllPricesToday.json.gz"]
+
+
+def test_run_ingest_still_scans_allprices_without_a_sidecar(
+        db, db_path, tmp_path, monkeypatch):
+    """The gate above is a gate, not an unconditional skip: with no sidecar
+    the AllPrices scan is still the only source of history."""
+    src = tmp_path / "src"
+    src.mkdir()
+    ap = make_allprintings(src)
+    allp = make_prices_gz(src, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    today = make_prices_gz(src, "AllPricesToday.json.gz", {
+        "uuid-a": {"paper": {"tcgplayer": {"retail": {
+            "normal": {"2026-08-09": 6.75}}}}}})
+    fetched = []
+
+    def fake_download(url, dest, _db):
+        import shutil
+        name = url.rsplit("/", 1)[-1]
+        fetched.append(name)
+        shutil.copy({"AllPrintings.sqlite": ap,
+                     "AllPrices.json.gz": allp,
+                     "AllPricesToday.json.gz": today}[name], dest)
+        return dest
+    monkeypatch.setattr(watchlist_ingest, "_download", fake_download)
+    monkeypatch.setattr(watchlist_ingest, "notify_hits", lambda _db: 0)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+
+    assert fetched == ["AllPrintings.sqlite", "AllPrices.json.gz",
+                       "AllPricesToday.json.gz"]
+    dates = {r["date"] for r in db.execute("SELECT date FROM prices")}
+    assert {"2026-08-01", "2026-08-08", "2026-08-09"} <= dates
+
+
+def test_run_ingest_projects_before_it_downsamples(db, db_path, tmp_path,
+                                                   monkeypatch):
+    """apply -> project -> downsample, in that order.
+
+    Under the normal `since` bound the order is inert: the projection window
+    starts at the old watermark and downsample's cutoff sits 120 days below
+    it, so they cannot overlap. It goes live when `previous` is None, which
+    price_sidecar documents as reachable — a build whose points were all
+    unparseable writes built_at but no daily_through, and is_ready() accepts
+    it. Then the projection is unbounded, and downsampling first would replace
+    the aged dailies with weekly means before they are copied, so `prices`
+    would record one Sunday mean as if it were the week's only observation."""
+    src = tmp_path / "src"
+    src.mkdir()
+    ap = make_allprintings(src)
+    seed = make_prices_gz(src, "seed.json.gz", {"uuid-a": {"paper": {
+        "tcgplayer": {"retail": {"normal": {f"2026-01-{d:02d}": 5.0
+                                            for d in range(5, 12)}}}}}})
+    today = make_prices_gz(src, "AllPricesToday.json.gz", {
+        "uuid-a": {"paper": {"tcgplayer": {"retail": {
+            "normal": {"2026-08-09": 6.75}}}}}})
+    side = watchlist_ingest._sidecar_path(str(tmp_path))
+    price_sidecar.build_from_allprices(side, seed)
+    sdb = price_sidecar.connect(side)
+    sdb.execute("DELETE FROM meta WHERE key='daily_through'")
+    sdb.commit()
+    sdb.close()
+    assert price_sidecar.is_ready(side) and price_sidecar.daily_through(side) is None
+
+    def fake_download(url, dest, _db):
+        import shutil
+        shutil.copy(ap if url.endswith(".sqlite") else today, dest)
+        return dest
+    monkeypatch.setattr(watchlist_ingest, "_download", fake_download)
+    monkeypatch.setattr(watchlist_ingest, "notify_hits", lambda _db: 0)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+
+    dates = {r["date"] for r in db.execute("SELECT date FROM prices")}
+    assert "2026-08-09" in dates             # the day just applied
+    # Collapsed in the sidecar afterwards, but projected as a daily first.
+    assert "2026-01-06" in dates, "downsample ran before the projection"
+    sdb = price_sidecar.connect(side)
+    weekly = sdb.execute("SELECT COUNT(*) FROM points WHERE agg=1").fetchone()[0]
+    sdb.close()
+    assert weekly >= 1, "downsample never ran at all"
+
+
+def test_run_ingest_stamps_last_ingest_when_downsample_fails(
+        db, db_path, tmp_path, monkeypatch):
+    """Retention is housekeeping. If it fails, the day's prices have already
+    landed — losing the last_ingest stamp would report the night as un-run and
+    make /health say ingest_stale for work that actually succeeded."""
+    _nightly_fixture(tmp_path, monkeypatch, {
+        "uuid-a": {"paper": {"tcgplayer": {"retail": {
+            "normal": {"2026-08-09": 6.75}}}}}})
+
+    tried = []
+
+    def boom(*a, **k):
+        tried.append(1)
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(price_sidecar, "downsample", boom)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+
+    assert tried, "run_ingest never even attempted to downsample"
+    assert db.execute("SELECT value FROM meta WHERE key='last_ingest'"
+                      ).fetchone() is not None
+    fresh = db.execute(
+        "SELECT price FROM prices WHERE date='2026-08-09'").fetchone()
+    assert fresh is not None and fresh["price"] == 6.75

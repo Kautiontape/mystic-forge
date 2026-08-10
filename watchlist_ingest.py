@@ -326,14 +326,53 @@ def run_ingest(db_path: str, data_dir: str | None = None) -> None:
         if week_old or _needs_unresolved(db):
             ap_path = _download(f"{MTGJSON}/AllPrintings.sqlite", ap_path, db)
         resolve_watched(db, ap_path)
-        if _needs_backfill(db):
+        # Read readiness once and branch on the same answer twice, so the two
+        # gates below can never disagree and drop the backfill entirely.
+        side = _sidecar_path(data_dir)
+        ready = price_sidecar.is_ready(side)
+        # _needs_backfill alone must NOT gate this. It asks "any watched uuid
+        # with no price rows at all?", and a printing MTGJSON simply never
+        # prices — a promo, a token — answers yes tonight, tomorrow night and
+        # forever, so on that condition alone this downloads and full-scans
+        # 1.4 GB every night to accomplish nothing. A ready sidecar holds
+        # every card MTGJSON prices, so the projection below covers whatever
+        # is missing; the scan stays only as the sidecar-not-ready fallback.
+        if not ready and _needs_backfill(db):
             p = _download(f"{MTGJSON}/AllPrices.json.gz",
                           os.path.join(data_dir, "AllPrices.json.gz"), db)
             n = ingest_prices_file(db, p)
             log.info("backfill: %d rows", n)
         p = _download(f"{MTGJSON}/AllPricesToday.json.gz",
                       os.path.join(data_dir, "AllPricesToday.json.gz"), db)
-        n = ingest_prices_file(db, p)
+        if ready:
+            previous = price_sidecar.daily_through(side)
+            # apply, then project, then downsample — the order is load-bearing
+            # and must not be reshuffled. Downsampling before the projection
+            # would collapse aged dailies into weekly means first, and the
+            # projection would then write those means into `prices` as if they
+            # were daily observations of a watched card.
+            price_sidecar.apply_daily(side, p)
+            # Project only what is new. `previous` is exclusive, so a server
+            # that was down for several days catches up in one pass.
+            # since= is exclusive, so step back a day: re-projecting the
+            # watermark date is what catches a same-date revision, which would
+            # otherwise land in the sidecar and never reach `prices`.
+            # upsert_price is an INSERT OR REPLACE, so the overlap is
+            # idempotent and costs one day's rows for watched uuids.
+            floor = (price_sidecar.from_day(price_sidecar.to_day(previous) - 1)
+                     if previous is not None else None)
+            n = _project(db, side, watched_uuids(db), since=floor)
+            try:
+                price_sidecar.downsample(side)
+            except Exception:
+                # Retention is housekeeping and the day's prices have already
+                # landed. Letting this escape would skip the last_ingest stamp
+                # below, so /health would report ingest_stale for a night that
+                # actually succeeded.
+                log.exception("sidecar downsample failed; the day's prices "
+                              "are already applied and projected")
+        else:
+            n = ingest_prices_file(db, p)
         log.info("daily: %d rows", n)
         _set_meta(db, "last_ingest", date.today().isoformat())
         notify_hits(db)
