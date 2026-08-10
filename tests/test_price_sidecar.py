@@ -1,5 +1,6 @@
 import gzip
 import json
+import math
 import os
 import sqlite3
 import tracemalloc
@@ -337,3 +338,89 @@ def test_apply_daily_crash_then_retry_converges(tmp_path, monkeypatch):
         "SELECT cents FROM points WHERE day=?", (day9,))}
     db.close()
     assert cents == {100, 101, 102, 103, 104}
+
+
+def test_series_for_uuids_returns_upsert_shaped_tuples(tmp_path):
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        {"uuid-a": PRICE_OBJ, "uuid-b": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    got = sorted(price_sidecar.series_for_uuids(p, ["uuid-a"]))
+    assert got == sorted([
+        ("uuid-a", "2026-08-01", "tcgplayer", "normal", 8.0),
+        ("uuid-a", "2026-08-08", "tcgplayer", "normal", 7.0),
+        ("uuid-a", "2026-08-08", "tcgplayer", "foil", 30.0),
+        ("uuid-a", "2026-08-08", "manapool", "normal", 6.5),
+    ])
+
+
+def test_series_filters_by_provider_and_since(tmp_path):
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    only = list(price_sidecar.series_for_uuids(p, ["uuid-a"],
+                                               providers=["manapool"]))
+    assert only == [("uuid-a", "2026-08-08", "manapool", "normal", 6.5)]
+    recent = list(price_sidecar.series_for_uuids(p, ["uuid-a"],
+                                                 since="2026-08-01"))
+    assert all(d > "2026-08-01" for _u, d, _p, _f, _v in recent)
+    assert len(recent) == 3
+
+
+def test_series_on_unbuilt_sidecar_yields_nothing(tmp_path):
+    assert list(price_sidecar.series_for_uuids(
+        str(tmp_path / "absent.sqlite"), ["uuid-a"])) == []
+
+
+def test_series_skips_reserved_and_future_src_codes(tmp_path):
+    """A rollback reading rows a newer build wrote for an unnamed provider or
+    finish must skip them, not raise -- pack_src already treats unknowns as
+    None on write; unpack_src must mirror that on read."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    db = price_sidecar.connect(p)
+    card_id = db.execute(
+        "SELECT card_id FROM cards WHERE uuid='uuid-a'").fetchone()[0]
+    day = price_sidecar.to_day("2026-08-09")
+    db.execute("INSERT INTO points (card_id, src, day, cents, agg)"
+              " VALUES (?,3,?,100,0)", (card_id, day))       # reserved finish
+    db.execute("INSERT INTO points (card_id, src, day, cents, agg)"
+              " VALUES (?,16,?,200,0)", (card_id, day))      # future provider
+    db.commit()
+    db.close()
+    got = list(price_sidecar.series_for_uuids(p, ["uuid-a"]))
+    assert len(got) == 4                    # only the original 4 valid points
+    assert all(row[0] == "uuid-a" for row in got)
+
+
+def test_chunks_covers_every_item_including_a_partial_tail():
+    assert list(price_sidecar._chunks(list(range(7)), 3)) == [[0, 1, 2], [3, 4, 5], [6]]
+    assert list(price_sidecar._chunks(list(range(6)), 3)) == [[0, 1, 2], [3, 4, 5]]
+    assert list(price_sidecar._chunks([], 3)) == []
+
+
+def test_series_stitches_results_across_several_queries(tmp_path, monkeypatch):
+    """A watchlist larger than one chunk is split across queries and stitched
+    back with nothing dropped. Asserts the query count, not just the result:
+    SQLite's parameter cap is 32766, so a row-count assertion alone passes
+    even with chunking removed entirely."""
+    many = {f"uuid-{i}": TODAY_OBJ for i in range(50)}
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", many)
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+
+    monkeypatch.setattr(price_sidecar, "READ_CHUNK", 7)
+    seen = []
+    real_connect = price_sidecar.connect
+
+    def tracing_connect(path):
+        db = real_connect(path)
+        db.set_trace_callback(
+            lambda s: seen.append(s) if "FROM points" in s else None)
+        return db
+    monkeypatch.setattr(price_sidecar, "connect", tracing_connect)
+
+    got = list(price_sidecar.series_for_uuids(p, list(many)))
+    assert len({u for u, *_ in got}) == 50
+    assert len(seen) == math.ceil(50 / 7) == 8

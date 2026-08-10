@@ -29,6 +29,7 @@ FINISH_SLOTS = 4          # packing stride; room for a 4th finish without renumb
 KEEP_DAILY_DAYS = 120
 BATCH = 50_000
 BUILD_HEADROOM = 2_500_000_000     # bytes of free space a full build needs
+READ_CHUNK = 500          # uuids per read query; well under SQLite's 32766 parameter cap
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cards (
@@ -66,8 +67,16 @@ def pack_src(provider: str, finish: str):
     return p * FINISH_SLOTS + f
 
 
-def unpack_src(src: int) -> tuple[str, str]:
-    return PROVIDERS[src // FINISH_SLOTS], FINISHES[src % FINISH_SLOTS]
+def unpack_src(src: int):
+    """Decode a packed src, or None if it names a slot this build reserves.
+
+    Mirrors pack_src, which already returns None for unknowns. A newer build
+    may write a provider or finish this one has no name for; reading such a
+    row must skip it, never raise."""
+    p, f = divmod(src, FINISH_SLOTS)
+    if p >= len(PROVIDERS) or f >= len(FINISHES):
+        return None
+    return PROVIDERS[p], FINISHES[f]
 
 
 def to_day(iso: str) -> int:
@@ -287,5 +296,56 @@ def apply_daily(path: str, gz_path: str) -> int:
         db.commit()
         log.info("sidecar daily: %d points, %d cards", rows, len(ids))
         return rows
+    finally:
+        db.close()
+
+
+def _chunks(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def series_for_uuids(path: str, uuids, providers=None, since: str | None = None):
+    """Yield (uuid, date_iso, provider, finish, price) for the given uuids.
+
+    Shaped exactly for watchlist_db.upsert_price, so the projection into the
+    main database needs no adaptation layer. `since` is exclusive. Yields
+    nothing at all when the sidecar is not ready — callers fall back.
+
+    Holds a read connection to `path` open for as long as the generator is
+    alive; callers should consume it fully (a full `for` loop, or `list(...)`)
+    rather than abandoning it partway with a `break`."""
+    uuids = list(uuids)
+    if not uuids or not is_ready(path):
+        return
+    want = None
+    if providers is not None:
+        want = {pack_src(p, f) for p in providers for f in FINISHES}
+        want.discard(None)
+        if not want:
+            return
+    floor = to_day(since) if since else None
+    db = connect(path)
+    try:
+        for chunk in _chunks(uuids, READ_CHUNK):
+            marks = ",".join("?" * len(chunk))
+            sql = (f"SELECT c.uuid AS uuid, p.src AS src, p.day AS day,"
+                   f" p.cents AS cents FROM points p"
+                   f" JOIN cards c ON c.card_id = p.card_id"
+                   f" WHERE c.uuid IN ({marks})")
+            args = list(chunk)
+            if floor is not None:
+                sql += " AND p.day > ?"
+                args.append(floor)
+            sql += " ORDER BY c.uuid, p.src, p.day"
+            for r in db.execute(sql, args):
+                if want is not None and r["src"] not in want:
+                    continue
+                pair = unpack_src(r["src"])
+                if pair is None:
+                    continue
+                provider, finish = pair
+                yield (r["uuid"], from_day(r["day"]), provider, finish,
+                       from_cents(r["cents"]))
     finally:
         db.close()
