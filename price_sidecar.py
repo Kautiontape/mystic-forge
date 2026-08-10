@@ -219,3 +219,73 @@ def build_from_allprices(path: str, gz_path: str) -> int:
     os.replace(part, path)
     log.info("sidecar built: %d cards, %d points", len(ids), rows)
     return rows
+
+
+def apply_daily(path: str, gz_path: str) -> int:
+    """Fold a day's AllPricesToday into a built sidecar. Returns points written.
+
+    A no-op on an unbuilt sidecar: a partial file must never look like a
+    complete one. New uuids are learned as they appear.
+
+    Commits per batch rather than once at the end. The primary key orders
+    points by (card_id, src, day), so one card's rows all live on roughly
+    the same leaf page; folding in a single new day still touches nearly
+    every leaf page in the file, and a single all-at-once transaction would
+    let the WAL grow to roughly the size of the whole database. Committing
+    incrementally bounds that.
+
+    This trades away the all-or-nothing guarantee build_from_allprices has:
+    a crash mid-apply can leave some of the day's rows committed and others
+    not. What survives is that this call never advances daily_through() past
+    a day it left incomplete -- the watermark write is the last statement --
+    and INSERT OR REPLACE makes re-running this function over the *same*
+    file converge to the complete, correct state.
+
+    That guarantee is per-invocation, not global. If a crash is followed by
+    a run that applies a *different* day, the watermark advances past the
+    interrupted day and its missing rows are permanently lost, because
+    AllPricesToday only ever carries the latest day. Nothing heals this
+    short of deleting the sidecar to force a rebuild, and only inside
+    MTGJSON's 90-day window. Callers must not read daily_through() as
+    proof that every day beneath it is complete."""
+    if not is_ready(path):
+        return 0
+    db = connect(path)
+    try:
+        ids = {r["uuid"]: r["card_id"]
+               for r in db.execute("SELECT uuid, card_id FROM cards")}
+        next_id = max(ids.values(), default=0) + 1
+        batch, rows, newest = [], 0, None
+        for uuid, src, day, cents in _iter_points(gz_path):
+            cid = ids.get(uuid)
+            if cid is None:
+                cid = next_id
+                next_id += 1
+                ids[uuid] = cid
+                db.execute("INSERT INTO cards (card_id, uuid) VALUES (?,?)",
+                           (cid, uuid))
+            batch.append((cid, src, day, cents))
+            newest = day if newest is None else max(newest, day)
+            if len(batch) >= BATCH:
+                db.executemany(
+                    "INSERT OR REPLACE INTO points (card_id,src,day,cents,agg)"
+                    " VALUES (?,?,?,?,0)", batch)
+                db.commit()
+                rows += len(batch)
+                batch.clear()
+        if batch:
+            db.executemany(
+                "INSERT OR REPLACE INTO points (card_id,src,day,cents,agg)"
+                " VALUES (?,?,?,?,0)", batch)
+            db.commit()
+            rows += len(batch)
+        if newest is not None:
+            prev = _get_meta(db, "daily_through")
+            latest = from_day(newest)
+            if prev is None or latest > prev:
+                _set_meta(db, "daily_through", latest)
+        db.commit()
+        log.info("sidecar daily: %d points, %d cards", rows, len(ids))
+        return rows
+    finally:
+        db.close()

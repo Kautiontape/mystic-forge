@@ -175,3 +175,165 @@ def test_build_discards_a_stale_wal_from_an_unclean_shutdown(tmp_path):
     uuids = {r["uuid"] for r in db.execute("SELECT uuid FROM cards")}
     db.close()
     assert uuids == {"uuid-new"}
+
+
+TODAY_OBJ = {"paper": {"tcgplayer": {"retail": {
+    "normal": {"2026-08-09": 6.75}}}}}
+
+
+def test_apply_daily_appends_and_advances_the_watermark(tmp_path):
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    assert price_sidecar.daily_through(p) == "2026-08-08"
+
+    today = make_prices_gz(tmp_path, "AllPricesToday.json.gz",
+                           {"uuid-a": TODAY_OBJ})
+    assert price_sidecar.apply_daily(p, today) == 1
+    assert price_sidecar.daily_through(p) == "2026-08-09"
+    db = price_sidecar.connect(p)
+    got = db.execute(
+        "SELECT cents FROM points WHERE day=?",
+        (price_sidecar.to_day("2026-08-09"),)).fetchone()["cents"]
+    db.close()
+    assert got == 675
+
+
+def test_apply_daily_learns_new_cards(tmp_path):
+    """A card printed after the build must get a card_id, not be dropped."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    today = make_prices_gz(tmp_path, "AllPricesToday.json.gz",
+                           {"uuid-a": TODAY_OBJ, "uuid-new": TODAY_OBJ})
+    assert price_sidecar.apply_daily(p, today) == 2
+    db = price_sidecar.connect(p)
+    uuids = {r["uuid"] for r in db.execute("SELECT uuid FROM cards")}
+    db.close()
+    assert uuids == {"uuid-a", "uuid-new"}
+
+
+def test_apply_daily_is_idempotent(tmp_path):
+    """Applying the same day twice must leave every stored value unchanged,
+    not merely the row count -- a bug that corrupts cents on replay while
+    keeping the same primary key must not slip past this test."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    today = make_prices_gz(tmp_path, "AllPricesToday.json.gz",
+                           {"uuid-a": TODAY_OBJ})
+    price_sidecar.apply_daily(p, today)
+    db = price_sidecar.connect(p)
+    before = db.execute(
+        "SELECT card_id, src, day, cents, agg FROM points ORDER BY 1,2,3").fetchall()
+    db.close()
+    price_sidecar.apply_daily(p, today)
+    db = price_sidecar.connect(p)
+    after = db.execute(
+        "SELECT card_id, src, day, cents, agg FROM points ORDER BY 1,2,3").fetchall()
+    db.close()
+    assert [tuple(r) for r in before] == [tuple(r) for r in after]
+
+
+def test_apply_daily_on_unbuilt_sidecar_is_a_noop(tmp_path):
+    today = make_prices_gz(tmp_path, "AllPricesToday.json.gz",
+                           {"uuid-a": TODAY_OBJ})
+    assert price_sidecar.apply_daily(str(tmp_path / "absent.sqlite"), today) == 0
+
+
+def test_apply_daily_does_not_regress_the_watermark(tmp_path):
+    """A stale or reprocessed daily file must never move daily_through
+    backward."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    newer = make_prices_gz(tmp_path, "AllPricesToday.json.gz",
+                           {"uuid-a": TODAY_OBJ})
+    price_sidecar.apply_daily(p, newer)
+    assert price_sidecar.daily_through(p) == "2026-08-09"
+
+    stale_obj = {"paper": {"tcgplayer": {"retail": {
+        "normal": {"2026-08-05": 5.0}}}}}
+    older = make_prices_gz(tmp_path, "AllPricesStale.json.gz",
+                           {"uuid-a": stale_obj})
+    price_sidecar.apply_daily(p, older)
+    assert price_sidecar.daily_through(p) == "2026-08-09"
+
+
+def test_apply_daily_assigns_ids_past_a_gap_in_card_id(tmp_path):
+    """max(card_id)+1 must stay collision-free even with a gap in the
+    sequence -- the exact case that motivates max+1 over len(cards)+1."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        {"uuid-a": PRICE_OBJ, "uuid-b": PRICE_OBJ,
+                         "uuid-c": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    db = price_sidecar.connect(p)
+    db.execute("DELETE FROM points WHERE card_id="
+              "(SELECT card_id FROM cards WHERE uuid='uuid-b')")
+    db.execute("DELETE FROM cards WHERE uuid='uuid-b'")
+    db.commit()
+    remaining = {r["uuid"]: r["card_id"]
+                for r in db.execute("SELECT uuid, card_id FROM cards")}
+    db.close()
+    assert remaining == {"uuid-a": 1, "uuid-c": 3}   # len(cards)==2, but max==3
+
+    today = make_prices_gz(tmp_path, "AllPricesToday.json.gz",
+                           {"uuid-new": TODAY_OBJ})
+    price_sidecar.apply_daily(p, today)
+
+    db = price_sidecar.connect(p)
+    rows = {r["uuid"]: r["card_id"]
+           for r in db.execute("SELECT uuid, card_id FROM cards")}
+    db.close()
+    assert rows["uuid-new"] == 4          # max(1,3)+1, not len(cards)+1 == 3
+    assert len(set(rows.values())) == len(rows)     # no collisions
+
+
+def test_apply_daily_crash_then_retry_converges(tmp_path, monkeypatch):
+    """Per-batch commits mean a crash mid-apply can leave some but not all
+    of a day's rows committed. That must leave the watermark unadvanced,
+    and re-running the same file afterward must converge to the complete,
+    correct state -- the invariant that replaces the all-or-nothing
+    guarantee build_from_allprices has."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    previous = price_sidecar.daily_through(p)
+
+    monkeypatch.setattr(price_sidecar, "BATCH", 2)
+    day9 = price_sidecar.to_day("2026-08-09")
+
+    def crashes_after_two_batches(_gz):
+        for i in range(4):
+            yield f"uuid-{i}", 0, day9, 100 + i
+        yield "uuid-4", 0, day9, 104          # appended, never committed
+        raise RuntimeError("simulated crash mid-apply")
+
+    today = make_prices_gz(tmp_path, "AllPricesToday.json.gz",
+                           {"uuid-a": TODAY_OBJ})
+    with mock.patch.object(price_sidecar, "_iter_points", crashes_after_two_batches):
+        with pytest.raises(RuntimeError):
+            price_sidecar.apply_daily(p, today)
+
+    assert price_sidecar.daily_through(p) == previous
+    db = price_sidecar.connect(p)
+    partial = db.execute("SELECT COUNT(*) FROM points WHERE day=?",
+                         (day9,)).fetchone()[0]
+    db.close()
+    assert partial == 4          # the first two committed batches, not the fifth
+
+    def full_day(_gz):
+        for i in range(5):
+            yield f"uuid-{i}", 0, day9, 100 + i
+
+    with mock.patch.object(price_sidecar, "_iter_points", full_day):
+        n = price_sidecar.apply_daily(p, today)
+
+    assert n == 5
+    assert price_sidecar.daily_through(p) == "2026-08-09"
+    db = price_sidecar.connect(p)
+    cents = {r["cents"] for r in db.execute(
+        "SELECT cents FROM points WHERE day=?", (day9,))}
+    db.close()
+    assert cents == {100, 101, 102, 103, 104}
