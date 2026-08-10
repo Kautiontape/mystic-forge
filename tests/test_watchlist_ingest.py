@@ -435,6 +435,44 @@ def test_ensure_history_falls_back_when_the_sidecar_read_raises(
     assert db.execute("SELECT COUNT(*) FROM prices").fetchone()[0] == 3
 
 
+def test_a_failed_projection_leaves_none_of_its_rows_behind(
+        db, db_path, tmp_path, monkeypatch):
+    """A projection that dies part-way must not leak its staged rows.
+
+    _project writes with commit=False so an abort leaves `prices` untouched --
+    but the scan it falls back to runs on the *same* connection and ends in its
+    own commit, which would happily persist whatever the failed projection had
+    already staged. Only an explicit rollback makes the docstring true."""
+    ap = make_allprintings(tmp_path)
+    # The sidecar knows 2026-08-01; the file the scan reads does not, so a row
+    # for that date in `prices` can only have come from the failed projection.
+    sidecar_gz = make_prices_gz(tmp_path, "seed.json.gz", {"uuid-a": PRICE_OBJ})
+    price_sidecar.build_from_allprices(
+        watchlist_ingest._sidecar_path(str(tmp_path)), sidecar_gz)
+    make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": {"paper": {
+        "tcgplayer": {"retail": {"normal": {"2026-08-08": 7.0}}}}}})
+
+    real = price_sidecar.series_for_uuids
+
+    def yield_then_die(*a, **k):
+        for row in real(*a, **k):
+            yield row          # stage at least one row, then fail
+            raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(price_sidecar, "series_for_uuids", yield_then_die)
+
+    def no_download(*a, **k):
+        raise AssertionError("both files are already cached")
+    monkeypatch.setattr(watchlist_ingest, "_download", no_download)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    assert watchlist_ingest.ensure_history(db_path, str(tmp_path)) == 1
+    dates = {r["date"] for r in db.execute("SELECT date FROM prices")}
+    assert dates == {"2026-08-08"}, "a staged sidecar row survived the abort"
+
+
 def test_projection_carries_both_daily_and_weekly_points(db, db_path, tmp_path):
     """Spec acceptance 3: a card with history past the window projects daily
     points inside it and weekly means beyond, and price_series returns both."""

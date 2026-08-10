@@ -193,8 +193,13 @@ def _project(db, sidecar_path: str, uuids, since: str | None = None) -> int:
 
 
 def ensure_history(db_path: str, data_dir: str | None = None) -> int:
-    """Guarantee every watched card has its ~90 days of history, downloading
-    the MTGJSON files if they aren't cached yet.
+    """Guarantee every watched card has its price history.
+
+    How much history, and what it costs, depends on the sidecar: a ready one
+    supplies 120 days of dailies plus weekly means beyond that, as an indexed
+    read with no download. Without it this falls back to the original path —
+    MTGJSON's ~90 days, via a streaming scan of AllPrices, downloading it and
+    AllPrintings if they aren't cached yet.
 
     This is the on-demand path: history is a static backfill, so it must never
     wait for the nightly cycle. Idempotent and self-coalescing — it works on
@@ -229,6 +234,10 @@ def ensure_history(db_path: str, data_dir: str | None = None) -> int:
             try:
                 n = _project(db, side, missing)
             except Exception:
+                # The scan below runs on this same connection and ends in its
+                # own commit, which would otherwise persist whatever rows the
+                # failed projection had already staged.
+                db.rollback()
                 log.exception("sidecar projection failed; falling back to scan")
             else:
                 log.info("history fill from sidecar: %d uuid(s), %d rows",
