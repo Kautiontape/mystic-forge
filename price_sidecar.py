@@ -15,6 +15,7 @@ import gzip
 import logging
 import os
 import sqlite3
+from collections import Counter
 from datetime import date as _date, datetime, timedelta, timezone
 
 import ijson
@@ -142,13 +143,20 @@ def daily_through(path: str):
         db.close()
 
 
-def _iter_points(gz_path: str):
+def _iter_points(gz_path: str, counts: dict | None = None):
     """Yield (uuid, src, day, cents) from an MTGJSON prices .gz.
 
     Shape: data.<uuid>.paper.<provider>.retail.<finish>.<date> = price.
     Streams with ijson, so peak memory is independent of file size. Unknown
     providers/finishes and unparseable values are skipped, not fatal — MTGJSON
-    adds providers without warning."""
+    adds providers without warning.
+
+    `counts`, if given, is updated in place: counts["kept"][src] += 1 per
+    point yielded (keyed by the packed src), and
+    counts["skipped"][(provider, finish)] += len(series) for every
+    provider/finish pack_src does not recognize. Plain dict/Counter
+    increments only, bounded by the number of distinct provider/finish
+    pairs — this runs inside a loop over tens of millions of points."""
     with gzip.open(gz_path, "rb") as f:
         for uuid, obj in ijson.kvitems(f, "data"):
             paper = (obj or {}).get("paper") or {}
@@ -157,12 +165,19 @@ def _iter_points(gz_path: str):
                 for finish, series in retail.items():
                     src = pack_src(provider, finish)
                     if src is None:
+                        if counts is not None:
+                            counts["skipped"][(provider, finish)] += \
+                                len(series or {})
                         continue
+                    kept = counts["kept"] if counts is not None else None
                     for d, price in (series or {}).items():
                         try:
-                            yield uuid, src, to_day(d), to_cents(price)
+                            day, cents = to_day(d), to_cents(price)
                         except (ValueError, TypeError):
                             continue
+                        if kept is not None:
+                            kept[src] += 1
+                        yield uuid, src, day, cents
 
 
 def _free_bytes(directory: str) -> int:
@@ -192,7 +207,8 @@ def build_from_allprices(path: str, gz_path: str) -> int:
         ids: dict[str, int] = {}
         batch: list[tuple] = []
         rows = 0
-        for uuid, src, day, cents in _iter_points(gz_path):
+        counts = {"kept": Counter(), "skipped": Counter()}
+        for uuid, src, day, cents in _iter_points(gz_path, counts):
             cid = ids.get(uuid)
             if cid is None:
                 cid = len(ids) + 1
@@ -232,7 +248,10 @@ def build_from_allprices(path: str, gz_path: str) -> int:
         if os.path.exists(stale):
             os.remove(stale)
     os.replace(part, path)
-    log.info("sidecar built: %d cards, %d points", len(ids), rows)
+    log.info("sidecar built: %d cards, %d points; kept %s; skipped %s",
+              len(ids), rows,
+              {unpack_src(s): n for s, n in counts["kept"].items()},
+              dict(counts["skipped"]))
     return rows
 
 
@@ -476,5 +495,45 @@ def downsample(path: str, keep_daily_days: int = KEEP_DAILY_DAYS,
         if deleted:
             log.info("sidecar downsample: %d daily rows collapsed", deleted)
         return deleted
+    finally:
+        db.close()
+
+
+def stats(path: str) -> dict:
+    """Shape and span of the sidecar, for /health. Counts are full scans, so
+    call this on an operator-facing endpoint, not a hot path.
+
+    `bytes` sums the main file with any live -wal/-shm companions. A WAL-mode
+    database is a three-file unit, and a concurrent reader -- another stats()
+    call included -- can hold a checkpoint back long enough for the -wal to
+    reach a meaningful fraction of the main file's size; reporting the main
+    file alone would understate what the volume actually holds.
+
+    `daily_through` is the stored watermark, reported alongside the computed
+    `latest` rather than instead of it. The two agree under normal operation,
+    so publishing both costs nothing and turns any divergence between them
+    into a free signal of a partial write."""
+    if not is_ready(path):
+        return {"ready": False}
+    db = connect(path)
+    try:
+        span = db.execute("SELECT COUNT(*) AS n, MIN(day) AS lo, MAX(day) AS hi"
+                          " FROM points").fetchone()
+        daily = db.execute("SELECT COUNT(*) AS n FROM points WHERE agg=0"
+                           ).fetchone()["n"]
+        return {
+            "ready": True,
+            "cards": db.execute("SELECT COUNT(*) AS n FROM cards").fetchone()["n"],
+            "points": span["n"],
+            "daily_points": daily,
+            "weekly_points": span["n"] - daily,
+            "earliest": from_day(span["lo"]) if span["lo"] is not None else None,
+            "latest": from_day(span["hi"]) if span["hi"] is not None else None,
+            "daily_through": _get_meta(db, "daily_through"),
+            "built_at": _get_meta(db, "built_at"),
+            "bytes": sum(os.path.getsize(path + suffix)
+                        for suffix in ("", "-wal", "-shm")
+                        if os.path.exists(path + suffix)),
+        }
     finally:
         db.close()

@@ -112,7 +112,7 @@ def test_build_is_atomic_on_failure(tmp_path):
     price_sidecar.build_from_allprices(p, gz)
     before = os.path.getsize(p)
 
-    def boom(_gz):
+    def boom(_gz, _counts=None):
         yield "uuid-a", 0, 100, 500
         raise RuntimeError("disk fell over")
 
@@ -718,6 +718,112 @@ def test_downsample_leaves_no_half_applied_state_inside_a_chunk(tmp_path):
             db.execute("SELECT day, cents, agg FROM points ORDER BY day")]
     db.close()
     assert rows == [("2026-01-11", 1300, 1), ("2026-01-18", 2000, 1)]
+
+
+def test_stats_reports_shape_and_span(tmp_path):
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    s = price_sidecar.stats(p)
+    assert s["ready"] is True
+    assert s["cards"] == 1
+    assert s["points"] == 4
+    assert s["daily_points"] == 4
+    assert s["weekly_points"] == 0
+    assert s["earliest"] == "2026-08-01"
+    assert s["latest"] == "2026-08-08"
+    assert s["bytes"] > 0
+    assert s["built_at"]
+    # The stored watermark and the computed max(day) agree under normal
+    # operation; publishing both turns a future divergence into a free
+    # partial-write signal.
+    assert s["daily_through"] == s["latest"]
+
+
+def test_stats_distinguishes_daily_and_weekly_points(tmp_path):
+    """A freshly built fixture never populates agg=1, so a stats()
+    implementation that counts every row instead of filtering on agg=0
+    would still pass test_stats_reports_shape_and_span above -- daily_points
+    and weekly_points there are 4 and 0 either way. This fixture actually
+    contains both tiers, produced by a real downsample rather than planted
+    by hand, so the two counts can only agree with a real filter."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        _daily_series("uuid-a", "2026-01-05", 14))
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    # cutoff falls mid-week-2: week 1 (7 rows) collapses to one weekly mean,
+    # week 2 (7 rows) is left daily.
+    price_sidecar.downsample(p, keep_daily_days=1, today="2026-01-15")
+    s = price_sidecar.stats(p)
+    assert s["daily_points"] == 7
+    assert s["weekly_points"] == 1
+    assert s["daily_points"] != s["weekly_points"]
+    assert s["daily_points"] + s["weekly_points"] == s["points"]
+
+
+def test_stats_bytes_includes_a_live_wal(tmp_path):
+    """bytes must count the whole on-disk unit, not just the main file: a
+    concurrent reader -- a slow watchlist page render, or another stats()
+    call -- can hold a checkpoint back long enough for the -wal to become a
+    meaningful fraction of what the sidecar actually costs on disk."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+
+    # Establish WAL mode, exactly as the server's first connect() would.
+    warm = price_sidecar.connect(p)
+    warm.close()
+    main_only = os.path.getsize(p)
+
+    # A long-lived reader holds a snapshot open and blocks checkpointing.
+    reader = sqlite3.connect(p)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM points").fetchone()
+
+    writer = price_sidecar.connect(p)
+    writer.execute("INSERT INTO points (card_id, src, day, cents, agg)"
+                  " VALUES (1, 3, 999, 100, 0)")
+    writer.commit()
+    writer.close()
+
+    assert os.path.exists(p + "-wal")
+    assert os.path.getsize(p + "-wal") > 0
+
+    s = price_sidecar.stats(p)
+    expected = sum(os.path.getsize(p + suffix)
+                   for suffix in ("", "-wal", "-shm")
+                   if os.path.exists(p + suffix))
+    assert s["bytes"] == expected
+    assert s["bytes"] > main_only
+
+    reader.close()
+
+
+def test_stats_on_missing_file_is_not_ready(tmp_path):
+    assert price_sidecar.stats(str(tmp_path / "absent.sqlite")) == {"ready": False}
+
+
+def test_build_logs_skip_counts_for_unknown_provider(tmp_path, caplog):
+    """The failure this guards: MTGJSON renames a provider or adds a new
+    finish, pack_src returns None for it, and the build completes with a
+    plausible-looking total while an entire provider silently vanishes.
+    A grep of the deploy log must be able to catch that."""
+    obj = {"paper": {
+        "somenewstore": {"retail": {"normal": {"2026-08-08": 1.0,
+                                                "2026-08-07": 1.5}}},
+        "tcgplayer": {"retail": {"normal": {"2026-08-08": 2.0}}}}}
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": obj})
+    p = str(tmp_path / "side.sqlite")
+    with caplog.at_level("INFO", logger="mystic_forge.sidecar"):
+        price_sidecar.build_from_allprices(p, gz)
+    built = [r for r in caplog.records if "sidecar built" in r.getMessage()]
+    assert len(built) == 1
+    msg = built[0].getMessage()
+    assert "somenewstore" in msg
+    assert "skipped" in msg
+    # exactly the two points under the unknown provider, not e.g. 1 group
+    assert "{('somenewstore', 'normal'): 2}" in msg
+    assert "{('tcgplayer', 'normal'): 1}" in msg
 
 
 def test_apply_daily_warns_on_a_day_older_than_the_daily_window(tmp_path, caplog):
