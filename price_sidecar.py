@@ -27,7 +27,13 @@ PROVIDERS = ("tcgplayer", "cardkingdom", "cardmarket", "manapool")
 FINISHES = ("normal", "foil", "etched")
 FINISH_SLOTS = 4          # packing stride; room for a 4th finish without renumbering
 KEEP_DAILY_DAYS = 120
+# Must stay comfortably above MTGJSON's ~90-day AllPrices window. That gap is
+# the only reason an ingested row can never be older than downsample's cutoff.
+# Lower this below ~90 -- or point apply_daily at a full AllPrices rather than
+# AllPricesToday -- and daily rows start landing in weeks that have already
+# collapsed, where downsample can only discard them (see there).
 BATCH = 50_000
+DOWNSAMPLE_CARDS = 2_000  # card_ids per downsample transaction; bounds the WAL
 BUILD_HEADROOM = 2_500_000_000     # bytes of free space a full build needs
 READ_CHUNK = 500          # uuids per read query; well under SQLite's 32766 parameter cap
 
@@ -264,7 +270,7 @@ def apply_daily(path: str, gz_path: str) -> int:
         ids = {r["uuid"]: r["card_id"]
                for r in db.execute("SELECT uuid, card_id FROM cards")}
         next_id = max(ids.values(), default=0) + 1
-        batch, rows, newest = [], 0, None
+        batch, rows, newest, oldest = [], 0, None, None
         for uuid, src, day, cents in _iter_points(gz_path):
             cid = ids.get(uuid)
             if cid is None:
@@ -275,6 +281,7 @@ def apply_daily(path: str, gz_path: str) -> int:
                            (cid, uuid))
             batch.append((cid, src, day, cents))
             newest = day if newest is None else max(newest, day)
+            oldest = day if oldest is None else min(oldest, day)
             if len(batch) >= BATCH:
                 db.executemany(
                     "INSERT OR REPLACE INTO points (card_id,src,day,cents,agg)"
@@ -293,6 +300,17 @@ def apply_daily(path: str, gz_path: str) -> int:
             latest = from_day(newest)
             if prev is None or latest > prev:
                 _set_meta(db, "daily_through", latest)
+        # Detecting this in downsample would cost a second full scan and could
+        # only report "some rows were dropped"; here every day is already in
+        # hand, so it costs one min() per point and names the offending date.
+        if (oldest is not None and newest is not None
+                and oldest < newest - KEEP_DAILY_DAYS):
+            log.warning(
+                "sidecar daily: %s is older than the %d-day daily window "
+                "ending %s -- downsample will discard points landing in weeks "
+                "it has already collapsed. KEEP_DAILY_DAYS must stay above the "
+                "span this file covers.",
+                from_day(oldest), KEEP_DAILY_DAYS, from_day(newest))
         db.commit()
         log.info("sidecar daily: %d points, %d cards", rows, len(ids))
         return rows
@@ -347,5 +365,116 @@ def series_for_uuids(path: str, uuids, providers=None, since: str | None = None)
                 provider, finish = pair
                 yield (r["uuid"], from_day(r["day"]), provider, finish,
                        from_cents(r["cents"]))
+    finally:
+        db.close()
+
+
+def week_anchor(day: int) -> int:
+    """Day-offset of the Sunday ending `day`'s ISO week.
+
+    EPOCH is a Wednesday, which is where the + 2 comes from.
+
+    Kept in lockstep with _ANCHOR_SQL, which carries an extra `+ 7) % 7` this
+    does not need: Python's % floors, SQLite's truncates toward zero, so the
+    two forms agree only while `day + 2` is non-negative. A pre-EPOCH date --
+    which nothing in the ingest path rejects, and which to_day happily turns
+    into a negative offset -- makes the un-normalized SQL land a whole week
+    late while still falling on a Sunday, so nothing about the result looks
+    wrong. Normalizing the SQL is what "lockstep" means here."""
+    return day + 6 - ((day + 2) % 7)
+
+
+_ANCHOR_SQL = "(day + 6 - (((day + 2) % 7 + 7) % 7))"
+
+
+def downsample(path: str, keep_daily_days: int = KEEP_DAILY_DAYS,
+               today: str | None = None) -> int:
+    """Collapse daily rows older than the window into weekly means.
+
+    Returns rows deleted. Only whole weeks are collapsed: the anchor is the
+    week's last day, so anchor < cutoff proves every day of that week is
+    behind the cutoff. Only agg=0 rows are read as input, so a mean is never
+    taken of means and repeat runs are no-ops.
+
+    A week that already carries an agg=1 row is skipped entirely, so a late
+    daily row can never overwrite an established weekly mean with itself.
+    That late row is still deleted along with the rest of its cohort.
+    Reweighting the stored mean to absorb it is not merely expensive but
+    unsound: that needs to know whether the day is already inside the mean,
+    which a count cannot answer -- re-applying an already-included day would
+    double-count it -- and knowing it would mean storing the set of included
+    days, which defeats the compression. Leaving the row instead would strand
+    an agg=0 point behind the cutoff permanently. Discarding one late day is
+    the smaller loss. apply_daily warns when it sees such a day, which is
+    where the condition is detectable for free.
+
+    Wall-clock time bounds the cutoff only as far as the data allows: see the
+    watermark check below. Passing today= is a test seam and bypasses it.
+
+    Work is committed per DOWNSAMPLE_CARDS-wide card_id range rather than all
+    at once. Rows behind the cutoff are scattered across nearly every leaf
+    page, so a single transaction copies essentially the whole database into
+    the WAL -- measured at 100% of file size for one week's worth of rows.
+    Chunking trades this function's all-or-nothing guarantee for a bounded
+    WAL. That is safe because each card is collapsed independently of every
+    other: the aggregate groups by card_id and the guard above is correlated
+    on it, so a crash leaves whole cards done and the rest untouched, and the
+    next run finishes them without computing any value differently."""
+    if not is_ready(path):
+        return 0
+    db = connect(path)
+    try:
+        if today:
+            ref = _date.fromisoformat(today)
+        else:
+            ref = datetime.now(timezone.utc).date()
+            # The wall clock is an untrusted input, and this is the only
+            # irreversible operation in the module. A container without NTP,
+            # an NTP step after a long drift, a VM restored from a snapshot
+            # and a dead RTC battery all present as a jump forward, and one
+            # run with a fast clock collapses the entire daily window --
+            # unrecoverably, since past ~90 days MTGJSON cannot replay it.
+            # daily_through is what the data itself says, so let it bound the
+            # cutoff: a clock jump becomes a no-op, and a long ingest outage
+            # stops collapsing rather than racing ahead of the data.
+            watermark = _get_meta(db, "daily_through")
+            if watermark:
+                ref = min(ref, _date.fromisoformat(watermark))
+        cutoff = (ref - timedelta(days=keep_daily_days) - EPOCH).days
+        # Two queries, not one: SQLite optimizes a lone MIN() or MAX() over the
+        # leading primary-key column into a seek, but MIN(x), MAX(x) together
+        # into a full table scan.
+        lo = db.execute("SELECT MIN(card_id) FROM points").fetchone()[0]
+        hi = db.execute("SELECT MAX(card_id) FROM points").fetchone()[0]
+        if lo is None:
+            return 0
+        deleted = 0
+        for start in range(lo, hi + 1, DOWNSAMPLE_CARDS):
+            end = min(start + DOWNSAMPLE_CARDS - 1, hi)
+            # INSERT before DELETE: the Sunday is itself part of its group, so
+            # this overwrites it with the agg=1 mean and the DELETE then skips
+            # it, because it is no longer agg=0.
+            db.execute(
+                f"""INSERT OR REPLACE INTO points (card_id, src, day, cents, agg)
+                    SELECT card_id, src, {_ANCHOR_SQL} AS anchor,
+                           CAST(ROUND(AVG(cents)) AS INTEGER), 1
+                    FROM points
+                    WHERE agg = 0 AND card_id BETWEEN ? AND ?
+                      AND {_ANCHOR_SQL} < ?
+                    GROUP BY card_id, src, anchor
+                    HAVING NOT EXISTS (
+                        SELECT 1 FROM points w
+                        WHERE w.card_id = points.card_id
+                          AND w.src = points.src
+                          AND w.day = anchor AND w.agg = 1)""",
+                (start, end, cutoff))
+            cur = db.execute(
+                f"DELETE FROM points WHERE agg = 0 AND card_id BETWEEN ? AND ?"
+                f" AND {_ANCHOR_SQL} < ?", (start, end, cutoff))
+            deleted += cur.rowcount
+            db.commit()
+        if deleted:
+            log.info("sidecar downsample: %d daily rows collapsed", deleted)
+        return deleted
     finally:
         db.close()

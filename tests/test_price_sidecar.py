@@ -5,6 +5,7 @@ import os
 import sqlite3
 import tracemalloc
 import unittest.mock as mock
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -424,3 +425,319 @@ def test_series_stitches_results_across_several_queries(tmp_path, monkeypatch):
     got = list(price_sidecar.series_for_uuids(p, list(many)))
     assert len({u for u, *_ in got}) == 50
     assert len(seen) == math.ceil(50 / 7) == 8
+
+
+def _daily_series(uuid, start, days, price=1.0):
+    """A synthetic AllPrices block: `days` consecutive daily tcgplayer prices."""
+    d0 = date.fromisoformat(start)
+    return {uuid: {"paper": {"tcgplayer": {"retail": {"normal": {
+        (d0 + timedelta(days=i)).isoformat(): price + i
+        for i in range(days)}}}}}}
+
+
+def test_anchor_lands_on_the_iso_week_sunday():
+    for iso in ("2020-01-01", "2026-03-02", "2026-03-08", "2026-08-09"):
+        day = price_sidecar.to_day(iso)
+        got = date.fromisoformat(price_sidecar.from_day(
+            price_sidecar.week_anchor(day)))
+        assert got.isoweekday() == 7
+        assert got >= date.fromisoformat(iso)
+        assert (got - date.fromisoformat(iso)).days < 7
+
+
+def test_downsample_collapses_aged_weeks_to_means(tmp_path):
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        _daily_series("uuid-a", "2026-01-05", 14, price=10.0))
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    # 2026-01-05 is a Monday, so these are two whole ISO weeks.
+    deleted = price_sidecar.downsample(p, keep_daily_days=30,
+                                       today="2026-06-01")
+    assert deleted == 12                       # 14 rows in, 2 weekly rows out
+    db = price_sidecar.connect(p)
+    rows = db.execute("SELECT day, cents, agg FROM points ORDER BY day").fetchall()
+    db.close()
+    assert len(rows) == 2
+    assert all(r["agg"] == 1 for r in rows)
+    assert price_sidecar.from_day(rows[0]["day"]) == "2026-01-11"   # Sunday
+    assert price_sidecar.from_day(rows[1]["day"]) == "2026-01-18"
+    assert rows[0]["cents"] == 1300            # mean of 10.0..16.0 = 13.00
+    assert rows[1]["cents"] == 2000            # mean of 17.0..23.0 = 20.00
+
+
+def test_downsample_leaves_the_daily_window_alone(tmp_path):
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        _daily_series("uuid-a", "2026-01-05", 14))
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    assert price_sidecar.downsample(p, keep_daily_days=120,
+                                    today="2026-01-20") == 0
+    db = price_sidecar.connect(p)
+    assert db.execute("SELECT COUNT(*) FROM points").fetchone()[0] == 14
+    db.close()
+
+
+def test_downsample_never_collapses_a_partial_week(tmp_path):
+    """A week straddling the cutoff must wait until it is wholly behind it."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        _daily_series("uuid-a", "2026-01-05", 14))
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    # cutoff falls mid-week-2: week 1 collapses, week 2 is left whole.
+    price_sidecar.downsample(p, keep_daily_days=1, today="2026-01-15")
+    db = price_sidecar.connect(p)
+    daily = db.execute("SELECT COUNT(*) FROM points WHERE agg=0").fetchone()[0]
+    weekly = db.execute("SELECT COUNT(*) FROM points WHERE agg=1").fetchone()[0]
+    db.close()
+    assert weekly == 1 and daily == 7
+
+
+def test_downsample_is_idempotent_and_never_averages_an_average(tmp_path):
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        _daily_series("uuid-a", "2026-01-05", 14, price=10.0))
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    price_sidecar.downsample(p, keep_daily_days=30, today="2026-06-01")
+    db = price_sidecar.connect(p)
+    first = db.execute("SELECT day, cents, agg FROM points ORDER BY day").fetchall()
+    db.close()
+    assert price_sidecar.downsample(p, keep_daily_days=30,
+                                    today="2026-06-01") == 0
+    db = price_sidecar.connect(p)
+    second = db.execute("SELECT day, cents, agg FROM points ORDER BY day").fetchall()
+    db.close()
+    assert [tuple(r) for r in first] == [tuple(r) for r in second]
+
+
+def test_anchor_sql_and_python_agree_across_the_epoch_boundary():
+    """week_anchor and _ANCHOR_SQL are two transcriptions of one formula, and
+    only the SQL runs in production. Python's % floors, SQLite's truncates
+    toward zero, so for a pre-EPOCH day offset -- which nothing in the ingest
+    path rejects -- the un-normalized SQL lands a whole week late while still
+    falling on a Sunday, so nothing about the result looks wrong. Compare the
+    two real artifacts by executing the SQL, not a reimplementation of it."""
+    lo = price_sidecar.to_day("2018-01-01")
+    hi = price_sidecar.to_day("2022-12-31")
+    assert lo < 0 < hi                     # the range must straddle EPOCH
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE t (day INTEGER)")
+    db.executemany("INSERT INTO t VALUES (?)", [(d,) for d in range(lo, hi + 1)])
+    from_sql = dict(db.execute(f"SELECT day, {price_sidecar._ANCHOR_SQL} FROM t"))
+    db.close()
+    for d in range(lo, hi + 1):
+        iso = price_sidecar.from_day(d)
+        want = date.fromisoformat(iso)
+        want += timedelta(days=7 - want.isoweekday())
+        assert price_sidecar.week_anchor(d) == (want - price_sidecar.EPOCH).days, \
+            f"python anchor is not the ISO-week Sunday for {iso}"
+        assert from_sql[d] == price_sidecar.week_anchor(d), \
+            f"SQL anchor differs from the python one for {iso}"
+
+
+def test_downsample_never_recomputes_a_weekly_mean_from_a_mixture(tmp_path):
+    """The invariant the agg column exists to protect. Reaching it needs a
+    daily row planted in a week that has already collapsed: a Sunday is its
+    own anchor, so an established weekly row is otherwise alone in its group
+    and AVG of one row is itself, which hides the bug from every other test."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        _daily_series("uuid-a", "2026-01-05", 14, price=10.0))
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    price_sidecar.downsample(p, keep_daily_days=30, today="2026-06-01")
+
+    db = price_sidecar.connect(p)
+    card_id = db.execute(
+        "SELECT card_id FROM cards WHERE uuid='uuid-a'").fetchone()[0]
+    db.execute("INSERT INTO points (card_id, src, day, cents, agg)"
+               " VALUES (?,0,?,9900,0)",
+               (card_id, price_sidecar.to_day("2026-01-07")))
+    db.commit()
+    db.close()
+
+    price_sidecar.downsample(p, keep_daily_days=30, today="2026-06-01")
+    db = price_sidecar.connect(p)
+    rows = [(price_sidecar.from_day(r["day"]), r["cents"], r["agg"]) for r in
+            db.execute("SELECT day, cents, agg FROM points ORDER BY day")]
+    db.close()
+    # 1300 is the untouched seven-day mean. 9900 would be the raw day having
+    # overwritten it; 5600 would be the mean of the mean and the raw day.
+    assert rows == [("2026-01-11", 1300, 1), ("2026-01-18", 2000, 1)]
+
+
+def test_downsample_discards_a_late_daily_row_rather_than_reweighting(tmp_path):
+    """Task 9 runs apply_daily then downsample. A daily file carrying a date
+    older than the cutoff lands as agg=0 inside an already-collapsed week.
+    The stored mean carries no day count, so it cannot absorb the newcomer:
+    the week is left alone and the late row is dropped with its cohort."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        _daily_series("uuid-a", "2026-01-05", 14, price=10.0))
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    price_sidecar.downsample(p, keep_daily_days=30, today="2026-06-01")
+
+    late = make_prices_gz(tmp_path, "AllPricesLate.json.gz",
+                          {"uuid-a": {"paper": {"tcgplayer": {"retail": {
+                              "normal": {"2026-01-07": 99.0}}}}}})
+    assert price_sidecar.apply_daily(p, late) == 1
+    assert price_sidecar.downsample(p, keep_daily_days=30,
+                                    today="2026-06-01") == 1
+    db = price_sidecar.connect(p)
+    rows = [(price_sidecar.from_day(r["day"]), r["cents"], r["agg"]) for r in
+            db.execute("SELECT day, cents, agg FROM points ORDER BY day")]
+    db.close()
+    assert rows == [("2026-01-11", 1300, 1), ("2026-01-18", 2000, 1)]
+
+
+def test_downsample_commits_per_chunk_and_resumes_after_a_crash(tmp_path,
+                                                                monkeypatch):
+    """Chunking trades away all-or-nothing to bound the WAL. That is only
+    safe because cards collapse independently of each other: a crash must
+    leave whole cards done and the rest untouched, and the next run must
+    finish them with identical values."""
+    data = {}
+    for i in range(6):
+        data.update(_daily_series(f"uuid-{i}", "2026-01-05", 14, price=10.0))
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", data)
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    monkeypatch.setattr(price_sidecar, "DOWNSAMPLE_CARDS", 2)
+
+    real_connect = price_sidecar.connect
+
+    class CrashAfterFirstChunk:
+        """Commits, then dies -- a kill after a chunk is already durable."""
+
+        def __init__(self, db):
+            self._db, self._commits = db, 0
+
+        def __getattr__(self, name):
+            return getattr(self._db, name)
+
+        def commit(self):
+            self._db.commit()
+            self._commits += 1
+            if self._commits == 1:
+                raise RuntimeError("simulated crash between chunks")
+
+    with mock.patch.object(price_sidecar, "connect",
+                           lambda path: CrashAfterFirstChunk(real_connect(path))):
+        with pytest.raises(RuntimeError):
+            price_sidecar.downsample(p, keep_daily_days=30, today="2026-06-01")
+
+    db = price_sidecar.connect(p)
+    done = {r["card_id"] for r in
+            db.execute("SELECT card_id FROM points WHERE agg=1")}
+    pending = {r["card_id"] for r in
+               db.execute("SELECT card_id FROM points WHERE agg=0")}
+    db.close()
+    # A single transaction would have rolled the whole thing back to nothing.
+    assert done and pending and not (done & pending)
+
+    assert price_sidecar.downsample(p, keep_daily_days=30,
+                                    today="2026-06-01") == 12 * len(pending)
+    db = price_sidecar.connect(p)
+    per_card = {}
+    for r in db.execute("SELECT card_id, day, cents, agg FROM points"
+                        " ORDER BY card_id, day"):
+        per_card.setdefault(r["card_id"], []).append(
+            (price_sidecar.from_day(r["day"]), r["cents"], r["agg"]))
+    db.close()
+    assert len(per_card) == 6
+    assert all(v == [("2026-01-11", 1300, 1), ("2026-01-18", 2000, 1)]
+               for v in per_card.values())
+
+
+def test_downsample_will_not_collapse_ahead_of_the_data(tmp_path, monkeypatch):
+    """The wall clock is an untrusted input on the one irreversible operation
+    in the module, and production takes this branch: task 9 calls downsample()
+    with no arguments. A container without NTP, an NTP step after a drift, a
+    restored snapshot or a dead RTC battery all present as a jump forward, and
+    one run with a fast clock collapses the whole daily window -- past ~90 days
+    MTGJSON cannot replay it, so nothing recovers it. daily_through is what the
+    data itself says; it bounds the cutoff."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        _daily_series("uuid-a", "2026-01-05", 14, price=10.0))
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    assert price_sidecar.daily_through(p) == "2026-01-18"
+
+    class ClockAYearFast:
+        @staticmethod
+        def now(tz=None):
+            return datetime(2027, 1, 18, tzinfo=tz)
+
+    monkeypatch.setattr(price_sidecar, "datetime", ClockAYearFast)
+    # Unguarded this collapses all 14 rows: 2027-01-18 minus 120 days puts the
+    # cutoff at 2026-09-20, well past every anchor in the fixture.
+    assert price_sidecar.downsample(p) == 0
+    db = price_sidecar.connect(p)
+    assert db.execute("SELECT COUNT(*) FROM points WHERE agg=0").fetchone()[0] == 14
+    assert db.execute("SELECT COUNT(*) FROM points WHERE agg=1").fetchone()[0] == 0
+    db.close()
+
+
+def test_downsample_leaves_no_half_applied_state_inside_a_chunk(tmp_path):
+    """The INSERT and the DELETE are two statements. Dying between them is the
+    window where a bug would double-count a week or strand its daily rows, so
+    it needs its own cover: the crash-between-chunks test commits first and
+    never enters it."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz",
+                        _daily_series("uuid-a", "2026-01-05", 14, price=10.0))
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+
+    real_connect = price_sidecar.connect
+
+    class CrashBeforeDelete:
+        def __init__(self, db):
+            self._db = db
+
+        def __getattr__(self, name):
+            return getattr(self._db, name)
+
+        def execute(self, sql, *args):
+            if sql.lstrip().startswith("DELETE"):
+                raise RuntimeError("simulated crash between INSERT and DELETE")
+            return self._db.execute(sql, *args)
+
+    with mock.patch.object(price_sidecar, "connect",
+                           lambda path: CrashBeforeDelete(real_connect(path))):
+        with pytest.raises(RuntimeError):
+            price_sidecar.downsample(p, keep_daily_days=30, today="2026-06-01")
+
+    db = price_sidecar.connect(p)
+    daily = db.execute("SELECT COUNT(*) FROM points WHERE agg=0").fetchone()[0]
+    weekly = db.execute("SELECT COUNT(*) FROM points WHERE agg=1").fetchone()[0]
+    db.close()
+    assert (daily, weekly) == (14, 0)      # the uncommitted INSERT rolled back
+
+    assert price_sidecar.downsample(p, keep_daily_days=30,
+                                    today="2026-06-01") == 12
+    db = price_sidecar.connect(p)
+    rows = [(price_sidecar.from_day(r["day"]), r["cents"], r["agg"]) for r in
+            db.execute("SELECT day, cents, agg FROM points ORDER BY day")]
+    db.close()
+    assert rows == [("2026-01-11", 1300, 1), ("2026-01-18", 2000, 1)]
+
+
+def test_apply_daily_warns_on_a_day_older_than_the_daily_window(tmp_path, caplog):
+    """downsample can only discard such a point, and cannot say which one it
+    was without a second scan. apply_daily has every day in hand already."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+
+    spanning = make_prices_gz(tmp_path, "AllPricesWide.json.gz",
+                              {"uuid-a": {"paper": {"tcgplayer": {"retail": {
+                                  "normal": {"2025-01-01": 1.0,
+                                             "2026-08-09": 2.0}}}}}})
+    with caplog.at_level("WARNING", logger="mystic_forge.sidecar"):
+        price_sidecar.apply_daily(p, spanning)
+    assert "2025-01-01" in caplog.text and "older than" in caplog.text
+
+    caplog.clear()
+    today = make_prices_gz(tmp_path, "AllPricesToday.json.gz",
+                           {"uuid-a": TODAY_OBJ})
+    with caplog.at_level("WARNING", logger="mystic_forge.sidecar"):
+        price_sidecar.apply_daily(p, today)
+    assert caplog.text == ""            # a normal one-day file stays quiet
