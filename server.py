@@ -5121,7 +5121,7 @@ def _history_filling() -> bool:
     return _history_task is not None and not _history_task.done()
 
 
-def _schedule_backfill(card_names=None) -> bool:
+def _schedule_backfill() -> bool:
     """Kick the on-demand history fill after an add, off the request path.
 
     History is a static backfill, so it never waits for the nightly cycle: if
@@ -5911,7 +5911,7 @@ async def api_add(request: Request):
             target_price=tp,
             note=str(body.get("note") or "").strip()[:200] or None)
         backfilling = (not watchlist_db.entry_price_summary(db, entry)
-                       and _schedule_backfill(entry["card_name"]))
+                       and _schedule_backfill())
         return JSONResponse({"entry_id": entry["entry_id"],
                              "backfilling": backfilling})
     finally:

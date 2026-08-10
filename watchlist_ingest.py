@@ -254,44 +254,6 @@ def ensure_history(db_path: str, data_dir: str | None = None) -> int:
         db.close()
 
 
-def backfill_cards(db_path: str, data_dir: str | None = None,
-                   card_names=None) -> int:
-    """Instant history for just-added cards, entirely from the nightly-cached
-    MTGJSON files — no downloads. Resolves names against the local
-    AllPrintings, then makes ONE streaming pass over the cached AllPrices for
-    the union of their uuids (a bulk add costs the same scan as a single add).
-    Returns price rows written (0 when nothing is cached yet — the nightly
-    ingest covers that case)."""
-    names = [card_names] if isinstance(card_names, str) else list(card_names or [])
-    if not names:
-        return 0
-    data_dir = data_dir or _data_dir()
-    db = watchlist_db.connect(db_path)
-    try:
-        watchlist_db.init_db(db)
-        ap = os.path.join(data_dir, "AllPrintings.sqlite")
-        if os.path.exists(ap):
-            resolve_watched(db, ap)
-        marks = ",".join("?" * len(names))
-        uuids = {r["uuid"] for r in db.execute(
-            f"SELECT uuid FROM card_uuids WHERE LOWER(card_name) IN ({marks})",
-            [n.lower() for n in names])}
-        allp = os.path.join(data_dir, "AllPrices.json.gz")
-        if not uuids or not os.path.exists(allp):
-            return 0
-        n = ingest_prices_file(db, allp, only_uuids=uuids)
-        log.info("instant backfill (%d card(s)): %d rows", len(names), n)
-        return n
-    finally:
-        db.close()
-
-
-def backfill_entry(db_path: str, data_dir: str | None = None,
-                   card_name: str | None = None) -> int:
-    """Single-card convenience wrapper around backfill_cards."""
-    return backfill_cards(db_path, data_dir, [card_name] if card_name else [])
-
-
 def _needs_backfill(db) -> bool:
     """Any watched uuid with no price rows at all?"""
     return db.execute(
