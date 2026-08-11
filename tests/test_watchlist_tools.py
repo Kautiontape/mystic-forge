@@ -1,7 +1,7 @@
 import pytest
 
 import server
-import watchlist_db
+from mystic_forge.watchlist import db as watchlist_db
 
 
 @pytest.fixture

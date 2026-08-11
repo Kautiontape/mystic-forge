@@ -2,7 +2,7 @@ import re
 
 import pytest
 
-import watchlist_db
+from mystic_forge.watchlist import db as watchlist_db
 
 
 def test_init_db_creates_tables(db):

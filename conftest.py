@@ -12,7 +12,7 @@ import pytest
 @pytest.fixture
 def db_path(tmp_path, monkeypatch):
     """Fresh initialized SQLite DB; module default path patched to it."""
-    import watchlist_db
+    from mystic_forge.watchlist import db as watchlist_db
     p = str(tmp_path / "test.db")
     monkeypatch.setattr(watchlist_db, "DB_PATH", p)
     db = watchlist_db.connect(p)
@@ -23,7 +23,7 @@ def db_path(tmp_path, monkeypatch):
 
 @pytest.fixture
 def db(db_path):
-    import watchlist_db
+    from mystic_forge.watchlist import db as watchlist_db
     conn = watchlist_db.connect(db_path)
     yield conn
     conn.close()

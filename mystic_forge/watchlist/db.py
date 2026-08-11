@@ -15,7 +15,7 @@ from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = os.environ.get("MYSTIC_FORGE_DB", "mystic_forge.db")
-_WORDS_FILE = Path(__file__).parent / "watchlist_words.txt"
+_WORDS_FILE = Path(__file__).parent.parent / "data" / "watchlist_words.txt"
 _SHARE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"  # no 0/O/1/I/L/U confusables
 
 SCHEMA = """
@@ -64,6 +64,14 @@ CREATE TABLE IF NOT EXISTS card_uuids (
   collector_number TEXT,
   scryfall_id TEXT,
   PRIMARY KEY (card_name, uuid)
+);
+CREATE TABLE IF NOT EXISTS mtgstocks_prints (
+  card_name TEXT NOT NULL,
+  set_code TEXT NOT NULL,
+  print_id INTEGER,
+  slug TEXT,
+  checked_at TEXT NOT NULL,
+  PRIMARY KEY (card_name, set_code)
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS idx_prices_pfud

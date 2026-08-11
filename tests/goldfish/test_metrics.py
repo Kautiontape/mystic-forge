@@ -1,6 +1,6 @@
 import math
 
-from goldfish.metrics import (
+from mystic_forge.goldfish.metrics import (
     GameRecord,
     aggregate,
     mcnemar_exact_p,

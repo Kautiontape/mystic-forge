@@ -4,7 +4,7 @@ Any engine/policy change that alters these lines must update this list
 CONSCIOUSLY — that is the point of the test (spec §Architecture: same seed +
 deck + annotations + policy -> byte-identical log).
 """
-from goldfish.runner import play_one_game
+from mystic_forge.goldfish.runner import play_one_game
 from tests.goldfish.helpers import mini_cards, small_deck
 
 # Frozen at implementation time from a real run (game_seed=1234, until_turn=6).

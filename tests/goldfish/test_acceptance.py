@@ -80,10 +80,10 @@ import time
 import pytest
 
 import server as srv
-from goldfish.cards import AnnotationError, validate_annotations
-from goldfish.engine import MulliganRules
-from goldfish.odds import odds_groups
-from goldfish.runner import run_batch
+from mystic_forge.goldfish.cards import AnnotationError, validate_annotations
+from mystic_forge.goldfish.engine import MulliganRules
+from mystic_forge.goldfish.odds import odds_groups
+from mystic_forge.goldfish.runner import run_batch
 from tests.goldfish.helpers import (
     MINI_DECK_TEXT,
     _patch_fetch_minideck,

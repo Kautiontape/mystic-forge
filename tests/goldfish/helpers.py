@@ -5,8 +5,8 @@ test_cards, ``mini_cards``/``annotated``/``started`` from test_engine,
 ``small_deck`` from test_runner — so every test module imports one place.
 """
 import server as srv
-from goldfish.cards import CardData, SimCard, parse_cost, validate_annotations
-from goldfish.engine import new_game
+from mystic_forge.goldfish.cards import CardData, SimCard, parse_cost, validate_annotations
+from mystic_forge.goldfish.engine import new_game
 
 
 def make_data(name, **kw):

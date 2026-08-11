@@ -2,8 +2,8 @@ import json
 
 import pytest
 
-from goldfish.cards import SimCard, parse_cost
-from goldfish.engine import (
+from mystic_forge.goldfish.cards import SimCard, parse_cost
+from mystic_forge.goldfish.engine import (
     Game,
     IllegalAction,
     MulliganRules,

@@ -4,6 +4,10 @@ name: propose release
 # submodule pin. Merging that PR is what deploys — this workflow never touches
 # production itself.
 #
+# Runs after CI succeeds on main (not on push) so a version bump whose tests
+# fail cannot be proposed for release — the parent repo's release checks never
+# run this repo's test suite, so this is the only test gate in the chain.
+#
 # Only proposes when VERSION differs from the version at the current pin, so
 # docs- and CI-only pushes do not raise a release PR that would then fail the
 # "version increased" check.
@@ -14,7 +18,9 @@ name: propose release
 # is repo-scoped and cannot write to another repository.
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
 
@@ -26,11 +32,17 @@ permissions: {}
 
 jobs:
   propose:
+    # workflow_run fires for every CI completion; only a successful run of a
+    # main push may propose. Manual dispatch proposes the tip of main as-is.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     env:
       TARGET_REPO: Kautiontape/mcp-servers
       RELEASE_BRANCH: release/mystic-forge
-      NEW_SHA: ${{ github.sha }}
+      NEW_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - name: Check out mcp-servers
         uses: actions/checkout@v4

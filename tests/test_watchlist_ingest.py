@@ -9,8 +9,9 @@ import httpx
 import pytest
 
 import price_sidecar
-import watchlist_db
-import watchlist_ingest
+
+from mystic_forge.watchlist import db as watchlist_db
+from mystic_forge.watchlist import ingest as watchlist_ingest
 
 
 def make_allprintings(tmp_path):
@@ -215,7 +216,7 @@ def test_manapool_is_ingested(db, tmp_path):
 
 
 def test_manapool_is_a_selectable_shop():
-    import watchlist_pages
+    from mystic_forge.watchlist import pages as watchlist_pages
     assert watchlist_pages.SHOPS["manapool"] == "$"
 
 

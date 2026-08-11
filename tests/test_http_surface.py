@@ -7,8 +7,9 @@ import pytest
 from starlette.testclient import TestClient
 
 import server
-import watchlist_db
-import watchlist_ingest
+from mystic_forge.watchlist import db as watchlist_db
+from mystic_forge.watchlist import ingest as watchlist_ingest
+from mystic_forge.watchlist import mtgstocks
 
 
 def client():
@@ -663,12 +664,14 @@ def test_card_modal_payload_has_site_links(db_path):
     list_id, pp, _ = watchlist_db.create_list(db)
     watchlist_db.add_card(db, list_id, "Sol Ring", set_code="C21",
                           collector_number="263")
+    # MTGStocks only has per-printing URLs, so its badge needs a resolved id.
+    mtgstocks.remember(db, "Sol Ring", "C21", 5210, "sol-ring")
     db.close()
     with client() as c:
         r = c.get(f"/w/{pp}").text
     assert "scryfall.com/card/c21/263" in r
     assert "edhrec.com/cards/sol-ring" in r
-    assert "mtgstocks.com" in r and "tcgplayer.com" in r
+    assert "mtgstocks.com/prints/5210-sol-ring" in r and "tcgplayer.com" in r
 
 
 def test_api_revision_snapshot(db_path):

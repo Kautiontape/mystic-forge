@@ -5,7 +5,7 @@ import time
 import httpx
 import pytest
 
-import rulebook
+from mystic_forge import rulebook
 import server
 
 FIXTURE = (pathlib.Path(__file__).parent / "fixtures" / "cr_fixture.txt").read_text(encoding="utf-8")
@@ -328,7 +328,7 @@ async def test_get_glossary_omission_notice_comes_last(monkeypatch):
 
 
 async def test_glossary_renders_all_real_terms(monkeypatch):
-    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    real = (pathlib.Path(__file__).parent.parent / "mystic_forge" / "data" / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
     idx = rulebook.parse(real)
     monkeypatch.setitem(server._rules_state, "index", idx)
     monkeypatch.setitem(server._rules_state, "checked_at", time.time())
@@ -376,7 +376,7 @@ async def test_search_tool_singular_grammar(monkeypatch):
 
 
 async def test_search_output_stays_bounded_real_cr(monkeypatch):
-    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    real = (pathlib.Path(__file__).parent.parent / "mystic_forge" / "data" / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
     idx = rulebook.parse(real)
     monkeypatch.setitem(server._rules_state, "index", idx)
     monkeypatch.setitem(server._rules_state, "checked_at", time.time())
@@ -387,7 +387,7 @@ async def test_search_output_stays_bounded_real_cr(monkeypatch):
 
 
 async def test_search_compound_headword_roundtrips_real_cr(monkeypatch):
-    real = (pathlib.Path(__file__).parent.parent / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
+    real = (pathlib.Path(__file__).parent.parent / "mystic_forge" / "data" / "MagicCompRules.txt").read_text(encoding="utf-8-sig")
     idx = rulebook.parse(real)
     monkeypatch.setitem(server._rules_state, "index", idx)
     monkeypatch.setitem(server._rules_state, "checked_at", time.time())

@@ -2,8 +2,8 @@ import json
 
 import pytest
 
-from goldfish.cards import AnnotationError, SimCard, parse_cost
-from goldfish.engine import (
+from mystic_forge.goldfish.cards import AnnotationError, SimCard, parse_cost
+from mystic_forge.goldfish.engine import (
     Game,
     IllegalAction,
     _payment_plan,
@@ -735,7 +735,7 @@ def test_trigger_loop_bounded_by_depth_limit():
     # validation-legal annotation that self-feeds. The depth bound must stop
     # it deterministically, log one suppression line per cascade, and leave
     # the game consistent.
-    from goldfish.engine import _MAX_FIRE_DEPTH
+    from mystic_forge.goldfish.engine import _MAX_FIRE_DEPTH
     cards = mini_cards()
     cards["Broodmother"] = SimCard(data=make_data("Broodmother", cost=parse_cost("{3}{G}"),
                                    types=frozenset({"enchantment"})), ann=None, scope_class=None)
@@ -784,7 +784,7 @@ def test_branching_trigger_cascade_bounded_by_fire_budget():
     # useful time (65s at depth 14, ~days at 20). The per-cascade fire budget
     # must cut the cascade off: every executed fire spawns at most 2 tokens,
     # so the battlefield stays within 2 * budget + the direct token.
-    from goldfish.engine import _MAX_CASCADE_FIRES
+    from mystic_forge.goldfish.engine import _MAX_CASCADE_FIRES
     cards = mini_cards()
     for name in ("BroodA", "BroodB"):
         cards[name] = SimCard(data=make_data(name, cost=parse_cost("{3}{G}"),
@@ -2022,7 +2022,7 @@ def test_assembled_counts_battlefield():
     g.new_perm("PieceA")                          # A already deployed
     for _ in range(4):
         g.new_perm("Mountain")
-    from goldfish.engine import check_combos
+    from mystic_forge.goldfish.engine import check_combos
     check_combos(g)
     assert g.combo_assembled_turn[0] == 3
     assert g.combo_castable_turn[0] == 3          # B's {3}{R} payable, A costs 0
@@ -2038,7 +2038,7 @@ def test_castable_includes_commander_tax():
     g.hand[:] = ["PieceA"]                         # Boss in command zone
     for _ in range(6):
         g.new_perm("Mountain")
-    from goldfish.engine import check_combos
+    from mystic_forge.goldfish.engine import check_combos
     check_combos(g)
     assert g.combo_assembled_turn[0] == 3
     # need {2}{R} + {2}{R}+{4} tax = 10 mv total vs 6 mountains:
@@ -2056,7 +2056,7 @@ def test_wins_ends_game_and_counts_casts():
     g.hand[:] = ["PieceA", "PieceB"]
     for _ in range(7):                             # joint {2}{R}+{3}{R} = 7 mv
         g.new_perm("Mountain")
-    from goldfish.engine import check_combos
+    from mystic_forge.goldfish.engine import check_combos
     check_combos(g)
     assert g.won_turn == 3
     assert g.spells_cast_this_turn == 2            # pieces logged as cast
@@ -2068,7 +2068,7 @@ def test_combo_wins_only_at_castable():
     # assembled but unpayable: no win, no synthetic casts
     _cards, g = combo_setup(wins=True)
     g.hand[:] = ["PieceA", "PieceB"]              # zero producers on battlefield
-    from goldfish.engine import check_combos
+    from mystic_forge.goldfish.engine import check_combos
     check_combos(g)
     assert g.combo_assembled_turn[0] == 3
     assert g.combo_castable_turn[0] is None
@@ -2089,7 +2089,7 @@ def test_combo_castable_applies_cost_reduction_statics():
     g.hand[:] = ["PieceA", "PieceB"]
     for _ in range(3):
         g.new_perm("Mountain")
-    from goldfish.engine import check_combos
+    from mystic_forge.goldfish.engine import check_combos
     check_combos(g)
     assert g.combo_assembled_turn[0] == 3
     assert g.combo_castable_turn[0] is None       # 7 mv vs 3 mountains
@@ -2104,7 +2104,7 @@ def test_win_line_single_sourced_for_combo_and_table_kill():
     g.hand[:] = ["PieceA", "PieceB"]
     for _ in range(7):
         g.new_perm("Mountain")
-    from goldfish.engine import check_combos
+    from mystic_forge.goldfish.engine import check_combos
     check_combos(g)
     assert "T3: combo 1 wins — won turn 3" in g.log
 
@@ -2128,7 +2128,7 @@ def test_post_win_step_accepts_only_pass():
     g.hand[:] = ["PieceA", "PieceB", "Mountain"]
     for _ in range(7):
         g.new_perm("Mountain")
-    from goldfish.engine import check_combos
+    from mystic_forge.goldfish.engine import check_combos
     check_combos(g)
     assert g.won_turn == 3
     assert legal_actions(g) == [{"type": "pass"}]
@@ -2183,7 +2183,7 @@ def test_check_combos_fires_mid_main_on_land_drop():
     g.new_perm("PieceA")
     for _ in range(3):
         g.new_perm("Mountain")
-    from goldfish.engine import check_combos
+    from mystic_forge.goldfish.engine import check_combos
     check_combos(g)
     assert g.combo_assembled_turn[0] == 3
     assert g.combo_castable_turn[0] is None       # {3}{R} vs 3 mountains
@@ -2222,7 +2222,7 @@ def test_check_combos_empty_fast_path():
     assert g.combos == []
     g.hand = _Boom()
     g.battlefield = _Boom()
-    from goldfish.engine import check_combos
+    from mystic_forge.goldfish.engine import check_combos
     check_combos(g)                               # no zone access, no raise
 
 
@@ -2241,7 +2241,7 @@ def test_castable_requires_current_assembly_not_ever_assembled():
     g.phase = "main1"; g.turn = 3
     g.hand[:] = ["Reversal"]
     g.new_perm("Scepter")
-    from goldfish.engine import check_combos
+    from mystic_forge.goldfish.engine import check_combos
     check_combos(g)                               # no producers: assembled only
     assert g.combo_assembled_turn[0] == 3
     assert g.combo_castable_turn[0] is None
@@ -2275,7 +2275,7 @@ def test_second_wins_combo_post_win_records_but_never_casts():
     g.hand[:] = ["A1", "A2", "B1", "B2"]
     for _ in range(2):
         g.new_perm("Mountain")
-    from goldfish.engine import check_combos
+    from mystic_forge.goldfish.engine import check_combos
     check_combos(g)
     assert g.won_turn == 3                        # combo 1 wins at {R}+{R}
     assert g.spells_cast_this_turn == 2

@@ -17,7 +17,9 @@ import httpx
 import ijson
 
 import price_sidecar
-import watchlist_db
+
+from . import db as watchlist_db
+from . import mtgstocks
 
 log = logging.getLogger("mystic_forge.ingest")
 
@@ -168,6 +170,17 @@ def resolve_watched(db, allprintings_path: str) -> int:
     return added
 
 
+def resolve_mtgstocks(db, allprintings_path: str | None = None) -> int:
+    """Best-effort MTGStocks print-id resolution. A third-party API we don't
+    control must never be able to fail a price ingest, so this swallows
+    everything — the only cost of a bad day at MTGStocks is a missing badge."""
+    try:
+        return mtgstocks.refresh(db, allprintings_path)
+    except Exception:
+        log.exception("mtgstocks resolve failed")
+        return 0
+
+
 def watched_uuids(db) -> set[str]:
     return {r["uuid"] for r in db.execute(
         """SELECT DISTINCT cu.uuid FROM watchlist_current wc
@@ -248,6 +261,7 @@ def ensure_history(db_path: str, data_dir: str | None = None) -> int:
             _download(f"{MTGJSON}/AllPrintings.sqlite", ap_path, db)
         if os.path.exists(ap_path):
             resolve_watched(db, ap_path)
+        resolve_mtgstocks(db, ap_path)
         missing = {r["uuid"] for r in db.execute(
             """SELECT cu.uuid FROM watchlist_current wc
                JOIN card_uuids cu ON LOWER(cu.card_name)=LOWER(wc.card_name)
@@ -318,6 +332,7 @@ def run_ingest(db_path: str, data_dir: str | None = None) -> None:
         if week_old or _needs_unresolved(db):
             ap_path = _download(f"{MTGJSON}/AllPrintings.sqlite", ap_path, db)
         resolve_watched(db, ap_path)
+        resolve_mtgstocks(db, ap_path)
         # Read readiness once and branch on the same answer twice, so the two
         # gates below can never disagree and drop the backfill entirely.
         side = _sidecar_path(data_dir)

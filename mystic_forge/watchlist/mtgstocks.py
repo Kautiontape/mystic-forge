@@ -1,0 +1,334 @@
+"""MTGStocks deep links for watched cards.
+
+MTGStocks has no name-addressable URL. `/search?query=<name>` is not a route —
+it 404s — and the only card page is `/prints/<print_id>-<slug>`, where
+`print_id` names one specific printing (Black Market Connections is 141924).
+Nothing we already ingest carries that id: MTGJSON's Identifiers model has
+fields for TCGplayer, Card Kingdom, Cardmarket, Cardsphere, SCG and more, but
+none for MTGStocks. So the id can only come from MTGStocks' own JSON API, and
+the only way to make a name and a print id "work together" is to look the name
+up once and cache the id.
+
+That shapes the design:
+
+* Resolution is a **background** job (nightly ingest / post-add backfill),
+  never the page path. Pages read the cache and nothing else.
+* Misses are cached too, with a retry window, so an unknown name isn't
+  re-queried on every cycle.
+* Everything fails closed: if MTGStocks is unreachable the badge is simply
+  absent. We never emit a link we know 404s.
+
+The API is undocumented and unversioned, so the parsers below key off shape
+(any object carrying an int `id` plus a `name`) rather than an exact schema.
+
+Verify the endpoint from a network that can reach MTGStocks with:
+
+    python -m mystic_forge.watchlist.mtgstocks "Black Market Connections"
+"""
+
+import json
+import logging
+import os
+import sqlite3
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import httpx
+
+log = logging.getLogger("mystic_forge.mtgstocks")
+
+SITE = "https://www.mtgstocks.com"
+API = "https://api.mtgstocks.com"
+TIMEOUT = 10.0
+RETRY_DAYS = 7        # how long a "not found" answer is trusted
+MAX_PER_RUN = 60      # cap the calls one ingest cycle may make
+GIVE_UP_AFTER = 3     # consecutive transport failures ends the run
+PAUSE = 0.3           # seconds between calls — be a polite guest
+
+
+def _version() -> str:
+    try:
+        return (Path(__file__).resolve().parents[2] / "VERSION").read_text().strip()
+    except OSError:
+        return "0"
+
+
+def _headers() -> dict:
+    return {"User-Agent": f"MysticForge/{_version()}",
+            "Accept": "application/json"}
+
+
+def disabled() -> bool:
+    return bool(os.environ.get("MYSTIC_FORGE_NO_MTGSTOCKS")
+                or os.environ.get("MYSTIC_FORGE_NO_INGEST"))
+
+
+# ── URL shapes ──────────────────────────────────────────────────────────────
+
+def slugify(name: str) -> str:
+    out: list[str] = []
+    for ch in name.lower():
+        if ch.isalnum():
+            out.append(ch)
+        elif out and out[-1] != "-":
+            out.append("-")
+    return "".join(out).strip("-")
+
+
+def print_url(print_id, slug: str | None = None) -> str:
+    """`/prints/141924-black-market-connections`. The slug is cosmetic — the
+    numeric prefix is what MTGStocks routes on — but we keep it when known so
+    the link reads like one a human would paste."""
+    tail = f"-{slug}" if slug else ""
+    return f"{SITE}/prints/{print_id}{tail}"
+
+
+def front_face(name: str) -> str:
+    """MTGStocks indexes double-faced cards under the front face alone."""
+    return name.split(" // ")[0].strip()
+
+
+# ── shape-tolerant payload readers ──────────────────────────────────────────
+
+def _walk(payload):
+    """Every dict anywhere in a decoded JSON payload."""
+    stack = [payload]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            yield node
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+
+
+def _named(payload):
+    for node in _walk(payload):
+        if isinstance(node.get("id"), int) and isinstance(node.get("name"), str):
+            yield node
+
+
+def _pick(payload, name: str):
+    """Best card-ish object for `name`: exact match wins, prefix match settles."""
+    wants = [name.strip().lower(), front_face(name).lower()]
+    partial = None
+    for node in _named(payload):
+        got = node["name"].strip().lower()
+        if got in wants:
+            return node
+        if partial is None and any(got.startswith(w) for w in wants):
+            partial = node
+    return partial
+
+
+def _set_name_of(node) -> str | None:
+    for key in ("set_name", "setName", "set"):
+        val = node.get(key)
+        if isinstance(val, str):
+            return val
+        if isinstance(val, dict) and isinstance(val.get("name"), str):
+            return val["name"]
+    if isinstance(node.get("card_set"), dict):
+        name = node["card_set"].get("name")
+        if isinstance(name, str):
+            return name
+    return None
+
+
+def _get(client, path: str, params=None):
+    resp = client.get(f"{API}{path}", params=params, headers=_headers(),
+                      timeout=TIMEOUT, follow_redirects=True)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ── API calls ───────────────────────────────────────────────────────────────
+
+def resolve_name(client, name: str):
+    """(print_id, slug) for a card name, or None if MTGStocks doesn't know it."""
+    payload = _get(client, "/search/autocomplete", {"query": front_face(name)})
+    hit = _pick(payload, name)
+    if hit is None:
+        return None
+    slug = hit.get("slug") if isinstance(hit.get("slug"), str) else None
+    return hit["id"], slug or slugify(hit["name"])
+
+
+def printings(client, print_id):
+    """[(print_id, slug, set_name)] for every printing on a print's page.
+
+    Best-effort: MTGStocks lists a card's other printings alongside the one
+    being viewed, which is how a pinned printing gets its own link. An
+    unrecognised payload just yields nothing and the name-level link stands."""
+    payload = _get(client, f"/prints/{print_id}")
+    out, seen = [], set()
+    for node in _walk(payload):
+        pid, set_name = node.get("id"), _set_name_of(node)
+        if not isinstance(pid, int) or not set_name or pid in seen:
+            continue
+        seen.add(pid)
+        slug = node.get("slug") if isinstance(node.get("slug"), str) else None
+        out.append((pid, slug, set_name))
+    return out
+
+
+# ── cache ───────────────────────────────────────────────────────────────────
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def remember(db, card_name: str, set_code: str | None, print_id, slug,
+             commit: bool = True) -> None:
+    """Store a resolution. `print_id=None` is a cached miss, not an error."""
+    db.execute(
+        "INSERT OR REPLACE INTO mtgstocks_prints"
+        " (card_name, set_code, print_id, slug, checked_at) VALUES (?,?,?,?,?)",
+        (card_name.strip().lower(), (set_code or "").strip().upper(),
+         print_id, slug, _now()))
+    if commit:
+        db.commit()
+
+
+def cached_url(db, card_name: str, set_code: str | None = None) -> str | None:
+    """Deep link for a card from cache only — never a network call.
+
+    Falls back from the pinned printing to the card's default printing, then
+    to nothing. Returning None means "render no MTGStocks badge"; there is no
+    generic URL to fall back to."""
+    if db is None:
+        return None
+    keys = []
+    if set_code:
+        keys.append((card_name.strip().lower(), set_code.strip().upper()))
+    keys.append((card_name.strip().lower(), ""))
+    try:
+        for cn, sc in keys:
+            row = db.execute(
+                "SELECT print_id, slug FROM mtgstocks_prints"
+                " WHERE card_name=? AND set_code=?", (cn, sc)).fetchone()
+            if row and row["print_id"]:
+                return print_url(row["print_id"], row["slug"])
+    except sqlite3.Error:        # pre-migration database — badge, not a 500
+        return None
+    return None
+
+
+def _stale_before() -> str:
+    return (datetime.now(timezone.utc)
+            - timedelta(days=RETRY_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _pending_names(db, limit: int):
+    """Watched card names with no usable name-level answer yet."""
+    return [r["card_name"] for r in db.execute(
+        """SELECT MIN(wc.card_name) AS card_name FROM watchlist_current wc
+           WHERE NOT EXISTS (
+             SELECT 1 FROM mtgstocks_prints m
+             WHERE m.card_name = LOWER(wc.card_name) AND m.set_code = ''
+               AND (m.print_id IS NOT NULL OR m.checked_at > ?))
+           GROUP BY LOWER(wc.card_name) LIMIT ?""", (_stale_before(), limit))]
+
+
+def _pending_printings(db, limit: int):
+    """Pinned (name, set_code) pairs with no printing-level answer yet."""
+    return [(r["card_name"], r["set_code"]) for r in db.execute(
+        """SELECT MIN(wc.card_name) AS card_name, UPPER(wc.set_code) AS set_code
+           FROM watchlist_current wc
+           WHERE wc.set_code IS NOT NULL AND wc.set_code <> ''
+             AND NOT EXISTS (
+               SELECT 1 FROM mtgstocks_prints m
+               WHERE m.card_name = LOWER(wc.card_name)
+                 AND m.set_code = UPPER(wc.set_code)
+                 AND (m.print_id IS NOT NULL OR m.checked_at > ?))
+           GROUP BY LOWER(wc.card_name), UPPER(wc.set_code) LIMIT ?""",
+        (_stale_before(), limit))]
+
+
+def _set_names(allprintings_path: str | None) -> dict:
+    """MTGJSON set code → set name, for matching MTGStocks' set labels."""
+    if not allprintings_path or not os.path.exists(allprintings_path):
+        return {}
+    try:
+        ap = sqlite3.connect(allprintings_path)
+        try:
+            return {c.upper(): n for c, n in
+                    ap.execute("SELECT code, name FROM sets")}
+        finally:
+            ap.close()
+    except sqlite3.Error:
+        return {}
+
+
+def refresh(db, allprintings_path: str | None = None,
+            limit: int = MAX_PER_RUN) -> int:
+    """Fill the print-id cache for watched cards. Returns rows resolved.
+
+    Safe to call on every cycle: it only touches names that have no fresh
+    answer, and it stops early once MTGStocks starts refusing us (their API
+    sits behind CloudFront and may simply not answer a server)."""
+    if disabled():
+        return 0
+    names = _pending_names(db, limit)
+    pinned = _pending_printings(db, limit)
+    if not names and not pinned:
+        return 0
+    set_names = _set_names(allprintings_path)
+    resolved, failures = 0, 0
+    with httpx.Client() as client:
+        for name in names:
+            if failures >= GIVE_UP_AFTER:
+                break
+            try:
+                hit = resolve_name(client, name)
+            except Exception as e:
+                failures += 1
+                log.debug("mtgstocks lookup failed for %s: %s", name, e)
+                continue
+            failures = 0
+            remember(db, name, "", hit[0] if hit else None,
+                     hit[1] if hit else None)
+            resolved += 1 if hit else 0
+            time.sleep(PAUSE)
+
+        for name, set_code in pinned:
+            if failures >= GIVE_UP_AFTER:
+                break
+            want = (set_names.get(set_code) or "").strip().lower()
+            base = cached_url(db, name)      # needs the name-level id first
+            if not base or not want:
+                continue
+            base_id = base.rsplit("/", 1)[1].split("-", 1)[0]
+            try:
+                others = printings(client, base_id)
+            except Exception as e:
+                failures += 1
+                log.debug("mtgstocks printings failed for %s: %s", name, e)
+                continue
+            failures = 0
+            match = next(((p, s) for p, s, sn in others
+                          if sn.strip().lower() == want), None)
+            remember(db, name, set_code,
+                     match[0] if match else None, match[1] if match else None)
+            resolved += 1 if match else 0
+            time.sleep(PAUSE)
+    if resolved:
+        log.info("mtgstocks: resolved %d print id(s)", resolved)
+    return resolved
+
+
+if __name__ == "__main__":                                # pragma: no cover
+    import sys
+    query = " ".join(sys.argv[1:]) or "Black Market Connections"
+    with httpx.Client() as _c:
+        raw = _get(_c, "/search/autocomplete", {"query": front_face(query)})
+        print(json.dumps(raw, indent=2)[:2000])
+        found = _pick(raw, query)
+        print("\npicked:", found)
+        if found:
+            print("url:", print_url(found["id"],
+                                    found.get("slug") or slugify(found["name"])))
+            print("\nprintings:")
+            for row in printings(_c, found["id"])[:20]:
+                print(" ", row)
