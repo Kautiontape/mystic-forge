@@ -6,8 +6,8 @@ an indexed lookup instead, and so history outlives the upstream window:
 daily resolution for a rolling KEEP_DAILY_DAYS, weekly means forever beyond.
 
 Data flows one way. This module never reads the main watchlist database; the
-`prices` table there is a projection of this file, written by
-watchlist_ingest. Every function takes an explicit path — the module does not
+`prices` table there is a projection of this file, written by the sibling
+`ingest` module. Every function takes an explicit path — the module does not
 know where it lives, which keeps it free of a circular import.
 """
 

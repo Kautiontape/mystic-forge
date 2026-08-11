@@ -16,10 +16,9 @@ from datetime import date
 import httpx
 import ijson
 
-import price_sidecar
-
 from . import db as watchlist_db
 from . import mtgstocks
+from . import sidecar as price_sidecar
 
 log = logging.getLogger("mystic_forge.ingest")
 
@@ -211,8 +210,8 @@ def ingest_prices_file(db, gz_path: str, only_uuids=None) -> int:
 
 
 def _sidecar_path(data_dir: str | None = None) -> str:
-    """Where the price sidecar lives. Computed here, not in price_sidecar, so
-    that module stays free of any import back into this one."""
+    """Where the price sidecar lives. Computed here, not in the sidecar
+    module, so that module stays free of any import back into this one."""
     return os.path.join(data_dir or _data_dir(), "price_sidecar.sqlite")
 
 

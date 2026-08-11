@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-import price_sidecar
+from mystic_forge.watchlist import sidecar as price_sidecar
 
 
 def test_src_packing_round_trips():

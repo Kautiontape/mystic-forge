@@ -30,11 +30,10 @@ import httpx
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from mcp.server.fastmcp import FastMCP
 
-import price_sidecar
-
 from mystic_forge.watchlist import db as watchlist_db
 from mystic_forge.watchlist import ingest as watchlist_ingest
 from mystic_forge.watchlist import pages as watchlist_pages
+from mystic_forge.watchlist import sidecar as price_sidecar
 from mystic_forge import rulebook
 
 from mystic_forge.goldfish import ENGINE_VERSION, autoderive, metrics, report

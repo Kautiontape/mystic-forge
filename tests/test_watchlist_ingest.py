@@ -8,10 +8,9 @@ import tracemalloc
 import httpx
 import pytest
 
-import price_sidecar
-
 from mystic_forge.watchlist import db as watchlist_db
 from mystic_forge.watchlist import ingest as watchlist_ingest
+from mystic_forge.watchlist import sidecar as price_sidecar
 
 
 def make_allprintings(tmp_path):
