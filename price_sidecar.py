@@ -45,6 +45,8 @@ STALE_PART_SECONDS = 6 * 3600
 # build takes 10-30 minutes, so anything younger than this may well belong to a
 # live process; deleting that is the very hazard per-pid part names exist to
 # avoid (see build_from_allprices).
+SUPERSEDED_SUFFIX = ".superseded"
+# Where a rebuild parks the sidecar it is replacing (see _supersede).
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cards (
@@ -284,11 +286,58 @@ def _sweep_stale_parts(path: str, directory: str) -> None:
             continue
 
 
+def _supersede(path: str) -> None:
+    """Move any existing sidecar aside, and clear the way for os.replace.
+
+    A rebuild is triggered by is_ready() being false, and that is also the
+    answer for a file that is merely corrupt or built for another
+    SCHEMA_VERSION. Past ~90 days this file holds the only copy of its
+    history -- MTGJSON cannot replay it -- so publishing over it would turn a
+    transient corruption or a mistaken version bump into the permanent loss of
+    every weekly mean. A rename costs one inode and makes it recoverable by
+    hand; the operator decides what to do with the copy, which is a decision
+    this code is in no position to make for them.
+
+    Only the most recent copy is kept: os.replace overwrites the previous one
+    rather than stacking gigabyte-sized generations until the volume fills.
+
+    The -wal/-shm companions move with the file they belong to. Deleting
+    them -- all the swap had to do when it only needed them out of
+    os.replace's way -- would strip every un-checkpointed transaction off the
+    copy being preserved, and a backup that will not open is not a backup. Any
+    companion the moved file does not have is deleted at the destination, or
+    the previous generation's -wal would be replayed into this one.
+
+    Best-effort, not atomic: no filesystem can rename three files as a unit,
+    so a crash mid-way can leave the copy without a companion. The live path
+    is unaffected either way -- os.replace below is still the only thing that
+    publishes."""
+    if not os.path.exists(path):
+        for suffix in ("-wal", "-shm"):    # orphans; nothing to preserve
+            if os.path.exists(path + suffix):
+                os.remove(path + suffix)
+        return
+    dest = path + SUPERSEDED_SUFFIX
+    os.replace(path, dest)
+    for suffix in ("-wal", "-shm"):
+        src, old = path + suffix, dest + suffix
+        if os.path.exists(src):
+            os.replace(src, old)
+        elif os.path.exists(old):
+            os.remove(old)
+    log.warning("sidecar: kept the previous %s as %s before rebuilding. Past "
+                "MTGJSON's ~90-day window that copy is the only record of its "
+                "weekly tier; verify the new build before deleting it.",
+                path, dest)
+
+
 def build_from_allprices(path: str, gz_path: str) -> int:
     """Full load from AllPrices.json.gz. Returns points written.
 
     Builds into a private <path>.part.<pid> and atomically renames, so an
-    interrupted build can never leave a file that is_ready() would accept.
+    interrupted build can never leave a file that is_ready() would accept. Any
+    sidecar already at `path` is moved aside, not overwritten -- see
+    _supersede, which is where the reasoning about that lives.
 
     The pid in that name is what keeps two concurrent builds from destroying
     each other. With one shared `.part`, B's cleanup unlinks A's in-progress
@@ -359,12 +408,11 @@ def build_from_allprices(path: str, gz_path: str) -> int:
         raise
     db.close()
     # A WAL-mode database is a three-file unit; os.replace is atomic for only
-    # one of them. A stale -wal left by an unclean shutdown would be replayed
-    # over the file we just built, silently resurrecting the old database.
-    for suffix in ("-wal", "-shm"):
-        stale = path + suffix
-        if os.path.exists(stale):
-            os.remove(stale)
+    # one of them. Whatever is at `path` has to be cleared out of the way first
+    # -- a surviving -wal would otherwise be replayed over the file we just
+    # built, silently resurrecting the old database -- and _supersede does that
+    # by moving the whole unit aside rather than deleting it.
+    _supersede(path)
     os.replace(part, path)
     log.info("sidecar built: %d cards, %d points; kept %s; skipped %s",
               len(ids), rows,

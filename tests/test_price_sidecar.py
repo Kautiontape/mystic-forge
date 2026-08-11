@@ -1096,3 +1096,110 @@ def test_downsample_will_not_collapse_without_a_watermark(tmp_path):
     db = price_sidecar.connect(p)
     assert db.execute("SELECT COUNT(*) FROM points WHERE agg=0").fetchone()[0] == 14
     db.close()
+
+
+def _uuids(path):
+    db = price_sidecar.connect(path)
+    try:
+        return {r["uuid"] for r in db.execute("SELECT uuid FROM cards")}
+    finally:
+        db.close()
+
+
+def _ghost_wal(path):
+    """Bytes of a real WAL holding one committed, un-checkpointed row.
+
+    Arbitrary bytes will not do: SQLite validates the WAL header against the
+    database it sits beside and silently discards anything that fails, so only
+    a genuine WAL reproduces a replay."""
+    db = price_sidecar.connect(path)
+    db.execute("PRAGMA wal_autocheckpoint=0")
+    db.execute("INSERT INTO cards (card_id, uuid) VALUES (9999,'uuid-ghost')")
+    db.commit()
+    with open(path + "-wal", "rb") as f:
+        wal = f.read()
+    db.close()                                  # checkpoints and removes it
+    return wal
+
+
+def test_rebuild_moves_the_old_sidecar_aside_instead_of_clobbering_it(tmp_path):
+    """A rebuild fires whenever is_ready() is false -- which includes a merely
+    corrupt file. Past ~90 days the sidecar is the only copy of its history,
+    so publishing over it would turn one bad byte into years of permanent
+    loss. Moving it aside makes that cost a rename."""
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(
+        p, make_prices_gz(tmp_path, "old.json.gz", {"uuid-old": PRICE_OBJ}))
+    price_sidecar.build_from_allprices(
+        p, make_prices_gz(tmp_path, "new.json.gz", {"uuid-new": PRICE_OBJ}))
+
+    kept = p + price_sidecar.SUPERSEDED_SUFFIX
+    assert os.path.exists(kept), "the previous sidecar must survive a rebuild"
+    assert _uuids(kept) == {"uuid-old"}
+    assert _uuids(p) == {"uuid-new"}
+    assert price_sidecar.is_ready(p)
+
+
+def test_first_build_leaves_no_superseded_copy(tmp_path):
+    """Nothing to preserve on first boot, and an orphaned -wal with no
+    database beside it is debris, not history."""
+    p = str(tmp_path / "side.sqlite")
+    with open(p + "-wal", "wb") as f:
+        f.write(b"orphan")
+    price_sidecar.build_from_allprices(
+        p, make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ}))
+    assert glob.glob(p + ".superseded*") == []
+    assert not os.path.exists(p + "-wal")
+    assert _uuids(p) == {"uuid-a"}
+
+
+def test_superseded_copy_keeps_the_wal_that_holds_its_last_commits(tmp_path):
+    """The -wal moves with the file it belongs to. Deleting it -- which is all
+    the swap had to do when it only needed it out of os.replace's way -- would
+    strip every transaction that had not been checkpointed off the copy being
+    preserved, and a backup that will not open is not a backup."""
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(
+        p, make_prices_gz(tmp_path, "old.json.gz", {"uuid-old": PRICE_OBJ}))
+    wal = _ghost_wal(p)
+    with open(p + "-wal", "wb") as f:          # exactly as a kill would leave it
+        f.write(wal)
+
+    price_sidecar.build_from_allprices(
+        p, make_prices_gz(tmp_path, "new.json.gz", {"uuid-new": PRICE_OBJ}))
+
+    kept = p + price_sidecar.SUPERSEDED_SUFFIX
+    assert _uuids(kept) == {"uuid-old", "uuid-ghost"}
+    assert _uuids(p) == {"uuid-new"}           # and never replayed onto the new one
+
+
+def test_only_the_most_recent_superseded_copy_is_kept(tmp_path):
+    """One rename, not a generation per rebuild: these are gigabyte files and
+    a crash-loop would fill the volume with them."""
+    p = str(tmp_path / "side.sqlite")
+    for gen in ("one", "two", "three"):
+        price_sidecar.build_from_allprices(
+            p, make_prices_gz(tmp_path, f"{gen}.json.gz",
+                              {f"uuid-{gen}": PRICE_OBJ}))
+    assert glob.glob(p + ".superseded*") == [p + ".superseded"]
+    assert _uuids(p + ".superseded") == {"uuid-two"}
+
+
+def test_a_previous_superseded_wal_is_not_replayed_into_the_next_copy(tmp_path):
+    """os.replace covers the main file only. A -wal left from the previous
+    generation would be replayed into the one that just took its place,
+    corrupting the very copy this exists to protect."""
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(
+        p, make_prices_gz(tmp_path, "one.json.gz", {"uuid-one": PRICE_OBJ}))
+    wal = _ghost_wal(p)
+    with open(p + "-wal", "wb") as f:
+        f.write(wal)
+    price_sidecar.build_from_allprices(          # gen1 + its wal move aside
+        p, make_prices_gz(tmp_path, "two.json.gz", {"uuid-two": PRICE_OBJ}))
+    assert os.path.exists(p + ".superseded-wal")
+
+    price_sidecar.build_from_allprices(          # gen2 has no wal to move
+        p, make_prices_gz(tmp_path, "three.json.gz", {"uuid-three": PRICE_OBJ}))
+    assert not os.path.exists(p + ".superseded-wal")
+    assert _uuids(p + ".superseded") == {"uuid-two"}

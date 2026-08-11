@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 import uuid
@@ -29,6 +30,7 @@ import httpx
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from mcp.server.fastmcp import FastMCP
 
+import price_sidecar
 import watchlist_db
 import watchlist_ingest
 import watchlist_pages
@@ -177,22 +179,34 @@ watchlist_pages.PUBLIC_BASE = PUBLIC_BASE
 class PassphraseMiddleware:
     """Maps /mcp/<passphrase> → /mcp with the resolved list in a ContextVar.
 
-    Also owns app lifespan add-ons: starts the nightly ingest loop on startup
-    (disabled via MYSTIC_FORGE_NO_INGEST for tests/dev)."""
+    Also owns app lifespan add-ons: starts the nightly ingest loop and the
+    one-shot price-sidecar build on startup (both disabled via
+    MYSTIC_FORGE_NO_INGEST for tests/dev)."""
 
     def __init__(self, app):
         self.app = app
         self._ingest_task = None
+        self._sidecar_task = None
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
             async def send_hooked(msg):
                 if (msg["type"] == "lifespan.startup.complete"
                         and not os.environ.get("MYSTIC_FORGE_NO_INGEST")):
-                    self._ingest_task = asyncio.create_task(
-                        watchlist_ingest_loop())
-                if msg["type"] == "lifespan.shutdown.complete" and self._ingest_task:
-                    self._ingest_task.cancel()
+                    # `is None`, not truthiness: a second startup event must
+                    # not schedule a second 141 MB download and 10-30 minute
+                    # build racing the first for the same output path.
+                    if self._ingest_task is None:
+                        self._ingest_task = asyncio.create_task(
+                            watchlist_ingest_loop())
+                    if self._sidecar_task is None:
+                        self._sidecar_task = asyncio.create_task(
+                            sidecar_build_once())
+                if msg["type"] == "lifespan.shutdown.complete":
+                    if self._ingest_task:
+                        self._ingest_task.cancel()
+                    if self._sidecar_task:
+                        self._sidecar_task.cancel()
                 await send(msg)
             await self.app(scope, receive, send_hooked)
             return
@@ -238,6 +252,68 @@ async def watchlist_ingest_loop():
         except Exception:
             logging.getLogger("mystic_forge").exception("ingest loop error")
         await asyncio.sleep(3600)
+
+
+# Held for the duration of a build. A non-blocking acquire is what makes
+# sidecar_build_once single-flight within the process: the lifespan hook
+# already refuses to schedule a second task, but nothing stops a future caller
+# (a rebuild endpoint, a second app instance) from awaiting the coroutine
+# directly, and two concurrent builds mean two 141 MB downloads and two
+# 10-30 minute passes racing to publish over the same path.
+_sidecar_build_lock = threading.Lock()
+
+
+async def sidecar_build_once():
+    """Build the price sidecar if it does not exist yet.
+
+    Eager rather than lazy on purpose: the weekly tier can only start from the
+    90 days AllPrices carries on build day, so delay is history that can never
+    be recovered.
+
+    Runs for 10-30 minutes in a worker thread while the server serves
+    requests. Everything degrades to the pre-sidecar behaviour for that
+    window -- is_ready() stays false, so page loads take the legacy scan --
+    and any failure is logged and swallowed, because a server that will not
+    start is worse than one without a sidecar."""
+    log = logging.getLogger("mystic_forge")
+    if not _sidecar_build_lock.acquire(blocking=False):
+        log.info("sidecar build already running; not starting another")
+        return
+    try:
+        data_dir = watchlist_ingest._data_dir()
+        side = watchlist_ingest._sidecar_path(data_dir)
+        if price_sidecar.is_ready(side):
+            return
+        # Cheap: stats() short-circuits on a not-ready path without scanning.
+        reason = price_sidecar.stats(side).get("reason")
+        if reason == "disabled":
+            # The escape hatch means "do not use the sidecar", which is not
+            # the same as "rebuild it" -- and a rebuild moves aside whatever
+            # the operator was preserving when they set it.
+            log.info("MYSTIC_FORGE_NO_SIDECAR is set; skipping the build")
+            return
+        if os.path.exists(side):
+            log.warning(
+                "sidecar at %s exists but is unusable (%s); rebuilding from "
+                "AllPrices. The old file is kept as %s%s -- past MTGJSON's "
+                "~90-day window it is the only copy of its history, so check "
+                "it before deleting it.",
+                side, reason, side, price_sidecar.SUPERSEDED_SUFFIX)
+        gz = os.path.join(data_dir, "AllPrices.json.gz")
+        if not os.path.exists(gz):
+            db = watchlist_db.connect()
+            try:
+                watchlist_db.init_db(db)
+                await asyncio.to_thread(
+                    watchlist_ingest._download,
+                    f"{watchlist_ingest.MTGJSON}/AllPrices.json.gz", gz, db)
+            finally:
+                db.close()
+        await asyncio.to_thread(price_sidecar.build_from_allprices, side, gz)
+    except Exception:
+        log.exception("sidecar build failed")
+    finally:
+        _sidecar_build_lock.release()
 
 
 def build_app():
@@ -5616,6 +5692,41 @@ async def og_image(request: Request):
                                      "og.png"), media_type="image/png")
 
 
+_SIDECAR_STATS_TTL = 60.0
+# Seconds a /health sidecar block is reused. price_sidecar.stats() is three
+# full table scans -- 3.2s measured on a 54M-row, 1.14 GB sidecar -- so an
+# uptime monitor polling every 10-30s would otherwise keep a worker thread
+# scanning a gigabyte more or less continuously. 60s sits just above the slow
+# end of that polling range, which collapses each cycle to at most one scan
+# while still surfacing a landed build within a minute.
+_sidecar_stats_cache = None                # (monotonic stamp, payload) | None
+_sidecar_stats_lock = threading.Lock()
+
+
+def _sidecar_stats_fresh():
+    """The cached sidecar stats if still inside the TTL, else None."""
+    snap = _sidecar_stats_cache
+    if snap is not None and time.monotonic() - snap[0] < _SIDECAR_STATS_TTL:
+        return snap[1]
+    return None
+
+
+def _sidecar_stats_refresh() -> dict:
+    """Recompute the sidecar stats. Blocking -- call in a worker thread."""
+    global _sidecar_stats_cache
+    with _sidecar_stats_lock:
+        hit = _sidecar_stats_fresh()       # another thread may have just filled it
+        if hit is not None:
+            return hit
+        try:
+            side = price_sidecar.stats(watchlist_ingest._sidecar_path())
+        except Exception:
+            logging.getLogger("mystic_forge").exception("sidecar stats failed")
+            side = {"ready": False}
+        _sidecar_stats_cache = (time.monotonic(), side)
+        return side
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request):
     """Health surface for compose healthcheck and /mtg/health monitoring."""
@@ -5637,11 +5748,19 @@ async def health(request: Request):
         stale = age.days > 1                  # > 36h in whole-day terms
     elif cards:
         stale = True
+    # Never inline: stats() is a multi-second scan on a real sidecar, and this
+    # is the endpoint an uptime monitor hits. `reason` rides along when it is
+    # not ready -- it is what tells a first boot apart from history that has
+    # just been thrown away.
+    side = _sidecar_stats_fresh()
+    if side is None:
+        side = await asyncio.to_thread(_sidecar_stats_refresh)
     return JSONResponse({
         "status": "degraded" if stale else "ok",
         "version": VERSION,
         "db": True, "lists": lists, "watched_cards": cards,
         "last_ingest": last, "ingest_stale": stale,
+        "sidecar": side,
     })
 
 

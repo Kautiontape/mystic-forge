@@ -1,7 +1,14 @@
+import asyncio
+import logging
+import os
+import time
+
+import pytest
 from starlette.testclient import TestClient
 
 import server
 import watchlist_db
+import watchlist_ingest
 
 
 def client():
@@ -704,3 +711,335 @@ def test_api_fork_and_recover(db_path):
     db = watchlist_db.connect(db_path)
     assert watchlist_db.get_list(db, list_id)["superseded_by"] is not None
     db.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIDECAR WIRING — /health reporting and the one-shot startup build
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_sidecar_stats():
+    """/health caches stats() in a module global, and a cache that outlived
+    its test would answer the next one with the wrong sidecar."""
+    server._sidecar_stats_cache = None
+    yield
+    server._sidecar_stats_cache = None
+
+
+def _sidecar_env(db_path, monkeypatch):
+    """Point the sidecar helpers at this test's tmp dir and return that path,
+    whatever the ambient environment happens to say."""
+    monkeypatch.delenv("MYSTIC_FORGE_DATA", raising=False)
+    monkeypatch.delenv("MYSTIC_FORGE_NO_SIDECAR", raising=False)
+    return watchlist_ingest._sidecar_path(os.path.dirname(db_path))
+
+
+def test_health_reports_sidecar_state(db_path, monkeypatch):
+    """Operators need to see whether the sidecar exists and how deep it goes."""
+    monkeypatch.setattr(server.price_sidecar, "stats",
+                        lambda _p: {"ready": True, "points": 42,
+                                    "earliest": "2026-01-01",
+                                    "latest": "2026-08-09"})
+    with client() as c:
+        body = c.get("/health").json()
+    assert body["sidecar"]["ready"] is True
+    assert body["sidecar"]["points"] == 42
+
+
+def test_health_survives_a_missing_sidecar(db_path, monkeypatch):
+    """No sidecar is a normal state, not an error."""
+    _sidecar_env(db_path, monkeypatch)
+    with client() as c:
+        r = c.get("/health")
+    assert r.status_code == 200
+    assert r.json()["sidecar"]["ready"] is False
+
+
+def test_health_names_why_the_sidecar_is_not_ready(db_path, monkeypatch):
+    """"absent" and "corrupt" are the difference between a first boot and
+    history that has just been thrown away. They are byte-identical in
+    `ready`, and /health is where an operator gets to tell them apart."""
+    side = _sidecar_env(db_path, monkeypatch)
+    with client() as c:
+        assert c.get("/health").json()["sidecar"]["reason"] == "absent"
+    server._sidecar_stats_cache = None
+    with open(side, "wb") as f:
+        f.write(b"this is not a database")
+    with client() as c:
+        assert c.get("/health").json()["sidecar"]["reason"] == "corrupt"
+
+
+def test_health_runs_sidecar_stats_off_the_event_loop(db_path, monkeypatch):
+    """stats() is three full table scans -- ~3.2s on a 54M-row sidecar. Called
+    inline it blocks the loop for that long on the one endpoint an uptime
+    monitor polls every 10-30s, stalling every in-flight MCP request with it."""
+    where = {}
+
+    def probe(_p):
+        try:
+            asyncio.get_running_loop()
+            where["on_loop"] = True
+        except RuntimeError:
+            where["on_loop"] = False
+        return {"ready": True, "points": 1}
+
+    monkeypatch.setattr(server.price_sidecar, "stats", probe)
+    with client() as c:
+        assert c.get("/health").json()["sidecar"]["points"] == 1
+    assert where == {"on_loop": False}
+
+
+def _counting_stats(calls):
+    def stats(_p):
+        calls.append(1)
+        return {"ready": True, "points": len(calls)}
+    return stats
+
+
+def test_health_caches_sidecar_stats_within_the_ttl(db_path, monkeypatch):
+    """Off the loop is not enough on its own: a monitor polling every 10s
+    would otherwise keep a worker thread scanning a gigabyte continuously."""
+    calls = []
+    monkeypatch.setattr(server.price_sidecar, "stats", _counting_stats(calls))
+    with client() as c:
+        first = c.get("/health").json()["sidecar"]
+        second = c.get("/health").json()["sidecar"]
+    assert len(calls) == 1
+    assert first == second == {"ready": True, "points": 1}
+
+
+def test_health_recomputes_sidecar_stats_once_the_ttl_lapses(db_path,
+                                                             monkeypatch):
+    """Cached, not frozen -- a build landing has to become visible."""
+    monkeypatch.setattr(server, "_SIDECAR_STATS_TTL", 0.0)
+    calls = []
+    monkeypatch.setattr(server.price_sidecar, "stats", _counting_stats(calls))
+    with client() as c:
+        assert c.get("/health").json()["sidecar"]["points"] == 1
+        assert c.get("/health").json()["sidecar"]["points"] == 2
+    assert len(calls) == 2
+
+
+def test_health_survives_stats_blowing_up(db_path, monkeypatch):
+    """A sick sidecar must not take the healthcheck down with it."""
+    def boom(_p):
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(server.price_sidecar, "stats", boom)
+    with client() as c:
+        r = c.get("/health")
+    assert r.status_code == 200
+    assert r.json()["sidecar"] == {"ready": False}
+
+
+def test_health_answers_while_a_build_is_in_flight(db_path, monkeypatch):
+    """A build is 10-30 minutes during which the .part file exists and the
+    real path does not, and the healthcheck still has to answer."""
+    side = _sidecar_env(db_path, monkeypatch)
+    with open(f"{side}.part.{os.getpid()}", "wb") as f:
+        f.write(b"half a database")
+    with client() as c:
+        body = c.get("/health").json()
+    assert body["sidecar"] == {"ready": False, "reason": "absent"}
+    assert body["status"] in ("ok", "degraded")
+
+
+# ── Startup scheduling ───────────────────────────────────────────────────────
+
+
+class _LifespanApp:
+    """Minimal ASGI app that emits the lifespan messages it is handed."""
+
+    def __init__(self, *types):
+        self.types = types
+
+    async def __call__(self, scope, receive, send):
+        for t in self.types:
+            await send({"type": t})
+
+
+def run_lifespan(*types):
+    """Drive PassphraseMiddleware's lifespan hook.
+
+    Returns the middleware and which of its tasks were cancelled. That second
+    value has to be sampled from inside the loop: asyncio.run cancels every
+    task still pending when it tears the loop down, so a `.cancelled()` read
+    after it returns is true whether or not the shutdown hook did anything."""
+    mw = server.PassphraseMiddleware(_LifespanApp(*types))
+
+    async def receive():
+        return {"type": "lifespan.startup"}
+
+    async def send(_msg):
+        pass
+
+    async def go():
+        await mw({"type": "lifespan"}, receive, send)
+        for _ in range(3):        # let the scheduled tasks run, or be cancelled
+            await asyncio.sleep(0)
+        return mw, {name: task is not None and task.cancelled()
+                    for name, task in (("ingest", mw._ingest_task),
+                                       ("sidecar", mw._sidecar_task))}
+
+    return asyncio.run(go())
+
+
+def _record_startups(monkeypatch, started, body=None):
+    async def run(name):
+        started.append(name)
+        if body is not None:
+            await body()
+
+    monkeypatch.setattr(server, "watchlist_ingest_loop",
+                        lambda: run("ingest"))
+    monkeypatch.setattr(server, "sidecar_build_once", lambda: run("sidecar"))
+
+
+def test_startup_schedules_the_sidecar_build(monkeypatch):
+    """Eager, not lazy: the weekly tier can only ever begin from the 90 days
+    AllPrices holds on build day, so a day of delay is a day of history that
+    can never be recovered."""
+    monkeypatch.delenv("MYSTIC_FORGE_NO_INGEST", raising=False)
+    started = []
+    _record_startups(monkeypatch, started)
+    mw, _ = run_lifespan("lifespan.startup.complete")
+    assert started == ["ingest", "sidecar"]
+    assert mw._sidecar_task is not None
+
+
+def test_a_second_startup_event_cannot_start_a_second_build(monkeypatch):
+    """The build downloads 141 MB and runs for 10-30 minutes; twice over is
+    twice the bandwidth racing for the same output path."""
+    monkeypatch.delenv("MYSTIC_FORGE_NO_INGEST", raising=False)
+    started = []
+    _record_startups(monkeypatch, started)
+    run_lifespan("lifespan.startup.complete", "lifespan.startup.complete")
+    assert started.count("sidecar") == 1
+    assert started.count("ingest") == 1
+
+
+def test_no_ingest_env_var_keeps_startup_inert():
+    """conftest sets MYSTIC_FORGE_NO_INGEST for the whole suite, and that is
+    the only thing standing between the test run and a 141 MB download."""
+    mw, _ = run_lifespan("lifespan.startup.complete")
+    assert mw._sidecar_task is None and mw._ingest_task is None
+
+
+def test_shutdown_cancels_the_sidecar_build(monkeypatch):
+    monkeypatch.delenv("MYSTIC_FORGE_NO_INGEST", raising=False)
+    started = []
+    _record_startups(monkeypatch, started, body=asyncio.Event().wait)
+    _, cancelled = run_lifespan("lifespan.startup.complete",
+                                "lifespan.shutdown.complete")
+    assert cancelled == {"ingest": True, "sidecar": True}
+
+
+# ── The one-shot build itself ────────────────────────────────────────────────
+
+
+def _stub_build(calls, delay=0.0):
+    def build(path, gz):
+        calls.append((path, gz))
+        time.sleep(delay)
+        return 0
+    return build
+
+
+async def test_sidecar_build_runs_once_even_when_scheduled_twice(db_path,
+                                                                 monkeypatch):
+    """141 MB and 10-30 minutes of CPU. Per-pid .part names keep two builds
+    from publishing each other's half-finished file, but nothing stops them
+    from both doing the work."""
+    side = _sidecar_env(db_path, monkeypatch)
+    open(os.path.join(os.path.dirname(db_path), "AllPrices.json.gz"), "wb").close()
+    calls = []
+    monkeypatch.setattr(server.price_sidecar, "is_ready", lambda _p: False)
+    monkeypatch.setattr(server.price_sidecar, "build_from_allprices",
+                        _stub_build(calls, delay=0.05))
+    await asyncio.gather(server.sidecar_build_once(),
+                         server.sidecar_build_once())
+    assert [c[0] for c in calls] == [side]
+
+
+async def test_sidecar_build_skips_a_sidecar_that_is_already_ready(db_path,
+                                                                  monkeypatch):
+    _sidecar_env(db_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(server.price_sidecar, "is_ready", lambda _p: True)
+    monkeypatch.setattr(server.price_sidecar, "build_from_allprices",
+                        _stub_build(calls))
+    await server.sidecar_build_once()
+    assert calls == []
+
+
+async def test_sidecar_build_respects_the_disable_switch(db_path, monkeypatch):
+    """MYSTIC_FORGE_NO_SIDECAR means "do not use it", which is not the same
+    as "rebuild it" -- and a rebuild moves whatever is there aside."""
+    _sidecar_env(db_path, monkeypatch)
+    monkeypatch.setenv("MYSTIC_FORGE_NO_SIDECAR", "1")
+    calls, fetched = [], []
+    monkeypatch.setattr(server.price_sidecar, "build_from_allprices",
+                        _stub_build(calls))
+    # Stubbed rather than left live: without the check this reaches for
+    # AllPrices, and a test that can pull 141 MB off MTGJSON when the code
+    # regresses is a worse outcome than the regression.
+    monkeypatch.setattr(watchlist_ingest, "_download",
+                        lambda url, dest, _db: fetched.append(url))
+    await server.sidecar_build_once()
+    assert calls == [] and fetched == []
+
+
+async def test_sidecar_build_downloads_allprices_when_it_is_absent(db_path,
+                                                                   monkeypatch):
+    side = _sidecar_env(db_path, monkeypatch)
+    gz = os.path.join(os.path.dirname(db_path), "AllPrices.json.gz")
+    fetched = []
+
+    def fake_download(url, dest, _db):
+        fetched.append(url)
+        open(dest, "wb").close()
+        return dest
+
+    calls = []
+    monkeypatch.setattr(server.price_sidecar, "is_ready", lambda _p: False)
+    monkeypatch.setattr(watchlist_ingest, "_download", fake_download)
+    monkeypatch.setattr(server.price_sidecar, "build_from_allprices",
+                        _stub_build(calls))
+    await server.sidecar_build_once()
+    assert fetched == [f"{watchlist_ingest.MTGJSON}/AllPrices.json.gz"]
+    assert calls == [(side, gz)]
+
+
+async def test_sidecar_build_survives_a_disk_too_small_to_hold_it(db_path,
+                                                                  monkeypatch,
+                                                                  caplog):
+    """build_from_allprices raises OSError rather than filling the volume.
+    The server has to finish starting anyway -- every other tool still works
+    without a sidecar, and the page path falls back to the legacy scan."""
+    _sidecar_env(db_path, monkeypatch)
+    open(os.path.join(os.path.dirname(db_path), "AllPrices.json.gz"), "wb").close()
+
+    def no_room(_path, _gz):
+        raise OSError("not enough free space")
+
+    monkeypatch.setattr(server.price_sidecar, "is_ready", lambda _p: False)
+    monkeypatch.setattr(server.price_sidecar, "build_from_allprices", no_room)
+    with caplog.at_level(logging.ERROR):
+        await server.sidecar_build_once()          # must not raise
+    assert "sidecar build failed" in caplog.text
+
+
+async def test_sidecar_build_warns_before_replacing_an_unusable_sidecar(
+        db_path, monkeypatch, caplog):
+    """Past ~90 days the file being replaced is the only copy of its history.
+    An operator gets one chance to notice that in the deploy log."""
+    side = _sidecar_env(db_path, monkeypatch)
+    with open(side, "wb") as f:
+        f.write(b"this is not a database")
+    open(os.path.join(os.path.dirname(db_path), "AllPrices.json.gz"), "wb").close()
+    monkeypatch.setattr(server.price_sidecar, "build_from_allprices",
+                        _stub_build([]))
+    with caplog.at_level(logging.WARNING):
+        await server.sidecar_build_once()
+    assert "corrupt" in caplog.text and "superseded" in caplog.text
