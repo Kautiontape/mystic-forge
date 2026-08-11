@@ -2,7 +2,11 @@ import gzip
 import json
 import os
 import sqlite3
+import threading
 import tracemalloc
+
+import httpx
+import pytest
 
 import price_sidecar
 import watchlist_db
@@ -813,3 +817,177 @@ def test_run_ingest_stamps_last_ingest_when_downsample_fails(
     fresh = db.execute(
         "SELECT price FROM prices WHERE date='2026-08-09'").fetchone()
     assert fresh is not None and fresh["price"] == 6.75
+
+
+# ── _download ──────────────────────────────────────────────────────────────
+
+URL = "https://mtgjson.test/api/v5/AllPrices.json.gz"
+
+
+class FakeStream:
+    """Stand-in for httpx.stream: a context manager over a canned response.
+
+    `chunks` may be a generator, which is what lets a test drive the body one
+    write at a time."""
+
+    def __init__(self, status_code=200, headers=None, chunks=()):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._chunks = chunks
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}",
+                request=httpx.Request("GET", URL),
+                response=httpx.Response(self.status_code))
+
+    def iter_bytes(self):
+        return iter(self._chunks)
+
+
+def part_files(directory):
+    return sorted(n for n in os.listdir(directory) if ".part" in n)
+
+
+def test_two_concurrent_downloads_publish_one_whole_body(
+        db_path, tmp_path, monkeypatch):
+    """Two callers fetching the same URL to the same dest at once.
+
+    Reachable since the lifespan hook schedules sidecar_build_once() and
+    watchlist_ingest_loop() together and both fetch AllPrices.json.gz to the
+    same path. Sharing one `<dest>.part` splices the two bodies together, and
+    the ETag stored afterwards then certifies the splice as current until
+    MTGJSON's own ETag changes.
+
+    The barrier forces the interleave instead of hoping for it, and the two
+    chunk sizes differ so the writers' offsets diverge — equal sizes would let
+    a shared file still come out looking like one whole body."""
+    dest = str(tmp_path / "AllPrices.json.gz")
+    chunk = {"a": b"A" * (64 * 1024), "b": b"B" * (96 * 1024)}
+    rounds = 4
+    whole = {which: piece * rounds for which, piece in chunk.items()}
+    barrier = threading.Barrier(2)
+
+    def body(which):
+        for _ in range(rounds):
+            barrier.wait(timeout=30)     # both writers step together
+            yield chunk[which]
+
+    handed = iter(("a", "b"))
+    lock = threading.Lock()
+
+    def fake_stream(method, url, **kw):
+        with lock:
+            which = next(handed)
+        return FakeStream(headers={"etag": f'"{which}"'}, chunks=body(which))
+
+    monkeypatch.setattr(watchlist_ingest.httpx, "stream", fake_stream)
+
+    failures = []
+
+    def download():
+        # Own connection per thread: sqlite3 forbids sharing one across them.
+        conn = watchlist_db.connect(db_path)
+        try:
+            watchlist_ingest._download(URL, dest, conn)
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=download) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not any(t.is_alive() for t in threads), "a download never finished"
+
+    assert not failures, f"a concurrent download raised: {failures!r}"
+    with open(dest, "rb") as f:
+        published = f.read()
+    assert published in whole.values(), (
+        f"published {len(published)} bytes, but a whole body is "
+        f"{sorted(len(w) for w in whole.values())} — the two downloads "
+        f"interleaved into the same file")
+    assert part_files(tmp_path) == []
+
+
+def test_a_failed_download_leaves_no_temp_file_behind(db, tmp_path,
+                                                     monkeypatch):
+    """Nothing else sweeps these — price_sidecar._sweep_stale_parts only
+    matches its own `price_sidecar.sqlite.part.*`, so one leaked file per
+    failed attempt would accumulate at ~1.4 GB each."""
+    dest = str(tmp_path / "AllPrices.json.gz")
+
+    def body():
+        yield b"x" * (64 * 1024)
+        raise httpx.ReadError("connection reset by peer")
+
+    monkeypatch.setattr(watchlist_ingest.httpx, "stream",
+                        lambda *a, **k: FakeStream(headers={"etag": '"v1"'},
+                                                   chunks=body()))
+    with pytest.raises(httpx.ReadError):
+        watchlist_ingest._download(URL, dest, db)
+
+    assert part_files(tmp_path) == []
+    assert not os.path.exists(dest), "a truncated body was published"
+    # The ETag must never outlive a body that did not land, or the next run
+    # gets a 304 for a file it does not have.
+    assert watchlist_ingest._get_meta(db, f"etag:{URL}") is None
+
+
+def test_a_download_that_errors_writes_nothing(db, tmp_path, monkeypatch):
+    """raise_for_status still fires, before any file is created."""
+    dest = str(tmp_path / "AllPrices.json.gz")
+    monkeypatch.setattr(
+        watchlist_ingest.httpx, "stream",
+        lambda *a, **k: FakeStream(status_code=503, chunks=[b"nope"]))
+    with pytest.raises(httpx.HTTPStatusError):
+        watchlist_ingest._download(URL, dest, db)
+
+    assert part_files(tmp_path) == []
+    assert not os.path.exists(dest)
+    assert watchlist_ingest._get_meta(db, f"etag:{URL}") is None
+
+
+def test_download_short_circuits_on_304(db, tmp_path, monkeypatch):
+    dest = str(tmp_path / "AllPrices.json.gz")
+    with open(dest, "wb") as f:
+        f.write(b"cached body")
+    watchlist_ingest._set_meta(db, f"etag:{URL}", '"v1"')
+    sent = {}
+
+    def fake_stream(method, url, headers=None, **kw):
+        sent.update(headers or {})
+        return FakeStream(status_code=304, headers={"etag": '"v2"'},
+                          chunks=[b"never read"])
+
+    monkeypatch.setattr(watchlist_ingest.httpx, "stream", fake_stream)
+
+    assert watchlist_ingest._download(URL, dest, db) == dest
+    assert sent.get("If-None-Match") == '"v1"'
+    with open(dest, "rb") as f:
+        assert f.read() == b"cached body"
+    assert watchlist_ingest._get_meta(db, f"etag:{URL}") == '"v1"'
+    assert part_files(tmp_path) == []
+
+
+def test_download_stores_the_etag_on_success(db, tmp_path, monkeypatch):
+    dest = str(tmp_path / "AllPrices.json.gz")
+    monkeypatch.setattr(
+        watchlist_ingest.httpx, "stream",
+        lambda *a, **k: FakeStream(headers={"etag": '"v9"'},
+                                   chunks=[b"first ", b"second"]))
+
+    assert watchlist_ingest._download(URL, dest, db) == dest
+    with open(dest, "rb") as f:
+        assert f.read() == b"first second"
+    assert watchlist_ingest._get_meta(db, f"etag:{URL}") == '"v9"'
+    assert part_files(tmp_path) == []

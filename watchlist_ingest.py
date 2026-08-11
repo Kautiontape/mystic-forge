@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sqlite3
+import tempfile
 import time
 from datetime import date
 
@@ -88,7 +89,24 @@ def _set_meta(db, key, value):
 
 
 def _download(url: str, dest: str, db) -> str:
-    """Download url to dest unless the cached copy's ETag still matches."""
+    """Download url to dest unless the cached copy's ETag still matches.
+
+    Streams into a temp file unique to this call and renames it into place.
+    A single shared `<dest>.part` was safe only while one caller ran at a
+    time; startup now schedules the ingest loop and the sidecar build
+    together and both fetch AllPrices.json.gz to the same path, so two
+    writers share the name, interleave their bodies, and publish the splice —
+    which the ETag written afterwards then certifies as current until
+    MTGJSON's own ETag changes.
+
+    Per-call uniqueness, not per-process: these are threads (asyncio.to_thread
+    plus _schedule_backfill), so build_from_allprices's `.part.<pid>` scheme
+    would still collide. mkstemp gives that and creates the file atomically;
+    putting it in dest's own directory keeps the rename on one filesystem, so
+    it stays atomic and a reader never sees a partial file at `dest`.
+
+    The temp file is removed on any failure — nothing else sweeps these
+    (price_sidecar._sweep_stale_parts matches only its own name)."""
     etag_key = f"etag:{url}"
     headers = {}
     old_etag = _get_meta(db, etag_key)
@@ -99,11 +117,23 @@ def _download(url: str, dest: str, db) -> str:
         if resp.status_code == 304:
             return dest
         resp.raise_for_status()
-        tmp = dest + ".part"
-        with open(tmp, "wb") as f:
-            for chunk in resp.iter_bytes():
-                f.write(chunk)
-        os.replace(tmp, dest)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(dest)),
+                                   prefix=os.path.basename(dest) + ".",
+                                   suffix=".part")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                for chunk in resp.iter_bytes():
+                    f.write(chunk)
+            os.replace(tmp, dest)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        # After the rename, never before: an ETag recorded for a body that
+        # never landed answers 304 forever against a file that is missing or
+        # stale.
         if resp.headers.get("etag"):
             _set_meta(db, etag_key, resp.headers["etag"])
     return dest
