@@ -35,5 +35,29 @@ jobs:
             exit 1
           fi
 
+      # A release is only proposable when its changelog entry ships with it.
+      # scripts/render_release.py in mcp-servers transcribes this fragment
+      # into the landing pages when propose-release opens the PR, so catching
+      # a missing or mistagged fragment here — where the author is — is what
+      # keeps the release PR from ever opening red.
+      - name: Validate changelog fragment
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < VERSION)
+          fragment="changelog.d/${version}.html"
+          if [ ! -f "$fragment" ]; then
+            echo "::error file=VERSION::VERSION is ${version} but ${fragment} does not exist; write the changelog entry in the same change as the bump (see changelog.d/README.md)"
+            exit 1
+          fi
+          if ! grep -q "<article class=\"entry\" data-version=\"${version}\">" "$fragment"; then
+            echo "::error file=${fragment}::no <article class=\"entry\" data-version=\"${version}\"> block"
+            exit 1
+          fi
+          stray=$(grep -o 'data-version="[^"]*"' "$fragment" | grep -v "\"${version}\"" || true)
+          if [ -n "$stray" ]; then
+            echo "::error file=${fragment}::article tagged ${stray} in the ${version} fragment"
+            exit 1
+          fi
+
       - name: Run tests
         run: python -m pytest -q -m "not slow"

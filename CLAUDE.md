@@ -39,12 +39,11 @@ A previous `deploy.yml` in this repo ran `git submodule update --remote` plus an
 
 To release:
 
-1. Bump `VERSION` (semver). It feeds the image tag, the outbound `User-Agent`, and `/health`.
-2. Push to `main`. `ci.yml` runs the tests, and only on a green run does `propose-release.yml` open or update a PR in `mcp-servers` bumping the submodule pin. Red tests propose nothing — the parent's release checks never run this suite, so this is the only test gate before a deploy.
-3. Add a changelog entry in the parent repo at `landing/mtg/changelog/index.html`, tagged `data-version="<VERSION>"`, and update the teaser in `landing/mtg/index.html` to match. Push those to the release PR branch.
-4. Merge the PR. That builds the image from the pin and deploys it.
+1. In one change: bump `VERSION` (semver — it feeds the image tag, the outbound `User-Agent`, and `/health`) and write `changelog.d/<VERSION>.html`, the release's changelog entry (see `changelog.d/README.md` for the markup contract; a tool that is new to the landing page needs `data-group="<Group>"` on its tag, and a brand-new group needs a `<VERSION>.group.html` companion). CI fails a bump without its fragment.
+2. Push to `main`. `ci.yml` runs the tests, and only on a green run does `propose-release.yml` build the release branch in `mcp-servers`: it bumps the submodule pin, renders the fragment into the landing pages with `scripts/render_release.py`, pre-flights `scripts/check_release.py`, and only then opens or updates the PR — so it opens with the checks passing. Red tests propose nothing — the parent's release checks never run this suite, so this is the only test gate before a deploy.
+3. Merge the PR. That builds the image from the pin and deploys it.
 
-`mcp-servers/scripts/check_release.py` blocks the merge unless the version has a changelog entry, the version went up, the teaser matches the newest entry, and the tool tags on the landing page match `@mcp.tool(name=...)` in `server.py`. Adding or renaming a tool means updating that page in the same release.
+The release branch is derived state, rebuilt from `origin/main` on every proposal — don't hand-edit it; fix the fragment here and re-push instead. `mcp-servers/scripts/check_release.py` still gates the merge: changelog entry exists, version went up, teaser matches the newest entry, and the tool tags on the landing page match `@mcp.tool(name=...)` in `server.py`.
 
 Verify a release with `curl -s https://mcp.kautiontape.com/mtg/health` — it reports the running version.
 

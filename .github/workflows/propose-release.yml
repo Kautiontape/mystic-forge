@@ -12,6 +12,15 @@ name: propose release
 # docs- and CI-only pushes do not raise a release PR that would then fail the
 # "version increased" check.
 #
+# The release branch is derived state, rebuilt from origin/main every run:
+# the pin bump, the changelog entry, the teaser, and any new tool tags are
+# all rendered from this repo's changelog.d/ fragments by
+# mcp-servers/scripts/render_release.py, and check_release.py must pass
+# before anything is pushed. A release PR therefore opens with its checks
+# already green — if rendering or the checks fail, this run fails instead,
+# here, where the fragment is fixed. Do not hand-edit the release branch;
+# edit changelog.d/ and re-push.
+#
 # Requires the repo secret MCP_SERVERS_RELEASE_TOKEN: a fine-grained PAT owned by
 # the Kautiontape org, scoped to Kautiontape/mcp-servers only, with
 # Contents: read+write and Pull requests: read+write. The built-in GITHUB_TOKEN
@@ -53,7 +62,13 @@ jobs:
           submodules: recursive
           path: mcp-servers
 
-      - name: Bump the submodule pin
+      # The same interpreter release-checks.yml uses, so the pre-flight here
+      # and the gate on the PR cannot disagree about the scripts they share.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Build the release branch
         id: bump
         working-directory: mcp-servers
         run: |
@@ -89,37 +104,30 @@ jobs:
           git config user.name  'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
-          # Reuse the release branch only while a release is genuinely in flight,
-          # so hand-written changelog commits on an open PR survive a later bump.
-          # Once it has been merged (or squashed away) start clean from main --
-          # building on a squash-merged tip would replay merged changes into the
-          # next PR.
-          REUSE=false
-          if git ls-remote --exit-code --heads origin "$RELEASE_BRANCH" >/dev/null 2>&1; then
-            git fetch origin "$RELEASE_BRANCH"
-            if [ -n "$(git rev-list "origin/main..origin/$RELEASE_BRANCH")" ]; then
-              REUSE=true
-            fi
-          fi
-
-          if [ "$REUSE" = true ]; then
-            echo "Release in flight; committing onto the existing branch."
-            git checkout -B "$RELEASE_BRANCH" "origin/$RELEASE_BRANCH"
-          else
-            echo "No release in flight; starting the branch from main."
-            git checkout -B "$RELEASE_BRANCH" origin/main
-          fi
-
+          # The branch is rebuilt from main every run. Everything on it is
+          # derived from the pin and changelog.d/, so there is nothing
+          # hand-written to preserve — a stale or squash-merged branch state
+          # is simply discarded.
+          git checkout -B "$RELEASE_BRANCH" origin/main
           git -C mystic-forge checkout --detach "$NEW_SHA"
 
-          git add mystic-forge
+          # Transcribe changelog.d/ fragments into the landing pages: the
+          # changelog entry, the teaser, and any new tool tags or groups.
+          python3 scripts/render_release.py
+
+          git add mystic-forge landing
           if git diff --cached --quiet; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Release branch already points at $NEW_SHA."
+            echo "Release branch already matches $NEW_SHA."
             exit 0
           fi
+          git commit -m "mystic-forge: Release ${NEW_VERSION} (${NEW_SHA:0:7})"
 
-          git commit -m "mystic-forge: Bump to ${NEW_VERSION} (${NEW_SHA:0:7})"
+          # Pre-flight the same checks the PR will run. A failure stops this
+          # run before anything is pushed, so the release PR can never open
+          # red — fix the fragment in changelog.d/ and push again.
+          python3 scripts/check_release.py --base origin/main
+
           git push --force-with-lease origin "$RELEASE_BRANCH"
 
           {
@@ -144,11 +152,12 @@ jobs:
             printf '### Commits\n\n'
             git -C mystic-forge log --format='- %s' "${OLD_SHA}..${NEW_SHA}" \
               || printf -- '- (range unavailable)\n'
-            printf '\n### Before merging\n\n'
-            printf -- '- [ ] `landing/mtg/changelog/index.html` has an entry with `data-version="%s"`\n' "$VERSION"
-            printf -- '- [ ] The teaser in `landing/mtg/index.html` carries the same `data-version`\n'
-            printf -- '- [ ] Tool tags on the page match the tool list at this pin\n\n'
-            printf '`release-checks` enforces all three. Push changelog edits to this branch.\n'
+            printf '\n### Release checks\n\n'
+            printf 'Passed when this branch was built: the changelog entry, teaser, and\n'
+            printf 'tool tags were rendered from `mystic-forge/changelog.d/%s.html` by\n' "$VERSION"
+            printf '`scripts/render_release.py`.\n\n'
+            printf 'This branch is rebuilt from `main` on every proposal — to change the\n'
+            printf 'entry, edit the fragment in mystic-forge and push; do not commit here.\n'
           } > /tmp/pr-body.md
 
           # Match OPEN pull requests only. `gh pr view <branch>` resolves by head

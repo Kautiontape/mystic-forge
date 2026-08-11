@@ -1,0 +1,29 @@
+<article class="entry" data-version="1.2.0">
+  <div class="entry-date">2026-08-11 &middot; v1.2.0</div>
+  <h2 class="entry-title">Price history that outlives MTGJSON's window</h2>
+  <p class="entry-body">
+    A watchlist used to show only what MTGJSON still had &mdash; a rolling
+    ~90 days &mdash; and adding a card meant waiting while the server
+    streamed a 1.4&nbsp;GB price file end to end just to find that card's
+    rows. Prices now land in a store the server keeps itself: 120 days at
+    daily resolution, and weekly averages kept indefinitely beyond that.
+    A list you have held for a year has a year of history rather than a
+    quarter, and it keeps accumulating. Adding a card reads that store by
+    index instead of scanning the file, so history shows up while the page
+    is still loading. <b>Mana Pool</b> also joins TCGplayer, Card Kingdom,
+    and Cardmarket as a fourth price source. The store builds itself once
+    after this release and takes a while to fill; until it does, every
+    watchlist keeps working exactly as it did before.
+  </p>
+  <p class="entry-teaser">
+    Watchlists used to show only the ~90 days MTGJSON still had, and adding a card meant waiting on a 1.4 GB scan. Prices now live in a store the server keeps itself &mdash; <b>120 days of daily history plus weekly averages kept indefinitely</b> &mdash; so a list you have held for a year has a year of history, and adding a card reads it by index instead of scanning. <b>Mana Pool</b> joins the other three price sources. See full changelog for more.
+  </p>
+  <div class="tools">
+    <span class="tool-tag">watchlist_add</span>
+    <span class="tool-tag">watchlist_bulk_add</span>
+    <span class="tool-tag">watchlist_view</span>
+    <span class="tool-tag">watchlist_history</span>
+    <span class="tool-tag">watchlist_report</span>
+    <span class="tool-tag">price_history</span>
+  </div>
+</article>
