@@ -20,10 +20,23 @@ That shapes the design:
 
 The API is undocumented and unversioned, so the parsers below key off shape
 (any object carrying an int `id` plus a `name`) rather than an exact schema.
+Two details about *reaching* it are not guessable, and getting either wrong
+403s every call rather than failing visibly:
+
+* The query is a **path segment**: `/search/autocomplete/Bitterblossom`.
+  `?query=` is not a route on their API gateway, which answers
+  `403 {"error":"Missing Authentication Token"}` to anything it can't match.
+* Their CloudFront WAF refuses a bare `MysticForge/<version>` User-Agent on
+  every path, including ones that serve a browser happily. It accepts the
+  `Mozilla/5.0 (compatible; …)` well-behaved-bot form, so that is what we
+  send — honest about who we are, shaped the way the filter expects.
 
 Verify the endpoint from a network that can reach MTGStocks with:
 
     python -m mystic_forge.watchlist.mtgstocks "Black Market Connections"
+
+The `slow`-marked tests in tests/test_watchlist_mtgstocks.py check both of
+the above against the live API; everything else there runs on fixtures.
 """
 
 import json
@@ -31,6 +44,7 @@ import logging
 import os
 import sqlite3
 import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -40,6 +54,7 @@ log = logging.getLogger("mystic_forge.mtgstocks")
 
 SITE = "https://www.mtgstocks.com"
 API = "https://api.mtgstocks.com"
+CONTACT = "https://mcp.kautiontape.com/mtg"
 TIMEOUT = 10.0
 RETRY_DAYS = 7        # how long a "not found" answer is trusted
 MAX_PER_RUN = 60      # cap the calls one ingest cycle may make
@@ -55,7 +70,10 @@ def _version() -> str:
 
 
 def _headers() -> dict:
-    return {"User-Agent": f"MysticForge/{_version()}",
+    """The `Mozilla/5.0 (compatible; …)` prefix is load-bearing: without it
+    CloudFront answers 403 on every path (see the module docstring)."""
+    return {"User-Agent": (f"Mozilla/5.0 (compatible; MysticForge/{_version()};"
+                           f" +{CONTACT})"),
             "Accept": "application/json"}
 
 
@@ -79,8 +97,13 @@ def slugify(name: str) -> str:
 def print_url(print_id, slug: str | None = None) -> str:
     """`/prints/141924-black-market-connections`. The slug is cosmetic — the
     numeric prefix is what MTGStocks routes on — but we keep it when known so
-    the link reads like one a human would paste."""
-    tail = f"-{slug}" if slug else ""
+    the link reads like one a human would paste. Their own slugs already lead
+    with the id (`97426-bitterblossom`), so drop that before joining or the
+    number lands in the URL twice."""
+    tail = ""
+    if slug:
+        head = f"{print_id}-"
+        tail = "-" + (slug[len(head):] if slug.startswith(head) else slug)
     return f"{SITE}/prints/{print_id}{tail}"
 
 
@@ -122,6 +145,26 @@ def _pick(payload, name: str):
     return partial
 
 
+def _set_code_of(node) -> str | None:
+    """MTGStocks calls a set code an `abbreviation`, which matches the set
+    code a watchlist entry pins — no MTGJSON name lookup needed."""
+    for key in ("abbreviation", "set_code", "setCode"):
+        val = node.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    card_set = node.get("card_set")
+    if isinstance(card_set, dict):
+        val = card_set.get("abbreviation")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _slug_of(node) -> str | None:
+    slug = node.get("slug")
+    return slug if isinstance(slug, str) else None
+
+
 def _set_name_of(node) -> str | None:
     for key in ("set_name", "setName", "set"):
         val = node.get(key)
@@ -146,30 +189,41 @@ def _get(client, path: str, params=None):
 # ── API calls ───────────────────────────────────────────────────────────────
 
 def resolve_name(client, name: str):
-    """(print_id, slug) for a card name, or None if MTGStocks doesn't know it."""
-    payload = _get(client, "/search/autocomplete", {"query": front_face(name)})
+    """(print_id, slug) for a card name, or None if MTGStocks doesn't know it.
+
+    The name is a path segment, not a `query` parameter — see the module
+    docstring; the parameter form is not a route and 403s every time."""
+    payload = _get(client, "/search/autocomplete/"
+                   + urllib.parse.quote(front_face(name), safe=""))
     hit = _pick(payload, name)
     if hit is None:
         return None
-    slug = hit.get("slug") if isinstance(hit.get("slug"), str) else None
-    return hit["id"], slug or slugify(hit["name"])
+    return hit["id"], _slug_of(hit) or slugify(hit["name"])
 
 
 def printings(client, print_id):
-    """[(print_id, slug, set_name)] for every printing on a print's page.
+    """[(print_id, slug, set_key, foil)] for every printing on a print's page.
 
-    Best-effort: MTGStocks lists a card's other printings alongside the one
-    being viewed, which is how a pinned printing gets its own link. An
-    unrecognised payload just yields nothing and the name-level link stands."""
+    `set_key` is the set's code where MTGStocks gives one and its name
+    otherwise, so `refresh` can match a pinned printing on either. Their
+    payload lists siblings under `sets`; an unrecognised one falls back to a
+    walk, yields nothing, and the name-level link stands."""
     payload = _get(client, f"/prints/{print_id}")
+    nodes = payload.get("sets") if isinstance(payload, dict) else None
+    if not isinstance(nodes, list):
+        nodes = list(_walk(payload))
+    elif isinstance(payload, dict):
+        nodes = [payload, *nodes]          # the printing being viewed counts
     out, seen = [], set()
-    for node in _walk(payload):
-        pid, set_name = node.get("id"), _set_name_of(node)
-        if not isinstance(pid, int) or not set_name or pid in seen:
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        pid = node.get("id")
+        key = _set_code_of(node) or _set_name_of(node)
+        if not isinstance(pid, int) or not key or pid in seen:
             continue
         seen.add(pid)
-        slug = node.get("slug") if isinstance(node.get("slug"), str) else None
-        out.append((pid, slug, set_name))
+        out.append((pid, _slug_of(node), key, bool(node.get("foil"))))
     return out
 
 
@@ -295,10 +349,10 @@ def refresh(db, allprintings_path: str | None = None,
         for name, set_code in pinned:
             if failures >= GIVE_UP_AFTER:
                 break
-            want = (set_names.get(set_code) or "").strip().lower()
             base = cached_url(db, name)      # needs the name-level id first
-            if not base or not want:
+            if not base:
                 continue
+            want_name = (set_names.get(set_code) or "").strip().lower()
             base_id = base.rsplit("/", 1)[1].split("-", 1)[0]
             try:
                 others = printings(client, base_id)
@@ -307,8 +361,11 @@ def refresh(db, allprintings_path: str | None = None,
                 log.debug("mtgstocks printings failed for %s: %s", name, e)
                 continue
             failures = 0
-            match = next(((p, s) for p, s, sn in others
-                          if sn.strip().lower() == want), None)
+            hits = [(pid, slug, foil) for pid, slug, key, foil in others
+                    if key.strip().upper() == set_code
+                    or (want_name and key.strip().lower() == want_name)]
+            hits.sort(key=lambda h: h[2])    # an entry pins a set, not a finish
+            match = hits[0] if hits else None
             remember(db, name, set_code,
                      match[0] if match else None, match[1] if match else None)
             resolved += 1 if match else 0
@@ -322,7 +379,8 @@ if __name__ == "__main__":                                # pragma: no cover
     import sys
     query = " ".join(sys.argv[1:]) or "Black Market Connections"
     with httpx.Client() as _c:
-        raw = _get(_c, "/search/autocomplete", {"query": front_face(query)})
+        raw = _get(_c, "/search/autocomplete/"
+                   + urllib.parse.quote(front_face(query), safe=""))
         print(json.dumps(raw, indent=2)[:2000])
         found = _pick(raw, query)
         print("\npicked:", found)
