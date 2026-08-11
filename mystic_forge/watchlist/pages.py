@@ -507,6 +507,66 @@ async function claimFlow(){
     `<a href="${d.page}">your page</a> or tell it to Claude in chat. `+
     `Your copy starts with everything on this board and is yours alone.</p>`;
 }
+/* MTGStocks refuses this server's hosting provider outright, so the badge
+   cannot be rendered server-side. Your browser can reach them, and it is
+   already looking at the card, so it resolves the print id once, shows the
+   link, remembers it locally, and reports it back for everyone else. */
+const SAPI='https://api.mtgstocks.com', SKEY='mfStocks:';
+function stocksUrl(id,slug){
+  const head=id+'-';
+  const tail=slug?('-'+(slug.indexOf(head)===0?slug.slice(head.length):slug)):'';
+  return 'https://www.mtgstocks.com/prints/'+id+tail;
+}
+async function stocksLookup(name,set){
+  const front=name.split(' // ')[0].trim();
+  try{
+    const r=await fetch(SAPI+'/search/autocomplete/'+encodeURIComponent(front));
+    if(!r.ok)return null;
+    const list=await r.json();
+    const want=[name.toLowerCase(),front.toLowerCase()];
+    const hit=(Array.isArray(list)?list:[]).find(
+      x=>x&&typeof x.id==='number'&&want.indexOf((x.name||'').toLowerCase())>=0);
+    if(!hit)return null;
+    let best={id:hit.id,slug:hit.slug||''};
+    if(set){                       /* pinned printing: siblings carry the set code */
+      const p=await fetch(SAPI+'/prints/'+hit.id);
+      if(p.ok){
+        const sets=(await p.json()).sets;
+        const m=(Array.isArray(sets)?sets:[])
+          .filter(s=>s&&(s.abbreviation||'').toUpperCase()===set)
+          .sort((a,b)=>(a.foil?1:0)-(b.foil?1:0))[0];   /* a set, not a finish */
+        if(m&&typeof m.id==='number')best={id:m.id,slug:m.slug||''};
+      }
+    }
+    return {id:best.id,slug:best.slug,url:stocksUrl(best.id,best.slug)};
+  }catch(e){return null;}          /* blocked or offline: no badge, no noise */
+}
+async function maybeStocks(card){
+  const host=document.getElementById('siteHost');
+  if(!host||(card.dataset.sites||'').indexOf('mtgstocks.com')>=0)return;
+  const name=card.dataset.name,set=(card.dataset.set||'').toUpperCase();
+  const ck=SKEY+name.toLowerCase()+'|'+set;
+  let url=null;
+  try{url=localStorage.getItem(ck);}catch(e){}
+  if(!url){
+    const hit=await stocksLookup(name,set);
+    if(!hit)return;
+    url=hit.url;
+    try{localStorage.setItem(ck,url);}catch(e){}
+    fetch(U('/api/mtgstocks'),{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:KEY,card_name:name,set_code:set,
+                           print_id:hit.id,slug:hit.slug})}).catch(()=>{});
+  }
+  /* The dialog is shared, so a slow lookup must not land on another card. */
+  if(document.getElementById('cardTitle').textContent!==name)return;
+  const box=host.querySelector('.sites');
+  if(!box||box.querySelector('a[href*="mtgstocks.com"]'))return;
+  const a=document.createElement('a');
+  a.href=url;a.target='_blank';a.rel='noopener';a.textContent='MTGStocks';
+  box.insertBefore(a,box.lastElementChild);
+  card.dataset.sites=host.innerHTML;
+}
 function wireCard(card){
   keyable(card);
   card.onclick=()=>{
@@ -532,6 +592,7 @@ function wireCard(card){
     const pts=card.dataset.pts?JSON.parse(card.dataset.pts):[];
     if(pts.length)armCrosshair(pts);
     cardDlg.showModal();
+    maybeStocks(card);
   };
 }
 function wireRev(r){
@@ -785,6 +846,7 @@ def _card_html(db, entry, s, hit, idx, shop, cur, filling=False):
     tgt_attr = (f'{entry["target_price"]:.2f}'
                 if entry.get("target_price") is not None else "")
     data = (f' data-name="{name}" data-sub="{esc(sub)}"'
+            f' data-set="{esc((entry.get("set_code") or "").upper())}"'
             f' data-entry="{entry["entry_id"]}"'
             f' data-target="{tgt_attr}"'
             f' data-note="{esc(entry["note"] or "")}"'

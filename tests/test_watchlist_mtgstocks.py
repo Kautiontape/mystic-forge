@@ -317,6 +317,26 @@ def test_refresh_falls_back_to_a_set_name_when_no_code_is_given(db, enabled,
     assert "200001" in mtgstocks.cached_url(db, "Black Market Connections", "CMM")
 
 
+def test_a_refused_run_says_so_in_the_log(db, enabled, monkeypatch, caplog):
+    """A blocked host resolved nothing and logged nothing for two releases,
+    which reads exactly like a run with nothing to do."""
+    list_id, _, _ = watchlist_db.create_list(db)
+    for n in ("Sol Ring", "Cultivate", "Counterspell", "Brainstorm"):
+        watchlist_db.add_card(db, list_id, n)
+    monkeypatch.setattr(mtgstocks, "httpx",
+                        _fake_httpx({"/search/autocomplete": RuntimeError("403")}))
+    with caplog.at_level("WARNING"):
+        assert mtgstocks.refresh(db) == 0
+    assert "mtgstocks" in caplog.text.lower()
+    assert "403" in caplog.text
+
+
+def test_a_run_with_nothing_pending_stays_quiet(db, enabled, monkeypatch, caplog):
+    with caplog.at_level("WARNING"):
+        assert mtgstocks.refresh(db) == 0
+    assert caplog.text == ""
+
+
 def test_refresh_is_disabled_by_env(db, monkeypatch):
     monkeypatch.setenv("MYSTIC_FORGE_NO_MTGSTOCKS", "1")
     list_id, _, _ = watchlist_db.create_list(db)
@@ -348,6 +368,84 @@ def test_badge_deep_links_once_the_id_is_known(db):
     html = watchlist_pages._site_links(entry, db)
     assert "/prints/141924-black-market-connections" in html
     assert "search?query" not in html          # the 404 shape is gone for good
+
+
+# ── votes ───────────────────────────────────────────────────────────────────
+# MTGStocks blocks the production host's whole ASN, so viewers' browsers do
+# the resolving and report back. Nothing about a submitter is trustworthy, so
+# the answer is validated instead: the slug MTGStocks returns leads with the
+# id and continues with the card's own name, which caps a bad submission at
+# "a different printing of the right card" without authenticating anyone.
+
+def test_a_slug_naming_another_card_is_rejected():
+    assert mtgstocks.looks_like("Bitterblossom", "97426-bitterblossom")
+    assert not mtgstocks.looks_like("Bitterblossom", "3-black-lotus")
+
+
+def test_a_slug_may_name_the_full_double_faced_card():
+    assert mtgstocks.looks_like("Delver of Secrets // Insectile Aberration",
+                                "122611-delver-of-secrets-insectile-aberration")
+
+
+def test_one_vote_beats_no_votes(db):
+    """No quorum: an uncontested answer is the answer."""
+    assert mtgstocks.record_vote(db, "Bitterblossom", "", 97426,
+                                 "97426-bitterblossom", voter="a")
+    assert (mtgstocks.cached_url(db, "Bitterblossom")
+            == "https://www.mtgstocks.com/prints/97426-bitterblossom")
+
+
+def test_a_rejected_submission_is_not_recorded_at_all(db):
+    assert not mtgstocks.record_vote(db, "Bitterblossom", "", 3,
+                                     "3-black-lotus", voter="a")
+    assert mtgstocks.cached_url(db, "Bitterblossom") is None
+    assert db.execute("SELECT COUNT(*) FROM mtgstocks_votes").fetchone()[0] == 0
+
+
+def test_a_lone_dissenter_does_not_flip_the_answer(db):
+    mtgstocks.record_vote(db, "Bitterblossom", "", 97426,
+                          "97426-bitterblossom", voter="a")
+    mtgstocks.record_vote(db, "Bitterblossom", "", 2901,
+                          "2901-bitterblossom", voter="b")
+    assert "97426" in mtgstocks.cached_url(db, "Bitterblossom")   # tie: incumbent
+
+
+def test_the_answer_switches_once_more_voters_agree_on_another(db):
+    mtgstocks.record_vote(db, "Bitterblossom", "", 97426,
+                          "97426-bitterblossom", voter="a")
+    for voter in ("b", "c"):
+        mtgstocks.record_vote(db, "Bitterblossom", "", 2901,
+                              "2901-bitterblossom", voter=voter)
+    assert "2901" in mtgstocks.cached_url(db, "Bitterblossom")
+
+
+def test_a_voter_changing_their_mind_is_not_ballot_stuffing(db):
+    mtgstocks.record_vote(db, "Bitterblossom", "", 97426,
+                          "97426-bitterblossom", voter="a")
+    for _ in range(5):
+        mtgstocks.record_vote(db, "Bitterblossom", "", 2901,
+                              "2901-bitterblossom", voter="a")
+    assert db.execute("SELECT COUNT(*) FROM mtgstocks_votes").fetchone()[0] == 1
+    assert "2901" in mtgstocks.cached_url(db, "Bitterblossom")
+
+
+def test_a_trusted_answer_outranks_any_number_of_votes(db):
+    mtgstocks.remember(db, "Bitterblossom", "", 2901, "2901-bitterblossom",
+                       source="trusted")
+    for voter in ("a", "b", "c", "d"):
+        mtgstocks.record_vote(db, "Bitterblossom", "", 97426,
+                              "97426-bitterblossom", voter=voter)
+    assert "2901" in mtgstocks.cached_url(db, "Bitterblossom")
+
+
+def test_votes_are_counted_per_printing_not_per_card(db):
+    """A vote for the MOR printing must not decide the unpinned badge."""
+    mtgstocks.record_vote(db, "Bitterblossom", "", 97426,
+                          "97426-bitterblossom", voter="a")
+    mtgstocks.record_vote(db, "Bitterblossom", "MOR", 2901,
+                          "2901-bitterblossom", voter="a")
+    assert "97426" in mtgstocks.cached_url(db, "Bitterblossom")
+    assert "2901" in mtgstocks.cached_url(db, "Bitterblossom", "MOR")
 
 
 # ── live contract ───────────────────────────────────────────────────────────

@@ -71,7 +71,20 @@ CREATE TABLE IF NOT EXISTS mtgstocks_prints (
   print_id INTEGER,
   slug TEXT,
   checked_at TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'ingest',
   PRIMARY KEY (card_name, set_code)
+);
+-- Viewers' browsers resolve print ids the server cannot reach and report
+-- them back. One vote per voter per printing: a voter changing their mind
+-- replaces their own row rather than stacking another.
+CREATE TABLE IF NOT EXISTS mtgstocks_votes (
+  card_name TEXT NOT NULL,
+  set_code TEXT NOT NULL,
+  voter TEXT NOT NULL,
+  print_id INTEGER NOT NULL,
+  slug TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (card_name, set_code, voter)
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS idx_prices_pfud
@@ -91,6 +104,10 @@ def init_db(db: sqlite3.Connection) -> None:
     cols = [r[1] for r in db.execute("PRAGMA table_info(watchlist_current)")]
     if "bought_at" not in cols:  # migration for pre-"bought" databases
         db.execute("ALTER TABLE watchlist_current ADD COLUMN bought_at TEXT")
+    cols = [r[1] for r in db.execute("PRAGMA table_info(mtgstocks_prints)")]
+    if "source" not in cols:     # migration for pre-vote databases
+        db.execute("ALTER TABLE mtgstocks_prints ADD COLUMN source TEXT"
+                   " NOT NULL DEFAULT 'ingest'")
     db.commit()
 
 

@@ -39,9 +39,11 @@ The `slow`-marked tests in tests/test_watchlist_mtgstocks.py check both of
 the above against the live API; everything else there runs on fixtures.
 """
 
+import hashlib
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import time
 import urllib.parse
@@ -234,15 +236,34 @@ def _now() -> str:
 
 
 def remember(db, card_name: str, set_code: str | None, print_id, slug,
-             commit: bool = True) -> None:
-    """Store a resolution. `print_id=None` is a cached miss, not an error."""
+             commit: bool = True, source: str = "ingest") -> None:
+    """Store a resolution. `print_id=None` is a cached miss, not an error.
+
+    `source='trusted'` marks an answer votes may never overwrite."""
     db.execute(
         "INSERT OR REPLACE INTO mtgstocks_prints"
-        " (card_name, set_code, print_id, slug, checked_at) VALUES (?,?,?,?,?)",
+        " (card_name, set_code, print_id, slug, checked_at, source)"
+        " VALUES (?,?,?,?,?,?)",
         (card_name.strip().lower(), (set_code or "").strip().upper(),
-         print_id, slug, _now()))
+         print_id, slug, _now(), source))
     if commit:
         db.commit()
+
+
+def looks_like(card_name: str, slug: str | None) -> bool:
+    """Does this slug plausibly belong to this card?
+
+    MTGStocks slugs are `<id>-<slugified name>`, so a submission can be
+    checked against the card it claims to be without trusting whoever sent
+    it. This is what makes an open vote endpoint safe: the worst a bad
+    submission achieves is a different printing of the *right* card, because
+    anything naming another card fails here. Double-faced cards are indexed
+    under the front face, sometimes with the back appended, so both pass."""
+    if not slug:
+        return False
+    tail = slug.split("-", 1)[1] if slug.split("-", 1)[0].isdigit() else slug
+    full, front = slugify(card_name), slugify(front_face(card_name))
+    return tail in (full, front) or tail.startswith(f"{front}-")
 
 
 def cached_url(db, card_name: str, set_code: str | None = None) -> str | None:
@@ -267,6 +288,65 @@ def cached_url(db, card_name: str, set_code: str | None = None) -> str | None:
     except sqlite3.Error:        # pre-migration database — badge, not a 500
         return None
     return None
+
+
+def voter_id(db, address: str) -> str:
+    """A stable, opaque id for one voter.
+
+    The address never lands in the database: it is hashed with a per-install
+    salt, so the votes table cannot be read back as a record of who looked at
+    which card. Losing the salt only costs the current tallies."""
+    row = db.execute("SELECT value FROM meta WHERE key='vote_salt'").fetchone()
+    salt = row["value"] if row else None
+    if not salt:
+        salt = secrets.token_hex(16)
+        db.execute("INSERT OR REPLACE INTO meta (key, value)"
+                   " VALUES ('vote_salt', ?)", (salt,))
+        db.commit()
+    return hashlib.sha256(f"{salt}:{address}".encode()).hexdigest()[:32]
+
+
+def record_vote(db, card_name: str, set_code: str | None, print_id, slug,
+                voter: str) -> bool:
+    """Record one viewer's answer and re-decide the badge. False if refused.
+
+    One vote per voter per printing, so a voter who changes their mind
+    replaces their own ballot instead of stacking another. The winner is
+    simply the print id with the most votes; a tie leaves the standing answer
+    alone, so one dissenter never flips a settled card and an uncontested
+    first vote settles it immediately. There is no quorum: one beats none."""
+    try:
+        print_id = int(print_id)
+    except (TypeError, ValueError):
+        return False
+    if print_id <= 0 or not looks_like(card_name, slug):
+        return False
+    name, code = card_name.strip().lower(), (set_code or "").strip().upper()
+    db.execute(
+        "INSERT OR REPLACE INTO mtgstocks_votes"
+        " (card_name, set_code, voter, print_id, slug, created_at)"
+        " VALUES (?,?,?,?,?,?)", (name, code, voter, print_id, slug, _now()))
+    row = db.execute(
+        "SELECT print_id, source FROM mtgstocks_prints"
+        " WHERE card_name=? AND set_code=?", (name, code)).fetchone()
+    if row and row["source"] == "trusted":
+        db.commit()                       # the vote is kept, the badge is not
+        return True
+    standing = row["print_id"] if row else None
+    winner = db.execute(
+        """SELECT print_id, slug, COUNT(*) AS votes FROM mtgstocks_votes
+           WHERE card_name=? AND set_code=?
+           GROUP BY print_id ORDER BY votes DESC, MIN(created_at) LIMIT 1""",
+        (name, code)).fetchone()
+    if winner and winner["print_id"] != standing:
+        beaten = db.execute(
+            "SELECT COUNT(*) FROM mtgstocks_votes WHERE card_name=?"
+            " AND set_code=? AND print_id=?", (name, code, standing)).fetchone()[0]
+        if winner["votes"] > beaten:
+            remember(db, name, code, winner["print_id"], winner["slug"],
+                     commit=False, source="vote")
+    db.commit()
+    return True
 
 
 def _stale_before() -> str:
@@ -329,7 +409,7 @@ def refresh(db, allprintings_path: str | None = None,
     if not names and not pinned:
         return 0
     set_names = _set_names(allprintings_path)
-    resolved, failures = 0, 0
+    resolved, failures, refused = 0, 0, None
     with httpx.Client() as client:
         for name in names:
             if failures >= GIVE_UP_AFTER:
@@ -338,6 +418,7 @@ def refresh(db, allprintings_path: str | None = None,
                 hit = resolve_name(client, name)
             except Exception as e:
                 failures += 1
+                refused = refused or e
                 log.debug("mtgstocks lookup failed for %s: %s", name, e)
                 continue
             failures = 0
@@ -358,6 +439,7 @@ def refresh(db, allprintings_path: str | None = None,
                 others = printings(client, base_id)
             except Exception as e:
                 failures += 1
+                refused = refused or e
                 log.debug("mtgstocks printings failed for %s: %s", name, e)
                 continue
             failures = 0
@@ -372,6 +454,13 @@ def refresh(db, allprintings_path: str | None = None,
             time.sleep(PAUSE)
     if resolved:
         log.info("mtgstocks: resolved %d print id(s)", resolved)
+    elif refused is not None:
+        # Silence here is how a host whose whole ASN is blocked looked
+        # identical to a cycle with nothing pending, across two releases.
+        log.warning("mtgstocks: resolved nothing for %d pending name(s); "
+                    "first refusal was %s. Viewers' browsers still vote, so "
+                    "badges can fill in without this.",
+                    len(names) + len(pinned), refused)
     return resolved
 
 

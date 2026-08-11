@@ -32,6 +32,7 @@ from mcp.server.fastmcp import FastMCP
 
 from mystic_forge.watchlist import db as watchlist_db
 from mystic_forge.watchlist import ingest as watchlist_ingest
+from mystic_forge.watchlist import mtgstocks as watchlist_mtgstocks
 from mystic_forge.watchlist import pages as watchlist_pages
 from mystic_forge.watchlist import sidecar as price_sidecar
 from mystic_forge import rulebook
@@ -5967,6 +5968,66 @@ async def api_target(request: Request):
             return JSONResponse({"error": str(e)}, status_code=404)
         return JSONResponse({"entry_id": entry["entry_id"],
                              "target_price": entry["target_price"]})
+    finally:
+        db.close()
+
+
+def _client_ip(request: Request) -> str:
+    """The requester's address, as well as it can be known behind the proxy.
+
+    Cloudflare sets CF-Connecting-IP to the peer it actually accepted and
+    overwrites any copy the client sent, so it is the one header here worth
+    trusting; Caddy then appends itself to X-Forwarded-For, whose leading
+    entries a client can write freely. Falls back to the last XFF hop and
+    then the socket, both of which only degrade vote dedup, never safety."""
+    cf = request.headers.get("cf-connecting-ip")
+    if cf:
+        return cf.strip()
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[-1].strip()
+    return getattr(request.client, "host", "") or "unknown"
+
+
+@mcp.custom_route("/api/mtgstocks", methods=["POST"])
+async def api_mtgstocks(request: Request):
+    """A viewer's browser reports the MTGStocks print id for a watched card.
+
+    MTGStocks blocks this host's entire hosting provider, so the server cannot
+    resolve these itself — but the browsers reading the page can, and they are
+    already looking at the card. Share pages may post here, the one exception
+    to "share codes are read-only", because what is being reported is a fact
+    about a card rather than anything belonging to the list.
+
+    Nothing about the submitter is trusted. The slug must name the card it
+    claims to be (`mtgstocks.looks_like`), which caps a hostile submission at
+    pointing to a different printing of the right card, and that residue is
+    what the vote settles: most votes wins, a tie leaves the standing answer,
+    and one uncontested vote is enough to fill an empty badge."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, _ = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        card = str(body.get("card_name", "")).strip()
+        set_code = str(body.get("set_code") or "").strip()
+        if not db.execute("SELECT 1 FROM watchlist_current WHERE list_id=?"
+                          " AND LOWER(card_name)=LOWER(?) LIMIT 1",
+                          (row["id"], card)).fetchone():
+            return JSONResponse({"error": "card is not on this list"},
+                                status_code=404)
+        voter = watchlist_mtgstocks.voter_id(db, _client_ip(request))
+        if not watchlist_mtgstocks.record_vote(db, card, set_code,
+                                               body.get("print_id"),
+                                               body.get("slug"), voter):
+            return JSONResponse({"error": "that slug does not name this card"},
+                                status_code=400)
+        return JSONResponse(
+            {"url": watchlist_mtgstocks.cached_url(db, card, set_code)})
     finally:
         db.close()
 

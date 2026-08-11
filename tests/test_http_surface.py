@@ -183,6 +183,110 @@ def test_api_target_set_clear_and_share_forbidden(db_path):
     assert actions == ["create", "add", "set_target", "set_target"]
 
 
+def _voting_fixture(db_path, card="Bitterblossom"):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, sc = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, card)
+    db.close()
+    return pp, sc
+
+
+def test_the_page_ships_the_browser_side_resolver(db_path):
+    """The server cannot reach MTGStocks from this host, so the page carries
+    the lookup and posts the answer back."""
+    pp, _ = _voting_fixture(db_path)
+    page = client().get(f"/w/{pp}").text
+    assert "https://api.mtgstocks.com" in page
+    assert "/search/autocomplete/" in page
+    assert "/api/mtgstocks" in page
+
+
+def test_a_card_carries_its_set_for_the_browser_to_pin(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Bitterblossom", set_code="MOR",
+                          collector_number="62")
+    db.close()
+    assert 'data-set="MOR"' in client().get(f"/w/{pp}").text
+
+
+def test_api_mtgstocks_accepts_a_vote_and_the_badge_appears(db_path):
+    pp, _ = _voting_fixture(db_path)
+    with client() as c:
+        r = c.post("/api/mtgstocks",
+                   json={"key": pp, "card_name": "Bitterblossom",
+                         "print_id": 97426, "slug": "97426-bitterblossom"},
+                   headers={"CF-Connecting-IP": "203.0.113.7"})
+        assert r.status_code == 200
+        assert r.json()["url"] == \
+            "https://www.mtgstocks.com/prints/97426-bitterblossom"
+        assert "/prints/97426-bitterblossom" in c.get(f"/w/{pp}").text
+
+
+def test_api_mtgstocks_accepts_votes_from_share_pages_too(db_path):
+    """The one write a read-only page may make: it names a global fact about
+    a card, not anything about the list, and it is validated on arrival."""
+    pp, sc = _voting_fixture(db_path)
+    with client() as c:
+        r = c.post("/api/mtgstocks",
+                   json={"key": sc, "card_name": "Bitterblossom",
+                         "print_id": 97426, "slug": "97426-bitterblossom"},
+                   headers={"CF-Connecting-IP": "203.0.113.8"})
+        assert r.status_code == 200
+        assert "/prints/97426-bitterblossom" in c.get(f"/s/{sc}").text
+
+
+def test_api_mtgstocks_rejects_a_slug_naming_another_card(db_path):
+    pp, _ = _voting_fixture(db_path)
+    with client() as c:
+        r = c.post("/api/mtgstocks",
+                   json={"key": pp, "card_name": "Bitterblossom",
+                         "print_id": 3, "slug": "3-black-lotus"},
+                   headers={"CF-Connecting-IP": "203.0.113.9"})
+        assert r.status_code == 400
+        assert "/prints/3-" not in c.get(f"/w/{pp}").text
+
+
+def test_api_mtgstocks_rejects_a_card_that_is_not_on_the_list(db_path):
+    pp, _ = _voting_fixture(db_path)
+    with client() as c:
+        r = c.post("/api/mtgstocks",
+                   json={"key": pp, "card_name": "Black Lotus",
+                         "print_id": 3, "slug": "3-black-lotus"},
+                   headers={"CF-Connecting-IP": "203.0.113.10"})
+        assert r.status_code == 404
+
+
+def test_api_mtgstocks_rejects_an_unknown_key(db_path):
+    _voting_fixture(db_path)
+    with client() as c:
+        r = c.post("/api/mtgstocks",
+                   json={"key": "not-a-list", "card_name": "Bitterblossom",
+                         "print_id": 97426, "slug": "97426-bitterblossom"})
+        assert r.status_code == 404
+
+
+def test_api_mtgstocks_counts_one_address_as_one_voter(db_path):
+    """Ten posts from one address must not outvote one from another."""
+    pp, _ = _voting_fixture(db_path)
+    with client() as c:
+        c.post("/api/mtgstocks",
+               json={"key": pp, "card_name": "Bitterblossom",
+                     "print_id": 97426, "slug": "97426-bitterblossom"},
+               headers={"CF-Connecting-IP": "203.0.113.1"})
+        for _ in range(10):
+            c.post("/api/mtgstocks",
+                   json={"key": pp, "card_name": "Bitterblossom",
+                         "print_id": 2901, "slug": "2901-bitterblossom"},
+                   headers={"CF-Connecting-IP": "203.0.113.2"})
+        assert "/prints/97426-bitterblossom" in c.get(f"/w/{pp}").text
+    db = watchlist_db.connect(db_path)
+    votes = db.execute("SELECT voter FROM mtgstocks_votes").fetchall()
+    db.close()
+    assert len(votes) == 2
+    assert not any("203.0.113" in v["voter"] for v in votes)   # hashed, not kept
+
+
 def test_api_rename_and_share_forbidden(db_path):
     db = watchlist_db.connect(db_path)
     list_id, pp, sc = watchlist_db.create_list(db, label="Old Name")
