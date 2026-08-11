@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import logging
 import os
 import time
@@ -6,6 +7,7 @@ import time
 import pytest
 from starlette.testclient import TestClient
 
+import mystic_forge
 import server
 from mystic_forge.watchlist import db as watchlist_db
 from mystic_forge.watchlist import ingest as watchlist_ingest
@@ -1046,3 +1048,158 @@ async def test_sidecar_build_warns_before_replacing_an_unusable_sidecar(
     with caplog.at_level(logging.WARNING):
         await server.sidecar_build_once()
     assert "corrupt" in caplog.text and "superseded" in caplog.text
+
+
+# ── The reprojection startup pass ───────────────────────────────────────────
+
+
+def _record_reprojection(monkeypatch, calls, body=None):
+    def reproject(db_path, data_dir=None):
+        calls.append((db_path, data_dir))
+        return body() if body is not None else 0
+    monkeypatch.setattr(watchlist_ingest, "reproject_if_stale", reproject)
+    return calls
+
+
+async def test_startup_reprojects_a_sidecar_that_was_already_ready(db_path,
+                                                                   monkeypatch):
+    """The 1.2.0 field failure. The sidecar was built days earlier, so the
+    build returned early — and everything that only happens after a build,
+    the projection of a newly tracked provider included, never happened."""
+    _sidecar_env(db_path, monkeypatch)
+    calls = _record_reprojection(monkeypatch, [])
+    monkeypatch.setattr(server.price_sidecar, "is_ready", lambda _p: True)
+    monkeypatch.setattr(server.price_sidecar, "build_from_allprices",
+                        _stub_build([]))
+    await server.sidecar_build_once()
+    assert [c[0] for c in calls] == [db_path]
+
+
+async def test_startup_reprojects_after_a_build_it_just_finished(db_path,
+                                                                 monkeypatch):
+    """The other half: a first build has to be delivered too."""
+    side = _sidecar_env(db_path, monkeypatch)
+    open(os.path.join(os.path.dirname(db_path), "AllPrices.json.gz"), "wb").close()
+    built, calls = [], _record_reprojection(monkeypatch, [])
+    monkeypatch.setattr(server.price_sidecar, "is_ready", lambda _p: False)
+    monkeypatch.setattr(server.price_sidecar, "build_from_allprices",
+                        _stub_build(built))
+    await server.sidecar_build_once()
+    assert [c[0] for c in built] == [side]
+    assert [c[0] for c in calls] == [db_path]
+
+
+async def test_startup_does_not_reproject_when_the_sidecar_is_disabled(
+        db_path, monkeypatch):
+    """MYSTIC_FORGE_NO_SIDECAR means "do not use it"; reading it to project
+    from is using it."""
+    _sidecar_env(db_path, monkeypatch)
+    monkeypatch.setenv("MYSTIC_FORGE_NO_SIDECAR", "1")
+    calls = _record_reprojection(monkeypatch, [])
+    await server.sidecar_build_once()
+    assert calls == []
+
+
+async def test_startup_does_not_reproject_when_the_build_failed(db_path,
+                                                                monkeypatch,
+                                                                caplog):
+    """Nothing landed, so there is nothing new to deliver — and the failure
+    must still be logged and swallowed rather than reaching startup."""
+    _sidecar_env(db_path, monkeypatch)
+    open(os.path.join(os.path.dirname(db_path), "AllPrices.json.gz"), "wb").close()
+    calls = _record_reprojection(monkeypatch, [])
+
+    def no_room(_path, _gz):
+        raise OSError("not enough free space")
+    monkeypatch.setattr(server.price_sidecar, "is_ready", lambda _p: False)
+    monkeypatch.setattr(server.price_sidecar, "build_from_allprices", no_room)
+    with caplog.at_level(logging.ERROR):
+        await server.sidecar_build_once()
+    assert calls == []
+    assert "sidecar build failed" in caplog.text
+
+
+async def test_reprojection_runs_off_the_event_loop(db_path, monkeypatch):
+    """~1.2s of SQLite writes for 1,000 watched cards. Inline it stalls every
+    in-flight request on a server that is still starting up."""
+    where = {}
+
+    def probe(_db_path, data_dir=None):
+        try:
+            asyncio.get_running_loop()
+            where["on_loop"] = True
+        except RuntimeError:
+            where["on_loop"] = False
+        return 0
+
+    _sidecar_env(db_path, monkeypatch)
+    monkeypatch.setattr(server.price_sidecar, "is_ready", lambda _p: True)
+    monkeypatch.setattr(watchlist_ingest, "reproject_if_stale", probe)
+    await server.sidecar_build_once()
+    assert where == {"on_loop": False}
+
+
+# ── The nightly loop's guard ────────────────────────────────────────────────
+
+
+async def _one_ingest_tick(monkeypatch):
+    """Run exactly one iteration of the ingest loop and report what it ran.
+
+    to_thread is stubbed rather than the ingest itself, so the whole tick is
+    synchronous up to the hour-long sleep the loop then parks on."""
+    ran = []
+
+    async def fake_to_thread(fn, *a, **kw):
+        ran.append(fn)
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    task = asyncio.create_task(server.watchlist_ingest_loop())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    return ran
+
+
+def _stamp(db_path, **meta):
+    db = watchlist_db.connect(db_path)
+    for key, value in meta.items():
+        db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
+    db.commit()
+    db.close()
+
+
+async def test_ingest_loop_fires_when_the_running_version_changed(db_path,
+                                                                  monkeypatch):
+    """The 1.2.0 shared cause: last_ingest was stamped today by the *old*
+    build, so the date guard alone kept the new one from ever running an
+    ingest — and the MTGStocks resolve and the projection live only there."""
+    _stamp(db_path, last_ingest=datetime.date.today().isoformat(),
+           last_ingest_version="1.1.0")
+    assert await _one_ingest_tick(monkeypatch) == [watchlist_ingest.run_ingest]
+
+
+async def test_ingest_loop_stays_quiet_when_the_date_and_version_both_match(
+        db_path, monkeypatch):
+    """And it must settle: one forced run, not one every hour forever."""
+    _stamp(db_path, last_ingest=datetime.date.today().isoformat(),
+           last_ingest_version=server.VERSION)
+    assert await _one_ingest_tick(monkeypatch) == []
+
+
+async def test_ingest_loop_still_fires_on_a_new_day(db_path, monkeypatch):
+    _stamp(db_path, last_ingest="2020-01-01", last_ingest_version=server.VERSION)
+    assert await _one_ingest_tick(monkeypatch) == [watchlist_ingest.run_ingest]
+
+
+async def test_ingest_loop_fires_when_nothing_was_ever_stamped(db_path,
+                                                               monkeypatch):
+    assert await _one_ingest_tick(monkeypatch) == [watchlist_ingest.run_ingest]
+
+
+def test_the_version_helper_agrees_with_the_server_constant():
+    """Two readers of one file. If they ever disagree the loop would force an
+    ingest every hour, on every deploy, forever."""
+    assert mystic_forge.version() == server.VERSION

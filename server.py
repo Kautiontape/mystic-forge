@@ -237,16 +237,26 @@ class PassphraseMiddleware:
 
 
 async def watchlist_ingest_loop():
-    """Hourly check; actual ingest runs once per day (last_ingest guard)."""
+    """Hourly check; the ingest itself runs once a day, plus once per deploy.
+
+    The date guard alone cannot express "this build has never run an ingest".
+    A deploy may add a provider, a cache or a resolution step whose data
+    appears only when run_ingest runs, and a same-day deploy inherits a
+    last_ingest its predecessor already stamped — so it would sit inert until
+    tomorrow. That is exactly how 1.2.0 shipped with Mana Pool empty and the
+    MTGStocks badge missing. run_ingest stamps both keys together, so the
+    forced run settles on the next tick rather than repeating hourly."""
     while True:
         try:
             db = watchlist_db.connect()
             watchlist_db.init_db(db)
-            row = db.execute("SELECT value FROM meta WHERE key='last_ingest'"
-                             ).fetchone()
+            stamped = {r["key"]: r["value"] for r in db.execute(
+                "SELECT key, value FROM meta WHERE key IN ('last_ingest',"
+                " 'last_ingest_version')")}
             db.close()
             import datetime as _dt
-            if row is None or row["value"] != _dt.date.today().isoformat():
+            if (stamped.get("last_ingest") != _dt.date.today().isoformat()
+                    or stamped.get("last_ingest_version") != VERSION):
                 await asyncio.to_thread(watchlist_ingest.run_ingest,
                                         watchlist_db.DB_PATH)
         except Exception:
@@ -264,7 +274,7 @@ _sidecar_build_lock = threading.Lock()
 
 
 async def sidecar_build_once():
-    """Build the price sidecar if it does not exist yet.
+    """Build the price sidecar if it does not exist yet, then deliver it.
 
     Eager rather than lazy on purpose: the weekly tier can only start from the
     90 days AllPrices carries on build day, so delay is history that can never
@@ -274,7 +284,13 @@ async def sidecar_build_once():
     requests. Everything degrades to the pre-sidecar behaviour for that
     window -- is_ready() stays false, so page loads take the legacy scan --
     and any failure is logged and swallowed, because a server that will not
-    start is worse than one without a sidecar."""
+    start is worse than one without a sidecar.
+
+    The reprojection runs in both cases -- after a build this call finished,
+    and when the sidecar was already ready and no build was needed. The second
+    is the one that matters in practice: production almost always starts with
+    a sidecar already built, and a return-early there is what left 1.2.0's
+    newly tracked provider sitting in the sidecar, unprojected."""
     log = logging.getLogger("mystic_forge")
     if not _sidecar_build_lock.acquire(blocking=False):
         log.info("sidecar build already running; not starting another")
@@ -282,34 +298,41 @@ async def sidecar_build_once():
     try:
         data_dir = watchlist_ingest._data_dir()
         side = watchlist_ingest._sidecar_path(data_dir)
-        if price_sidecar.is_ready(side):
-            return
-        # Cheap: stats() short-circuits on a not-ready path without scanning.
-        reason = price_sidecar.stats(side).get("reason")
-        if reason == "disabled":
-            # The escape hatch means "do not use the sidecar", which is not
-            # the same as "rebuild it" -- and a rebuild moves aside whatever
-            # the operator was preserving when they set it.
-            log.info("MYSTIC_FORGE_NO_SIDECAR is set; skipping the build")
-            return
-        if os.path.exists(side):
-            log.warning(
-                "sidecar at %s exists but is unusable (%s); rebuilding from "
-                "AllPrices. The old file is kept as %s%s -- past MTGJSON's "
-                "~90-day window it is the only copy of its history, so check "
-                "it before deleting it.",
-                side, reason, side, price_sidecar.SUPERSEDED_SUFFIX)
-        gz = os.path.join(data_dir, "AllPrices.json.gz")
-        if not os.path.exists(gz):
-            db = watchlist_db.connect()
-            try:
-                watchlist_db.init_db(db)
-                await asyncio.to_thread(
-                    watchlist_ingest._download,
-                    f"{watchlist_ingest.MTGJSON}/AllPrices.json.gz", gz, db)
-            finally:
-                db.close()
-        await asyncio.to_thread(price_sidecar.build_from_allprices, side, gz)
+        if not price_sidecar.is_ready(side):
+            # Cheap: stats() short-circuits on a not-ready path without
+            # scanning.
+            reason = price_sidecar.stats(side).get("reason")
+            if reason == "disabled":
+                # The escape hatch means "do not use the sidecar", which is
+                # not the same as "rebuild it" -- and a rebuild moves aside
+                # whatever the operator was preserving when they set it.
+                # Reading it to project from is using it, so that returns too.
+                log.info("MYSTIC_FORGE_NO_SIDECAR is set; skipping the build")
+                return
+            if os.path.exists(side):
+                log.warning(
+                    "sidecar at %s exists but is unusable (%s); rebuilding "
+                    "from AllPrices. The old file is kept as %s%s -- past "
+                    "MTGJSON's ~90-day window it is the only copy of its "
+                    "history, so check it before deleting it.",
+                    side, reason, side, price_sidecar.SUPERSEDED_SUFFIX)
+            gz = os.path.join(data_dir, "AllPrices.json.gz")
+            if not os.path.exists(gz):
+                db = watchlist_db.connect()
+                try:
+                    watchlist_db.init_db(db)
+                    await asyncio.to_thread(
+                        watchlist_ingest._download,
+                        f"{watchlist_ingest.MTGJSON}/AllPrices.json.gz", gz, db)
+                finally:
+                    db.close()
+            await asyncio.to_thread(price_sidecar.build_from_allprices,
+                                    side, gz)
+        # ~1.2s of SQLite writes for 1,000 watched cards, on a WAL database
+        # where readers are not blocked -- but off the loop all the same, and
+        # a no-op on every start after the one that follows a build.
+        await asyncio.to_thread(watchlist_ingest.reproject_if_stale,
+                                watchlist_db.DB_PATH, data_dir)
     except Exception:
         log.exception("sidecar build failed")
     finally:

@@ -16,6 +16,8 @@ from datetime import date
 import httpx
 import ijson
 
+import mystic_forge
+
 from . import db as watchlist_db
 from . import mtgstocks
 from . import sidecar as price_sidecar
@@ -83,10 +85,11 @@ def _get_meta(db, key):
     return row["value"] if row else None
 
 
-def _set_meta(db, key, value):
+def _set_meta(db, key, value, commit: bool = True):
     db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)",
                (key, value))
-    db.commit()
+    if commit:
+        db.commit()
 
 
 def _download(url: str, dest: str, db) -> str:
@@ -232,6 +235,59 @@ def _project(db, sidecar_path: str, uuids, since: str | None = None) -> int:
         n += 1
     db.commit()
     return n
+
+
+def reproject_if_stale(db_path: str, data_dir: str | None = None) -> int:
+    """Project the sidecar's whole history once per sidecar build.
+
+    ensure_history covers "this card has no prices"; nothing covered "this
+    card has prices, but not these prices". A build that adds a provider, adds
+    a finish, or replaces the file outright changes what the sidecar can
+    answer for cards that already have rows, and those cards are in no
+    `missing` set and get no nightly catch-up either — the nightly projection
+    only asks for dates newer than the watermark, so history the sidecar
+    already held is never delivered. That is how 1.2.0 shipped Mana Pool to a
+    page that said "no prices yet".
+
+    Keyed on the sidecar's built_at rather than on a flag per feature, so a
+    new provider, a new finish, a rebuild and a first build all take the same
+    path and no one has to remember to write a backfill. Returns rows written.
+
+    The marker is written only after the projection commits: a crash here has
+    to re-run on the next startup, because nothing else will ever notice the
+    gap."""
+    data_dir = data_dir or _data_dir()
+    side = _sidecar_path(data_dir)
+    built = price_sidecar.built_at(side)
+    if built is None:                       # no sidecar, or not a usable one
+        return 0
+    db = watchlist_db.connect(db_path)
+    try:
+        watchlist_db.init_db(db)
+        if _get_meta(db, "sidecar_projected_from") == built:
+            return 0
+        uuids = watched_uuids(db)
+        if not uuids:
+            # No marker either. The first card added later still needs the
+            # full projection, and a marker written now would skip it.
+            return 0
+        try:
+            n = _project(db, side, uuids)
+        except Exception:
+            # Same shape as ensure_history's sidecar branch: roll back so no
+            # partial write survives, log, and degrade. There is no fallback
+            # to take here, so the marker stays unset and this retries on the
+            # next startup rather than failing a server boot.
+            db.rollback()
+            log.exception("sidecar reprojection failed; leaving the marker "
+                          "unset so the next startup retries")
+            return 0
+        _set_meta(db, "sidecar_projected_from", built)
+        log.info("reprojected sidecar build %s: %d uuid(s), %d rows",
+                 built, len(uuids), n)
+        return n
+    finally:
+        db.close()
 
 
 def ensure_history(db_path: str, data_dir: str | None = None) -> int:
@@ -380,7 +436,14 @@ def run_ingest(db_path: str, data_dir: str | None = None) -> None:
         else:
             n = ingest_prices_file(db, p)
         log.info("daily: %d rows", n)
-        _set_meta(db, "last_ingest", date.today().isoformat())
+        # Both halves of the loop's guard, in one transaction. The version is
+        # stamped because a date alone cannot express "a build that has never
+        # run an ingest": whatever a deploy adds that only run_ingest fills —
+        # a provider, the MTGStocks print-id cache, a resolution step — would
+        # otherwise wait for tomorrow when the day was already stamped by the
+        # build being replaced.
+        _set_meta(db, "last_ingest", date.today().isoformat(), commit=False)
+        _set_meta(db, "last_ingest_version", mystic_forge.version())
         notify_hits(db)
     finally:
         db.close()

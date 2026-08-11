@@ -189,6 +189,22 @@ def is_ready(path: str) -> bool:
     return _readiness(path) is None
 
 
+def built_at(path: str) -> str | None:
+    """When this sidecar's build completed, or None if there isn't one.
+
+    The identity of a build, for callers that must do something once per
+    build. stats() reports the same value, but it pays three full table scans
+    (~3.2s on a 54M-row sidecar) to get there, and a caller that only needs to
+    compare it against a stored marker should not have to."""
+    if not is_ready(path):
+        return None
+    db = connect(path)
+    try:
+        return _get_meta(db, "built_at")
+    finally:
+        db.close()
+
+
 def daily_through(path: str) -> str | None:
     """Newest date applied, as an ISO string, or None."""
     if not is_ready(path):

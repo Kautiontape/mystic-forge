@@ -4,10 +4,12 @@ import os
 import sqlite3
 import threading
 import tracemalloc
+from datetime import date, timedelta
 
 import httpx
 import pytest
 
+import mystic_forge
 from mystic_forge.watchlist import db as watchlist_db
 from mystic_forge.watchlist import ingest as watchlist_ingest
 from mystic_forge.watchlist import sidecar as price_sidecar
@@ -135,12 +137,17 @@ def test_ensure_history_downloads_when_cache_is_cold(db, db_path, tmp_path,
 
 def test_empty_watchlist_does_not_stamp_last_ingest(db, db_path, tmp_path):
     """Regression: stamping last_ingest on an empty list made the first cards
-    added that day wait until tomorrow for any prices."""
+    added that day wait until tomorrow for any prices.
+
+    The version stamp is half of the same guard, so it must not be written
+    either — a version-forced run over an empty list that stamped only the
+    version would satisfy the loop and put the day right back where it was."""
     watchlist_ingest.run_ingest(db_path, str(tmp_path))
     db2 = watchlist_db.connect(db_path)
-    row = db2.execute("SELECT value FROM meta WHERE key='last_ingest'").fetchone()
+    rows = db2.execute("SELECT key FROM meta WHERE key IN ('last_ingest',"
+                       " 'last_ingest_version')").fetchall()
     db2.close()
-    assert row is None
+    assert rows == []
 
 
 def test_notify_hits_pushes_once_per_new_hit(db, monkeypatch):
@@ -817,6 +824,199 @@ def test_run_ingest_stamps_last_ingest_when_downsample_fails(
     fresh = db.execute(
         "SELECT price FROM prices WHERE date='2026-08-09'").fetchone()
     assert fresh is not None and fresh["price"] == 6.75
+
+
+# ── One-time reprojection after a build ────────────────────────────────────
+
+MARKER_SQL = "SELECT value FROM meta WHERE key='sidecar_projected_from'"
+
+
+def _marker(db):
+    """The marker row itself, not its value: a stamped NULL and no stamp at
+    all mean opposite things here and must not compare equal."""
+    return db.execute(MARKER_SQL).fetchone()
+
+
+def _watch(db, name="Sol Ring", uuid="uuid-a"):
+    """A watched card with its uuid already resolved — the state every card in
+    a live database is in by the time a sidecar gets rebuilt under it."""
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, name)
+    db.execute("INSERT OR IGNORE INTO card_uuids (card_name, uuid) VALUES (?,?)",
+               (name, uuid))
+    db.commit()
+    return list_id
+
+
+def _built_sidecar(tmp_path, data=None, name="src.json.gz"):
+    gz = make_prices_gz(tmp_path, name, data or {"uuid-a": PRICE_OBJ})
+    side = watchlist_ingest._sidecar_path(str(tmp_path))
+    price_sidecar.build_from_allprices(side, gz)
+    return side
+
+
+def test_reprojection_runs_when_the_marker_is_absent(db, db_path, tmp_path):
+    """A sidecar this database has never been projected from — a first build,
+    or an upgrade that never had the marker — must be projected in full."""
+    side = _built_sidecar(tmp_path)
+    _watch(db)
+
+    assert watchlist_ingest.reproject_if_stale(db_path, str(tmp_path)) == 3
+    assert db.execute("SELECT COUNT(*) FROM prices").fetchone()[0] == 3
+    assert _marker(db)["value"] == price_sidecar.stats(side)["built_at"]
+
+
+def test_reprojection_is_a_noop_once_the_marker_matches(db, db_path,
+                                                        tmp_path, monkeypatch):
+    """Once per build, not nightly: ~480k rows for 1,000 watched cards is
+    cheap once and pointless every startup."""
+    _built_sidecar(tmp_path)
+    _watch(db)
+    assert watchlist_ingest.reproject_if_stale(db_path, str(tmp_path)) == 3
+
+    # Counted, not raised: reproject_if_stale swallows exceptions out of the
+    # projection by design, so a stub that raised would be caught and the
+    # test would pass on the very regression it is meant to catch.
+    calls, real = [], watchlist_ingest._project
+
+    def counting(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+    monkeypatch.setattr(watchlist_ingest, "_project", counting)
+    assert watchlist_ingest.reproject_if_stale(db_path, str(tmp_path)) == 0
+    assert calls == [], "projected again for a build already projected"
+
+
+def test_reprojection_reruns_when_the_sidecar_was_rebuilt(db, db_path, tmp_path):
+    """The marker is keyed on built_at, not on "have we ever done this": a
+    rebuilt sidecar holds different history and has to be re-delivered."""
+    side = _built_sidecar(tmp_path)
+    _watch(db)
+    assert watchlist_ingest.reproject_if_stale(db_path, str(tmp_path)) == 3
+
+    # Set rather than rebuilt: built_at has one-second resolution, so two
+    # builds inside one test would be indistinguishable.
+    sdb = price_sidecar.connect(side)
+    price_sidecar._set_meta(sdb, "built_at", "2099-01-01T00:00:00Z")
+    sdb.commit()
+    sdb.close()
+
+    assert watchlist_ingest.reproject_if_stale(db_path, str(tmp_path)) == 3
+    assert _marker(db)["value"] == "2099-01-01T00:00:00Z"
+
+
+def test_reprojection_noops_without_a_ready_sidecar(db, db_path, tmp_path):
+    """No sidecar and a corrupt one are both "nothing to project from" — and
+    neither may leave a marker behind that suppresses the real build's pass."""
+    _watch(db)
+    assert watchlist_ingest.reproject_if_stale(db_path, str(tmp_path)) == 0
+    assert _marker(db) is None
+
+    # An existing marker must survive it too: overwriting it with what an
+    # unreadable sidecar reports would be a stamp for a build that never
+    # happened.
+    watchlist_ingest._set_meta(db, "sidecar_projected_from", "2026-08-01T00:00:00Z")
+    with open(watchlist_ingest._sidecar_path(str(tmp_path)), "wb") as f:
+        f.write(b"this is not a database")
+    assert watchlist_ingest.reproject_if_stale(db_path, str(tmp_path)) == 0
+    assert _marker(db)["value"] == "2026-08-01T00:00:00Z"
+
+
+def test_reprojection_noops_when_nothing_is_watched(db, db_path, tmp_path):
+    """No marker either: the first card added later still needs the full
+    projection, and a marker written now would skip it."""
+    _built_sidecar(tmp_path)
+    assert watchlist_ingest.reproject_if_stale(db_path, str(tmp_path)) == 0
+    assert _marker(db) is None
+
+
+def _days(n, start="2026-05-15"):
+    first = date.fromisoformat(start)
+    return [(first + timedelta(days=i)).isoformat() for i in range(n)]
+
+
+def test_reprojection_backfills_a_provider_added_after_the_first_fill(
+        db, db_path, tmp_path):
+    """The 1.2.0 field report: Mana Pool showed "no prices yet".
+
+    ensure_history asks "does this uuid have *any* price?", so a card already
+    carrying tcgplayer rows is never in `missing` and a newly tracked provider
+    never reaches it. The reprojection asks the question the other way round
+    and must deliver every day the sidecar holds, not just the newest."""
+    days = _days(45)
+    both = {"paper": {
+        "tcgplayer": {"retail": {"normal": {d: 8.0 for d in days}}},
+        "manapool": {"retail": {"normal": {d: 7.5 for d in days}}}}}
+    _built_sidecar(tmp_path, {"uuid-a": both})
+    _watch(db)
+    # What 1.1.0 left behind: tcgplayer history and nothing else.
+    for d in days:
+        watchlist_db.upsert_price(db, "uuid-a", d, "tcgplayer", "normal", 8.0)
+    db.commit()
+
+    # The bug, pinned: the on-demand path sees nothing missing and does nothing.
+    assert watchlist_ingest.ensure_history(db_path, str(tmp_path)) == 0
+    assert db.execute("SELECT 1 FROM prices WHERE provider='manapool'"
+                      ).fetchone() is None
+
+    watchlist_ingest.reproject_if_stale(db_path, str(tmp_path))
+
+    got = {r["date"] for r in db.execute(
+        "SELECT date FROM prices WHERE provider='manapool'")}
+    assert got == set(days), "manapool must arrive with its full history"
+
+
+def test_a_crash_mid_reprojection_leaves_the_marker_unset(db, db_path,
+                                                          tmp_path, monkeypatch):
+    """A half-done projection that stamped the marker would never be retried,
+    and the missing history is not recoverable any other way."""
+    _built_sidecar(tmp_path)
+    _watch(db)
+    real, calls = watchlist_ingest._project, []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(*a, **k)
+    monkeypatch.setattr(watchlist_ingest, "_project", flaky)
+
+    assert watchlist_ingest.reproject_if_stale(db_path, str(tmp_path)) == 0
+    assert _marker(db) is None
+    # ...so the next startup tries again rather than skipping forever.
+    assert watchlist_ingest.reproject_if_stale(db_path, str(tmp_path)) == 3
+    assert _marker(db) is not None
+
+
+# ── Version-forced ingest ──────────────────────────────────────────────────
+
+
+def test_run_ingest_stamps_the_running_version_beside_the_date(
+        db, db_path, tmp_path, monkeypatch):
+    """A deploy that adds a provider or a cache only fills it by running an
+    ingest, so the loop has to be able to tell which build last ran one."""
+    _nightly_fixture(tmp_path, monkeypatch, {
+        "uuid-a": {"paper": {"tcgplayer": {"retail": {
+            "normal": {"2026-08-09": 6.75}}}}}})
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+
+    stamped = {r["key"]: r["value"] for r in db.execute(
+        "SELECT key, value FROM meta WHERE key IN ('last_ingest',"
+        " 'last_ingest_version')")}
+    assert stamped == {"last_ingest": date.today().isoformat(),
+                       "last_ingest_version": mystic_forge.version()}
+
+
+def test_version_helper_reports_a_version(tmp_path):
+    """Read from the repo-root VERSION file, which sits outside the package —
+    both in a source checkout and at /app in the image."""
+    v = mystic_forge.version()
+    assert v and v == v.strip()
+    assert v[0].isdigit()
 
 
 # ── _download ──────────────────────────────────────────────────────────────

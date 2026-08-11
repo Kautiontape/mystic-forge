@@ -23,7 +23,7 @@ docker compose up -d          # serves http://localhost:8000/mcp
 # Install deps
 pip install -r requirements.txt -r requirements-dev.txt
 
-# Run the test suite (641 tests; -m "not slow" skips the long acceptance runs)
+# Run the test suite (784 tests; -m "not slow" skips the long acceptance runs)
 python -m pytest -q -m "not slow"
 ```
 
