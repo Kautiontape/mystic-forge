@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Mystic Forge is an MCP (Model Context Protocol) server for Magic: The Gathering. It exposes 46 tools that wrap several public MTG APIs (Scryfall, EDHRec, Archidekt, Commander Spellbook, MTGJSON) behind a unified FastMCP server, plus a deck simulator and a price watchlist of its own.
 
-Most of it lives in `server.py`, with supporting modules alongside: `rulebook.py` (Comprehensive Rules parsing), `watchlist_db.py` / `watchlist_ingest.py` / `watchlist_pages.py`, and the `goldfish/` package (simulation engine). There is no build step, but there **is** a SQLite database backing the watchlist — path from `MYSTIC_FORGE_DB`, defaulting to `mystic_forge.db`.
+Most of it lives in `server.py`, with supporting modules alongside: `rulebook.py` (Comprehensive Rules parsing), `watchlist_db.py` / `watchlist_ingest.py` / `watchlist_pages.py` / `price_sidecar.py`, and the `goldfish/` package (simulation engine). There is no build step, but there **is** a SQLite database backing the watchlist — path from `MYSTIC_FORGE_DB`, defaulting to `mystic_forge.db`.
 
 ## Commands
 
@@ -62,16 +62,25 @@ Verify a release with `curl -s https://mcp.kautiontape.com/mtg/health` — it re
 - **RULEBOOK** — Comprehensive Rules lookup and search (`rules_*`), parsing via `rulebook.py` against the vendored `MagicCompRules.txt`
 - **PRECON DECKS** — preconstructed decks via MTGJSON (`precon_*`)
 - **GOLDFISH** — deck simulation (`goldfish_*`), engine in the `goldfish/` package
-- **WATCHLIST** — passphrase-named price watchlists (`watchlist_*`, `price_history`), backed by SQLite and served as HTML pages under `/w/` and `/s/`
+- **WATCHLIST** — passphrase-named price watchlists (`watchlist_*`, `price_history`), backed by **two** SQLite files and served as HTML pages under `/w/` and `/s/`
 - **ENTRYPOINT** — `mcp.run()` with transport chosen by the `--stdio` flag
 
-Sections past RULINGS do more than wrap an API: RULEBOOK, GOLDFISH, and WATCHLIST own local state (a vendored rules file, a simulation engine, a database). They do not follow the three-layer transport/error/tool shape below.
+Sections past RULINGS do more than wrap an API: RULEBOOK, GOLDFISH, and WATCHLIST own local state (a vendored rules file, a simulation engine, two databases). They do not follow the three-layer transport/error/tool shape below.
+
+### The price sidecar
+
+`price_sidecar.py` owns the second SQLite file — `price_sidecar.sqlite`, beside `mystic_forge.db` — holding price history for *every* card MTGJSON prices. It is the sole writer of the main database's `prices` table, and nothing downstream of `prices` knows it exists.
+
+- **It is data, not a rebuildable cache.** Daily resolution for `KEEP_DAILY_DAYS` (120), weekly means forever beyond that. MTGJSON only replays ~90 days, so past that the sidecar holds the only copy of its history. Whatever backs up `mystic_forge.db` must now cover `price_sidecar.sqlite` too.
+- **`PROVIDERS` and `FINISHES` are append-only.** The stored `src` codes are positional, so reordering or removing an entry silently reinterprets every existing row.
+- **A rebuild never clobbers.** The previous file is moved aside to `price_sidecar.sqlite.superseded`.
+- **`MYSTIC_FORGE_NO_SIDECAR` is the operator escape hatch.** With it set, readiness stays false and every path falls back to the pre-sidecar AllPrices scan.
 
 ### Consistent per-section pattern
 
 Every source follows the same three-layer shape, so match it when adding tools:
 
-1. **Transport helpers** — `async def _<source>_get(...)` / `_<source>_post(...)` build the request against the source's base-URL constant (`SCRYFALL_API`, `EDHREC_JSON`/`EDHREC_API`, `ARCHIDEKT_API`, `SPELLBOOK_API`, `MTGJSON_API`), always sending `USER_AGENT` (derived from `VERSION`, e.g. `MysticForge/1.1.0`) and `REQUEST_TIMEOUT`. Each opens its own `httpx.AsyncClient()`.
+1. **Transport helpers** — `async def _<source>_get(...)` / `_<source>_post(...)` build the request against the source's base-URL constant (`SCRYFALL_API`, `EDHREC_JSON`/`EDHREC_API`, `ARCHIDEKT_API`, `SPELLBOOK_API`, `MTGJSON_API`), always sending `USER_AGENT` (derived from `VERSION`, e.g. `MysticForge/1.2.0`) and `REQUEST_TIMEOUT`. Each opens its own `httpx.AsyncClient()`.
 2. **Error formatter** — `_<source>_error(e)` converts exceptions (esp. `httpx.HTTPStatusError`) into a human-readable string. Tools return these strings rather than raising.
 3. **Pydantic input model + `@mcp.tool` function** — input models subclass `BaseModel` with `Field(...)` constraints; the tool takes a single `params` argument and **returns a formatted `str`** (markdown-ish text), never raw JSON.
 
