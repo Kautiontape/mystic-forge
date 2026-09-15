@@ -105,6 +105,11 @@ CREATE TABLE IF NOT EXISTS mtgstocks_votes (
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS idx_prices_pfud
   ON prices(provider, finish, uuid, date);
+-- "Prices through <date>" on every board is MAX(date) for a set of shops.
+-- Without a (provider, date) index that walks every row of those shops --
+-- 3.8s on 1.5M rows, and growing daily -- with it, three index seeks.
+CREATE INDEX IF NOT EXISTS idx_prices_pd
+  ON prices(provider, date);
 """
 
 

@@ -12,6 +12,18 @@ def test_init_db_creates_tables(db):
             "card_uuids"} <= names
 
 
+def test_board_through_date_is_an_index_seek(db):
+    """The "prices through <date>" line on every board is MAX(date) over a
+    set of shops. It must resolve from the (provider, date) index -- the
+    older (provider, finish, uuid, date) index answers it too, but only by
+    walking every row of those shops, which took 3.8s per page in
+    production."""
+    plan = " ".join(r[3] for r in db.execute(
+        "EXPLAIN QUERY PLAN SELECT MAX(date) FROM prices"
+        " WHERE provider IN (?, ?, ?)", ("tcgplayer", "cardkingdom", "manapool")))
+    assert "idx_prices_pd" in plan, plan
+
+
 def test_mint_passphrase_format():
     pp = watchlist_db.mint_passphrase()
     parts = pp.split("-")
