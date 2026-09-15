@@ -1,3 +1,4 @@
+import datetime
 import pytest
 
 import server
@@ -391,3 +392,86 @@ async def test_list_shows_foil_fallback(db_path, a_list, fake_scryfall):
     db.close()
     out = await server.watchlist_list(server.WatchlistListInput(passphrase=pp))
     assert "42.00" in out and "foil" in out
+
+
+async def test_add_with_target_rule_and_shop(db_path, a_list, fake_scryfall):
+    list_id, pp, _ = a_list
+    out = await server.watchlist_add(server.WatchlistAddInput(
+        name="Sol Ring", target_rule="low-10%", shop="manapool", passphrase=pp))
+    assert "historic low −10%" in out and "Mana Pool only" in out
+    db = watchlist_db.connect(db_path)
+    e = watchlist_db.current_entries(db, list_id)[0]
+    db.close()
+    assert (e["target_mode"], e["target_pct"], e["shop"]) == ("low", 10.0, "manapool")
+    out = await server.watchlist_add(server.WatchlistAddInput(
+        name="Sol Ring", target_rule="banana", passphrase=pp))
+    assert "Could not read target rule" in out
+    out = await server.watchlist_add(server.WatchlistAddInput(
+        name="Sol Ring", shop="ebay", passphrase=pp))
+    assert "Unknown shop" in out
+
+
+async def test_bulk_add_target_rules_and_opt_in_pins(db_path, a_list,
+                                                     fake_scryfall_bulk):
+    list_id, pp, _ = a_list
+    out = await server.watchlist_bulk_add(server.WatchlistBulkAddInput(
+        decklist="1 Sol Ring @ low\n1 Rhystic Study @ -50%\nCultivate",
+        target_rule="low-20%", passphrase=pp))
+    assert "Added 3 card(s)" in out
+    db = watchlist_db.connect(db_path)
+    got = {e["card_name"]: e for e in watchlist_db.current_entries(db, list_id)}
+    db.close()
+    assert (got["Sol Ring"]["target_mode"], got["Sol Ring"]["target_pct"]) == ("low", 0.0)
+    assert got["Rhystic Study"]["target_price"] == 0.5      # fake price is $1.00
+    assert (got["Cultivate"]["target_mode"], got["Cultivate"]["target_pct"]) == ("low", 20.0)
+    assert all(e["set_code"] is None for e in got.values())
+
+
+async def test_list_and_report_use_the_basis_and_the_rule(db_path, a_list,
+                                                          fake_scryfall):
+    list_id, pp, _ = a_list
+    db = watchlist_db.connect(db_path)
+    watchlist_db.add_card(db, list_id, "Sol Ring", target_mode="low")
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Sol Ring','u1')")
+    watchlist_db.upsert_price(db, "u1", "2026-09-13", "tcgplayer", "normal", 2.0)
+    watchlist_db.upsert_price(db, "u1", "2026-09-14", "tcgplayer", "normal", 1.9)
+    watchlist_db.upsert_price(db, "u1", "2026-09-14", "manapool", "normal", 1.5)
+    db.close()
+    out = await server.watchlist_list(server.WatchlistListInput(passphrase=pp))
+    assert "| $1.50 | Mana Pool |" in out
+    assert "🎯 historic low (now $2.00)" in out
+    rep = await server.watchlist_report(server.WatchlistListInput(passphrase=pp))
+    assert "At or below target" in rep and "$1.50 at Mana Pool" in rep
+
+
+async def test_price_history_all_is_the_cheapest_usd_market(db_path, a_list,
+                                                            fake_scryfall):
+    list_id, pp, _ = a_list
+    db = watchlist_db.connect(db_path)
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Sol Ring','u1')")
+    watchlist_db.upsert_price(db, "u1", "2026-09-14", "tcgplayer", "normal", 1.9)
+    watchlist_db.upsert_price(db, "u1", "2026-09-14", "manapool", "normal", 1.5)
+    watchlist_db.upsert_price(db, "u1", "2026-09-14", "cardmarket", "normal", 0.5)
+    db.close()
+    out = await server.price_history(server.PriceHistoryInput(name="Sol Ring", days=3650))
+    assert "2026-09-14: 1.5" in out and "cheapest across" in out
+    out = await server.price_history(server.PriceHistoryInput(
+        name="Sol Ring", provider="tcgplayer", days=3650))
+    assert "2026-09-14: 1.9" in out
+    out = await server.price_history(server.PriceHistoryInput(
+        name="Sol Ring", provider="ebay"))
+    assert "Unknown provider" in out
+
+
+async def test_report_movers_use_the_entry_currency(db_path, a_list, fake_scryfall):
+    list_id, pp, _ = a_list
+    db = watchlist_db.connect(db_path)
+    watchlist_db.add_card(db, list_id, "Sol Ring", shop="cardmarket")
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Sol Ring','u1')")
+    today = datetime.date.today()
+    for days, price in ((8, 2.0), (0, 1.5)):
+        watchlist_db.upsert_price(db, "u1", (today - datetime.timedelta(days=days)).isoformat(),
+                                  "cardmarket", "normal", price)
+    db.close()
+    rep = await server.watchlist_report(server.WatchlistListInput(passphrase=pp))
+    assert "Sol Ring: €1.50" in rep and "$1.50" not in rep

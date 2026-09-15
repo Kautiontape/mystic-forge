@@ -46,20 +46,24 @@ def notify_hits(db) -> int:
     for lst in db.execute("SELECT * FROM lists WHERE superseded_by IS NULL"):
         # State tracks every entry at/below target — bought ones included, so
         # un-marking a purchase doesn't re-announce an old buy window.
+        # Same basis as the board and the tools (pinned shop, else cheapest
+        # USD market) and the same effective target (fixed, or the historic-
+        # low rule resolved for today), so a lit card and a push never
+        # disagree. Bought cards are tracked but never announced.
         hits = []
         for e in watchlist_db.current_entries(db, lst["id"]):
-            if e.get("target_price") is None:
-                continue
-            s = watchlist_db.entry_price_summary(db, e)
-            if s and s["current"] <= e["target_price"]:
+            s = watchlist_db.basis_summary(db, e)
+            target = watchlist_db.effective_target(db, e, s)
+            if s and target is not None and s["current"] <= target:
                 hits.append((e["entry_id"], e["card_name"], s["current"],
-                             e["target_price"], bool(e.get("bought_at"))))
+                             target, bool(e.get("bought_at")),
+                             watchlist_db.entry_currency(e)))
         key = f"notified:{lst['id']}"
         prev = set(json.loads(_get_meta(db, key) or "[]"))
         fresh = [h for h in hits if h[0] not in prev and not h[4]]
         if fresh:
-            body = " · ".join(f"{n} ${c:.2f} (target ${t:.2f})"
-                              for _, n, c, t, _b in fresh)
+            body = " · ".join(f"{n} {cur}{c:.2f} (target {cur}{t:.2f})"
+                              for _, n, c, t, _b, cur in fresh)
             try:
                 httpx.post(
                     f"{NTFY_BASE}/{ntfy_topic(lst['share_code'])}",

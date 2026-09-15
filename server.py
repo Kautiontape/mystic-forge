@@ -35,6 +35,7 @@ from mystic_forge.watchlist import ingest as watchlist_ingest
 from mystic_forge.watchlist import mtgstocks as watchlist_mtgstocks
 from mystic_forge.watchlist import pages as watchlist_pages
 from mystic_forge.watchlist import sidecar as price_sidecar
+from mystic_forge.watchlist import targets as watchlist_targets
 from mystic_forge import rulebook
 
 from mystic_forge.goldfish import ENGINE_VERSION, autoderive, metrics, report
@@ -5137,7 +5138,15 @@ class WatchlistAddInput(BaseModel):
     name: str = Field(..., description="Card name (fuzzy-matched via Scryfall)")
     set_code: Optional[str] = Field(None, description="Pin a specific printing: set code")
     collector_number: Optional[str] = Field(None, description="Pin a specific printing: collector number")
-    target_price: Optional[float] = Field(None, description="Alert threshold in USD")
+    target_price: Optional[float] = Field(None, description="Fixed alert threshold (USD unless the card is pinned to Cardmarket)")
+    target_rule: Optional[str] = Field(None, description=(
+        "Moving target instead of a fixed price: 'low' alerts at the historic "
+        "low, 'low-10%' ten percent under it, '-20%' twenty percent under "
+        "today's price (fixed at add time). Overrides target_price."))
+    shop: Optional[str] = Field(None, description=(
+        "Pin this card's price basis to one market: tcgplayer | cardkingdom | "
+        "cardmarket | manapool. Default (omit) is the cheapest across the USD "
+        "markets."))
     note: Optional[str] = Field(None, description="Free-form note, e.g. deck/batch")
     passphrase: Optional[str] = Field(None, description="List passphrase (omit when using a personal connector URL)")
 
@@ -5146,12 +5155,20 @@ class WatchlistBulkAddInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decklist: str = Field(..., description=(
         "Cards to add, one per line. Accepts plain names, decklist quantities "
-        "('1 Sol Ring', '1x Sol Ring'), and Archidekt-style suffixes "
-        "((set) 123 [Category] ^label^) which are stripped. Quantities are "
-        "ignored — a watchlist tracks cards, not copies. An optional target "
-        "price may follow the name after ' @ ', e.g. 'Rhystic Study @ 60'."))
+        "('1 Sol Ring', '1x Sol Ring'), and Archidekt/Moxfield printings "
+        "('1 Sol Ring (CMM) 464' pins that printing; [Category] and ^label^ "
+        "suffixes are stripped). Quantities are ignored — a watchlist tracks "
+        "cards, not copies. An optional target may follow the name after "
+        "' @ ': a price ('Rhystic Study @ 60'), 'low' (alert at the historic "
+        "low), 'low-10%' (10% under the historic low), or '-20%' (20% under "
+        "today's price, fixed at add time)."))
     note: Optional[str] = Field(None, description="Note applied to every card added, e.g. the deck name")
-    target_price: Optional[float] = Field(None, description="Default target for cards without a per-line ' @ ' target")
+    target_price: Optional[float] = Field(None, description="Default fixed target for cards without a per-line ' @ ' target")
+    target_rule: Optional[str] = Field(None, description="Default target rule ('low', 'low-10%', '-20%') for cards without a per-line ' @ ' target; overrides target_price")
+    pin_printings: bool = Field(False, description=(
+        "Pin each card to the printing its line names ('(CMM) 464'). Off by "
+        "default because deck exports name the printing the owner has, while "
+        "a watchlist usually wants the cheapest one."))
     passphrase: Optional[str] = Field(None, description="List passphrase (omit when using a personal connector URL)")
 
 
@@ -5209,10 +5226,10 @@ def _mint_allowed(who: str) -> bool:
 
 
 def _client_key(request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """The mint-throttle bucket for a page request: the address the proxy
+    actually accepted (`_client_ip`), never the first X-Forwarded-For entry,
+    which a caller writes freely and could rotate to mint without limit."""
+    return _client_ip(request)
 
 
 _history_task: Optional[asyncio.Task] = None
@@ -5356,12 +5373,30 @@ async def watchlist_add(params: WatchlistAddInput) -> str:
             except Exception:
                 pass  # offline/unknown: keep the user's spelling
 
+        if params.shop is not None and params.shop not in watchlist_db.ALL_SHOPS:
+            return (f"Unknown shop {params.shop!r} — use one of "
+                    + ", ".join(watchlist_db.ALL_SHOPS) + ".")
+        spec = None
+        if params.target_rule:
+            spec = watchlist_targets.parse_spec(params.target_rule)
+            if spec is None:
+                return (f"Could not read target rule {params.target_rule!r}. "
+                        f"Use a price, 'low', 'low-10%', or '-20%'.")
+        elif params.target_price is not None:
+            spec = {"target_mode": "fixed", "target_pct": 0.0,
+                    "target_price": params.target_price}
+        target = watchlist_targets.resolve(
+            spec, float(current_usd) if current_usd else None)
+        if spec and "pct_of_current" in spec and target is None:
+            return (f"'{params.target_rule}' needs today's price to resolve "
+                    f"and Scryfall has none for {name}; give a fixed price "
+                    f"or use 'low'.")
         _, entry = watchlist_db.add_card(
             db, row["id"], name, set_code=params.set_code,
             collector_number=params.collector_number,
-            target_price=params.target_price, note=params.note)
+            note=params.note, shop=params.shop, **(target or {}))
         uuids = watchlist_db.uuids_for_entry(db, entry)
-        summary = watchlist_db.entry_price_summary(db, entry)
+        summary = watchlist_db.basis_summary(db, entry)
         if summary:
             backfill = "history ready"
         elif _schedule_backfill():
@@ -5374,13 +5409,105 @@ async def watchlist_add(params: WatchlistAddInput) -> str:
                  f"(entry #{entry['entry_id']}) — {backfill}."]
         if current_usd:
             lines.append(f"Scryfall market price now: ${current_usd}")
-        if entry.get("target_price") is not None:
-            lines.append(f"Target: {_fmt_price(entry['target_price'])}")
+        rule = _fmt_target(db, entry, summary)
+        if rule:
+            lines.append(f"Target: {rule}")
+        if entry.get("shop"):
+            lines.append(f"Price basis: {watchlist_db.SHOP_NAMES[entry['shop']]}"
+                         f" only.")
         if uuids:
             lines.append(f"Tracking {len(uuids)} printing(s).")
         return "\n".join(lines)
     finally:
         db.close()
+
+
+_TARGET_SUFFIX_RE = re.compile(r"\s+@\s*([^@]+?)\s*$")
+
+
+async def _bulk_add_cards(db, row, decklist: str, note: Optional[str] = None,
+                          default_spec: Optional[dict] = None,
+                          pin_printings: bool = False) -> dict:
+    """The bulk-add core shared by watchlist_bulk_add and the page's import
+    box: parse lines, peel ' @ <target>' specs, validate every name (and,
+    with `pin_printings`, the printing a line names) against Scryfall in
+    batches, add, and kick one backfill. Returns a result dict rather than
+    prose so each caller can phrase it."""
+    out = {"added": [], "updated": [], "skipped": [], "unpriced": [],
+           "backfilling": False, "error": None, "too_many": None}
+    wanted: list[tuple[str, Optional[str], Optional[str], Optional[dict]]] = []
+    seen_keys: set = set()
+    for line in decklist.splitlines():
+        spec = default_spec
+        m = _TARGET_SUFFIX_RE.search(line)
+        if m:
+            parsed = watchlist_targets.parse_spec(m.group(1))
+            if parsed is not None:
+                spec = parsed
+            line = line[:m.start()]
+        entries = _parse_decklist_entries(line)
+        if not entries or not entries[0].name:
+            continue
+        ent = entries[0]
+        set_code = (ent.set_code.upper()
+                    if pin_printings and ent.set_code and ent.collector_number
+                    else None)
+        cn = ent.collector_number if set_code else None
+        key = (ent.name.lower(), set_code, cn)
+        if key in seen_keys:      # same card twice in one paste
+            continue
+        seen_keys.add(key)
+        wanted.append((ent.name, set_code, cn, spec))
+    if not wanted:
+        out["error"] = "No card names found in that list."
+        return out
+    if len(wanted) > 300:
+        out["too_many"] = len(wanted)
+        out["error"] = (f"That's {len(wanted)} cards — more than this adds at "
+                        f"once. Split it into batches of 300 or fewer.")
+        return out
+
+    # Validate every name / pinned printing against Scryfall, 75 per request
+    found: dict = {}
+    for i in range(0, len(wanted), 75):
+        batch = wanted[i:i + 75]
+        identifiers = [({"set": s.lower(), "collector_number": c} if s
+                        else {"name": n}) for n, s, c, _ in batch]
+        try:
+            data = await _scryfall_post("/cards/collection",
+                                        {"identifiers": identifiers})
+        except Exception as e:
+            out["error"] = f"Scryfall lookup failed: {_scryfall_error(e)}"
+            return out
+        for card in data.get("data", []):
+            found[card["name"].lower()] = card
+            found[(card.get("set", "").upper(), card.get("collector_number"))] = card
+
+    for name, set_code, cn, spec in wanted:
+        card = found.get((set_code, cn)) if set_code else found.get(name.lower())
+        if card is None and not set_code:
+            # fall back to a fuzzy single lookup for near-misses
+            try:
+                card = await _scryfall_get("/cards/named", {"fuzzy": name})
+            except Exception:
+                card = None
+        if card is None:
+            out["skipped"].append(name + (f" ({set_code}) {cn}" if set_code else ""))
+            continue
+        canonical = card.get("name", name)
+        usd = (card.get("prices") or {}).get("usd")
+        target = watchlist_targets.resolve(spec, float(usd) if usd else None)
+        if spec and "pct_of_current" in spec and target is None:
+            out["unpriced"].append(canonical)
+        existed = watchlist_db._find_entry(db, row["id"], name=canonical,
+                                           set_code=set_code,
+                                           collector_number=cn)
+        _, entry = watchlist_db.add_card(
+            db, row["id"], canonical, set_code=set_code, collector_number=cn,
+            note=note, **(target or {}))
+        (out["updated"] if existed else out["added"]).append(entry["card_name"])
+    out["backfilling"] = _schedule_backfill() if out["added"] else False
+    return out
 
 
 @mcp.tool(name="watchlist_bulk_add")
@@ -5398,68 +5525,21 @@ async def watchlist_bulk_add(params: WatchlistBulkAddInput) -> str:
             return str(e)
         warning = _supersession_warning(db, row)
 
-        # Peel any ' @ <price>' off each line FIRST — _parse_decklist strips
-        # trailing digits as collector numbers and would eat the target.
-        wanted: list[tuple[str, Optional[float]]] = []
-        seen_keys: set[str] = set()
-        for line in params.decklist.splitlines():
-            target = params.target_price
-            m = re.search(r"\s+@\s*[$€]?\s*(\d+(?:\.\d+)?)\s*$", line)
-            if m:
-                target = float(m.group(1))
-                line = line[:m.start()]
-            parsed = _parse_decklist(line)
-            if not parsed:
-                continue
-            name = parsed[0][1]
-            if not name:
-                continue
-            key = name.lower()
-            if key in seen_keys:      # same card twice in one paste
-                continue
-            seen_keys.add(key)
-            wanted.append((name, target))
-        if not wanted:
-            return "No card names found in that list."
-        if len(wanted) > 300:
-            return (f"That's {len(wanted)} cards — more than this tool adds at "
-                    f"once. Split it into batches of 300 or fewer.")
-
-        # Validate every name against Scryfall, 75 identifiers per request
-        found: dict[str, dict] = {}
-        unresolved: list[str] = []
-        names = [n for n, _ in wanted]
-        for i in range(0, len(names), 75):
-            identifiers = [{"name": n} for n in names[i:i + 75]]
-            try:
-                data = await _scryfall_post("/cards/collection",
-                                            {"identifiers": identifiers})
-            except Exception as e:
-                return warning + f"Scryfall lookup failed: {_scryfall_error(e)}"
-            for card in data.get("data", []):
-                found[card["name"].lower()] = card
-                # Scryfall matches on exact/oracle name; map the query back too
-            for item in data.get("not_found", []):
-                unresolved.append(item.get("name", str(item)))
-
-        added, updated, skipped = [], [], []
-        for name, target in wanted:
-            card = found.get(name.lower())
-            if card is None:
-                # fall back to a fuzzy single lookup for near-misses
-                try:
-                    card = await _scryfall_get("/cards/named", {"fuzzy": name})
-                except Exception:
-                    skipped.append(name)
-                    continue
-            canonical = card.get("name", name)
-            existed = watchlist_db._find_entry(db, row["id"], name=canonical)
-            _, entry = watchlist_db.add_card(
-                db, row["id"], canonical, target_price=target, note=params.note)
-            (updated if existed else added).append(entry["card_name"])
-
-        backfilling = _schedule_backfill() if added else False
-
+        default_spec = None
+        if params.target_rule:
+            default_spec = watchlist_targets.parse_spec(params.target_rule)
+            if default_spec is None:
+                return (f"Could not read target rule {params.target_rule!r}. "
+                        f"Use a price, 'low', 'low-10%', or '-20%'.")
+        elif params.target_price is not None:
+            default_spec = {"target_mode": "fixed", "target_pct": 0.0,
+                            "target_price": params.target_price}
+        res = await _bulk_add_cards(db, row, params.decklist, note=params.note,
+                                    default_spec=default_spec,
+                                    pin_printings=params.pin_printings)
+        if res["error"]:
+            return warning + res["error"]
+        added, updated, skipped = res["added"], res["updated"], res["skipped"]
         lines = [warning + f"**Added {len(added)} card(s)** to "
                  f"{row['label'] or 'your watchlist'}."]
         if added:
@@ -5473,10 +5553,15 @@ async def watchlist_bulk_add(params: WatchlistBulkAddInput) -> str:
             lines.append(f"\n⚠️ {len(skipped)} not recognized by Scryfall — "
                          f"check spelling: " + ", ".join(skipped[:20])
                          + (" …" if len(skipped) > 20 else ""))
+        if res["unpriced"]:
+            lines.append(f"\n⚠️ {len(res['unpriced'])} had a percent-off "
+                         f"target but no Scryfall price to take it from, so "
+                         f"they were added without a target: "
+                         + ", ".join(res["unpriced"][:20]))
         lines.append("\n" + ("Fetching 90 days of price history now — it "
                              "appears on the board shortly (first run on a "
                              "new server takes a few minutes)."
-                             if backfilling else
+                             if res["backfilling"] else
                              "Price history arrives with the next ingest."))
         return "\n".join(lines)
     finally:
@@ -5507,24 +5592,48 @@ async def watchlist_remove(params: WatchlistRemoveInput) -> str:
         db.close()
 
 
+def _fmt_target(db, entry, summary) -> str:
+    """Target cell: '$12.00', 'historic low −10% (now $3.60)', or '—'."""
+    eff = watchlist_db.effective_target(db, entry, summary)
+    text = watchlist_targets.describe(entry, watchlist_db.entry_currency(entry),
+                                      effective=eff)
+    if text and eff is not None and summary and summary["current"] <= eff \
+            and not entry.get("bought_at"):
+        text = "🎯 " + text
+    return text or "—"
+
+
+def _fmt_shop(s, entry) -> str:
+    """Where the basis price comes from: the winning shop, marked when the
+    card is pinned to it."""
+    if not s or not s.get("provider"):
+        return "—"
+    name = watchlist_db.SHOP_NAMES.get(s["provider"], s["provider"])
+    return f"{name} (pinned)" if entry.get("shop") else name
+
+
 def _render_entries(db, list_id: int) -> list[str]:
-    lines = ["| # | Card | Price | Δ7d | Δ30d | Target | Note |",
-             "|---|------|-------|-----|------|--------|------|"]
+    lines = ["| # | Card | Price | Where | Δ7d | Δ30d | Target | Note |",
+             "|---|------|-------|-------|-----|------|--------|------|"]
     entries = watchlist_db.current_entries(db, list_id)
     rows = []
     for e in entries:
-        rows.append((e, watchlist_db.entry_price_summary(db, e)))
+        rows.append((e, watchlist_db.basis_summary(db, e)))
     rows.sort(key=lambda t: (t[1] is None,
                              t[1]["d30"] if t[1] and t[1]["d30"] is not None else 0))
     for e, s in rows:
         printing = f" [{e['set_code']} {e['collector_number']}]" \
             if e.get("set_code") else ""
+        cur = watchlist_db.entry_currency(e)
+        price = _fmt_summary_price(s)
+        if cur != "$" and s:
+            price = price.replace("$", cur, 1)
         lines.append(
             f"| {e['entry_id']} | {e['card_name']}{printing} "
-            f"| {_fmt_summary_price(s)} "
+            f"| {price} | {_fmt_shop(s, e)} "
             f"| {_fmt_delta(s['d7']) if s else '—'} "
             f"| {_fmt_delta(s['d30']) if s else '—'} "
-            f"| {_fmt_price(e['target_price'])} | {e['note'] or ''} |")
+            f"| {_fmt_target(db, e, s)} | {e['note'] or ''} |")
     if not entries:
         lines = ["*(empty list)*"]
     return lines
@@ -5532,7 +5641,8 @@ def _render_entries(db, list_id: int) -> list[str]:
 
 @mcp.tool(name="watchlist_list")
 async def watchlist_list(params: WatchlistListInput) -> str:
-    """Show a watchlist: current price (cheapest normal-finish tcgplayer),
+    """Show a watchlist: current price (cheapest normal-finish price across
+    TCGplayer, Card Kingdom and Mana Pool, or the card's pinned shop),
     7/30-day movement, targets, notes. Sorted by 30-day movement."""
     db = _wl_db()
     try:
@@ -5570,7 +5680,7 @@ class PriceHistoryInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(..., description="Card name")
     days: int = Field(90, description="Days of history")
-    provider: str = Field("tcgplayer", description="tcgplayer | cardkingdom | cardmarket | manapool")
+    provider: str = Field("all", description="all (cheapest across the USD shops) | tcgplayer | cardkingdom | cardmarket | manapool")
     set_code: Optional[str] = Field(None, description="Pin a specific printing: set code")
     collector_number: Optional[str] = Field(None, description="Pin a specific printing: collector number")
 
@@ -5587,31 +5697,39 @@ async def watchlist_report(params: WatchlistListInput) -> str:
         entries = watchlist_db.current_entries(db, row["id"])
         priced = []
         for e in entries:
-            s = watchlist_db.entry_price_summary(db, e)
+            s = watchlist_db.basis_summary(db, e)
             if s:
                 priced.append((e, s))
         if not priced:
             return "No price data yet — history arrives with the nightly ingest."
-        hits = [(e, s) for e, s in priced
-                if e["target_price"] is not None and s["current"] <= e["target_price"]]
+        hits = []
+        for e, s in priced:
+            target = watchlist_db.effective_target(db, e, s)
+            if watchlist_db.is_hit(e, s, target):
+                hits.append((e, s, target))
         movers = sorted((t for t in priced if t[1]["d7"] is not None),
                         key=lambda t: t[1]["d7"])
         lines = [f"# Watchlist report{': ' + row['label'] if row['label'] else ''}"]
         if hits:
             lines.append("\n## 🎯 At or below target")
-            for e, s in hits:
-                lines.append(f"- **{e['card_name']}** {_fmt_price(s['current'])}"
-                             f" (target {_fmt_price(e['target_price'])})")
+            for e, s, target in hits:
+                cur = watchlist_db.entry_currency(e)
+                where = watchlist_db.SHOP_NAMES.get(s.get("provider"), "")
+                lines.append(f"- **{e['card_name']}** {cur}{s['current']:.2f}"
+                             f" at {where} (target "
+                             f"{watchlist_targets.describe(e, cur, effective=target)})")
         if movers:
             lines.append("\n## 📉 Biggest 7-day drops")
             for e, s in movers[:5]:
                 if s["d7"] < 0:
-                    lines.append(f"- {e['card_name']}: {_fmt_price(s['current'])}"
+                    cur = watchlist_db.entry_currency(e)
+                    lines.append(f"- {e['card_name']}: {cur}{s['current']:.2f}"
                                  f" ({_fmt_delta(s['d7'])})")
             lines.append("\n## 📈 Biggest 7-day rises")
             for e, s in movers[::-1][:5]:
                 if s["d7"] > 0:
-                    lines.append(f"- {e['card_name']}: {_fmt_price(s['current'])}"
+                    cur = watchlist_db.entry_currency(e)
+                    lines.append(f"- {e['card_name']}: {cur}{s['current']:.2f}"
                                  f" ({_fmt_delta(s['d7'])})")
         return "\n".join(lines)
     finally:
@@ -5831,6 +5949,15 @@ def _ensure_history_for(db, row) -> bool:
     return _schedule_backfill() if unpriced else False
 
 
+# Declared before /w/{passphrase}: Starlette matches routes in order, and
+# the passphrase route would otherwise swallow "new" as an unknown key.
+@mcp.custom_route("/w/new", methods=["GET"])
+@mcp.custom_route("/w/", methods=["GET"])
+async def new_list_page(request: Request):
+    """The forge: make a list by hand, seeded from pasted cards."""
+    return HTMLResponse(watchlist_pages.render_new())
+
+
 @mcp.custom_route("/w/{passphrase}", methods=["GET"])
 async def watch_page(request: Request):
     db = _wl_db()
@@ -5841,7 +5968,7 @@ async def watch_page(request: Request):
         filling = _ensure_history_for(db, row)
         return HTMLResponse(watchlist_pages.render_main(
             db, row, editable=True, cp=_page_int(request, "cp"),
-            shop=request.query_params.get("shop", "tcgplayer"),
+            shop=request.query_params.get("shop", watchlist_pages.ALL),
             filling=filling,
             sort=request.query_params.get("sort", "target"),
             show_bought=request.query_params.get("bought") != "hide",
@@ -5859,7 +5986,7 @@ async def watch_history_page(request: Request):
             return HTMLResponse("unknown passphrase", status_code=404)
         return HTMLResponse(watchlist_pages.render_history(
             db, row, editable=True, hp=_page_int(request, "hp"),
-            shop=request.query_params.get("shop", "tcgplayer")))
+            shop=request.query_params.get("shop", watchlist_pages.ALL)))
     finally:
         db.close()
 
@@ -5877,15 +6004,17 @@ async def export_csv(request: Request):
             return PlainTextResponse("unknown passphrase", status_code=404)
         out = io.StringIO()
         w = csv.writer(out)
-        w.writerow(["card", "set_code", "collector_number", "tcgplayer_usd",
-                    "cardkingdom_usd", "cardmarket_eur", "manapool_usd",
-                    "d7", "d7_pct", "d30", "d30_pct", "target_usd",
+        w.writerow(["card", "set_code", "collector_number", "price", "currency",
+                    "shop", "tcgplayer_usd", "cardkingdom_usd", "cardmarket_eur",
+                    "manapool_usd", "d7", "d7_pct", "d30", "d30_pct",
+                    "low", "low_date", "target", "target_rule",
                     "pct_to_target", "price_date"])
         for e in watchlist_db.current_entries(db, row["id"]):
             per_shop = {shop: watchlist_db.entry_price_summary(db, e, provider=shop)
-                        for shop in ("tcgplayer", "cardkingdom", "cardmarket",
-                                     "manapool")}
-            s = per_shop["tcgplayer"]
+                        for shop in watchlist_db.ALL_SHOPS}
+            # basis row: the pinned shop, else the cheapest USD market —
+            # the same numbers the board and the alerts use
+            s = watchlist_db.basis_summary(db, e)
 
             def pct(delta):
                 if not s or delta is None or s["current"] == delta:
@@ -5893,15 +6022,19 @@ async def export_csv(request: Request):
                 then = s["current"] - delta
                 return round(delta / then * 100, 1) if then else ""
 
-            tgt = e["target_price"]
+            tgt = watchlist_db.effective_target(db, e, s)
             w.writerow([
                 e["card_name"], e["set_code"] or "", e["collector_number"] or "",
+                s["current"] if s else "",
+                "EUR" if watchlist_db.entry_currency(e) == "€" else "USD",
+                s["provider"] if s else "",
                 *(per_shop[shop]["current"] if per_shop[shop] else ""
-                  for shop in ("tcgplayer", "cardkingdom", "cardmarket",
-                               "manapool")),
+                  for shop in watchlist_db.ALL_SHOPS),
                 s["d7"] if s else "", pct(s["d7"]) if s else "",
                 s["d30"] if s else "", pct(s["d30"]) if s else "",
+                s["low"] if s else "", s["low_date"] if s else "",
                 tgt if tgt is not None else "",
+                watchlist_targets.to_spec(e),
                 (round((s["current"] - tgt) / tgt * 100, 1)
                  if s and tgt else ""),
                 s["date"] if s else "",
@@ -5921,7 +6054,7 @@ async def share_page(request: Request):
         filling = _ensure_history_for(db, row)
         return HTMLResponse(watchlist_pages.render_main(
             db, row, editable=False, cp=_page_int(request, "cp"),
-            shop=request.query_params.get("shop", "tcgplayer"),
+            shop=request.query_params.get("shop", watchlist_pages.ALL),
             filling=filling,
             sort=request.query_params.get("sort", "target"),
             show_bought=request.query_params.get("bought") != "hide",
@@ -5938,14 +6071,18 @@ async def share_history_page(request: Request):
         if row is None:
             return HTMLResponse("unknown share code", status_code=404)
         return HTMLResponse(watchlist_pages.render_history(
-            db, row, editable=False, hp=_page_int(request, "hp")))
+            db, row, editable=False, hp=_page_int(request, "hp"),
+            shop=request.query_params.get("shop", watchlist_pages.ALL)))
     finally:
         db.close()
 
 
 @mcp.custom_route("/api/target", methods=["POST"])
 async def api_target(request: Request):
-    """Set or clear an entry's target from the page. Passphrase key only."""
+    """Set or clear an entry's target from the page. Passphrase key only.
+
+    `target_mode` 'low' installs the follow-the-historic-low rule with
+    `target_pct` percent under it; 'fixed' (default) stores `target_price`."""
     db = _wl_db()
     try:
         try:
@@ -5961,13 +6098,153 @@ async def api_target(request: Request):
         tp = body.get("target_price")
         if tp is not None and (not isinstance(tp, (int, float)) or tp < 0):
             return JSONResponse({"error": "bad target_price"}, status_code=400)
+        mode = body.get("target_mode", "fixed")
+        if mode not in watchlist_db.TARGET_MODES:
+            return JSONResponse({"error": "bad target_mode"}, status_code=400)
+        pct = body.get("target_pct", 0) or 0
+        if not isinstance(pct, (int, float)) or not 0 <= pct < 100:
+            return JSONResponse({"error": "bad target_pct"}, status_code=400)
         try:
             entry = watchlist_db.set_entry_target(
-                db, row["id"], int(body.get("entry_id", -1)), tp)
+                db, row["id"], int(body.get("entry_id", -1)), tp,
+                target_mode=mode, target_pct=pct)
         except watchlist_db.NotFound as e:
             return JSONResponse({"error": str(e)}, status_code=404)
         return JSONResponse({"entry_id": entry["entry_id"],
-                             "target_price": entry["target_price"]})
+                             "target_price": entry["target_price"],
+                             "target_mode": entry["target_mode"],
+                             "target_pct": entry["target_pct"],
+                             "effective": watchlist_db.effective_target(
+                                 db, entry, watchlist_db.basis_summary(db, entry))})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/shop", methods=["POST"])
+async def api_shop(request: Request):
+    """Pin an entry's price basis to one market (or clear it with null).
+    Passphrase key only."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        shop = body.get("shop") or None
+        if shop is not None and shop not in watchlist_db.ALL_SHOPS:
+            return JSONResponse({"error": "unknown shop"}, status_code=400)
+        try:
+            entry = watchlist_db.set_entry_shop(
+                db, row["id"], int(body.get("entry_id", -1)), shop)
+        except watchlist_db.NotFound as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        return JSONResponse({"entry_id": entry["entry_id"], "shop": entry["shop"]})
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/card/{key}/{entry_id}", methods=["GET"])
+async def api_card(request: Request):
+    """One card's chart at one shop, for the modal's market chips. Any key
+    (share pages compare markets too). `shop` is a market or 'basis'."""
+    db = _wl_db()
+    try:
+        row, _ = _resolve_page_key(db, request.path_params["key"])
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        try:
+            eid = int(request.path_params["entry_id"])
+        except ValueError:
+            return JSONResponse({"error": "bad entry"}, status_code=400)
+        entry = watchlist_db._find_entry(db, row["id"], entry_id=eid)
+        if entry is None:
+            return JSONResponse({"error": "no such entry"}, status_code=404)
+        shop = request.query_params.get("shop", "basis")
+        if shop != "basis" and shop not in watchlist_db.ALL_SHOPS:
+            return JSONResponse({"error": "unknown shop"}, status_code=400)
+        return JSONResponse(watchlist_pages.card_payload(db, dict(entry), shop))
+    finally:
+        db.close()
+
+
+def _import_spec(raw):
+    """Parse the page's default-target box: None (no default), a spec dict,
+    or False when the text is not a target at all."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    spec = watchlist_targets.parse_spec(str(raw))
+    return spec if spec is not None else False
+
+
+@mcp.custom_route("/api/import", methods=["POST"])
+async def api_import(request: Request):
+    """Paste-a-list import from the page: the bulk-add core behind
+    watchlist_bulk_add, phrased as JSON. Passphrase key only."""
+    db = _wl_db()
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        row, editable = _resolve_page_key(db, str(body.get("key", "")))
+        if row is None:
+            return JSONResponse({"error": "unknown key"}, status_code=404)
+        if not editable:
+            return JSONResponse({"error": "share codes are read-only"},
+                                status_code=403)
+        spec = _import_spec(body.get("target"))
+        if spec is False:
+            return JSONResponse({"error": "default target should be a price, "
+                                 "'low', 'low-10%', or '-20%'"}, status_code=400)
+        res = await _bulk_add_cards(
+            db, row, str(body.get("decklist") or "")[:60000],
+            note=str(body.get("note") or "").strip()[:200] or None,
+            default_spec=spec, pin_printings=bool(body.get("pin_printings")))
+        if res["error"]:
+            return JSONResponse({"error": res["error"]}, status_code=400)
+        return JSONResponse(res)
+    finally:
+        db.close()
+
+
+@mcp.custom_route("/api/create", methods=["POST"])
+async def api_create(request: Request):
+    """Forge a list from the page: mint (throttled like the tool and the
+    fork button), then seed it from pasted cards. The passphrase is in the
+    response and nowhere else."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "bad json"}, status_code=400)
+    if not _mint_allowed(_client_key(request)):
+        return JSONResponse({"error": "too many new lists from this address;"
+                             " try again later"}, status_code=429)
+    spec = _import_spec(body.get("target"))
+    if spec is False:
+        return JSONResponse({"error": "default target should be a price, "
+                             "'low', 'low-10%', or '-20%'"}, status_code=400)
+    db = _wl_db()
+    try:
+        label = str(body.get("label") or "").strip()[:80] or None
+        list_id, pp, sc = watchlist_db.create_list(db, label=label)
+        out = {"passphrase": pp, "share_code": sc,
+               "url": f"{PUBLIC_BASE}/mcp/{pp}", "page": f"{PUBLIC_BASE}/w/{pp}",
+               "share": f"{PUBLIC_BASE}/s/{sc}", "import": None}
+        decklist = str(body.get("decklist") or "")[:60000]
+        if decklist.strip():
+            row = watchlist_db.get_list(db, list_id)
+            out["import"] = await _bulk_add_cards(
+                db, row, decklist,
+                note=str(body.get("note") or "").strip()[:200] or None,
+                default_spec=spec,
+                pin_printings=bool(body.get("pin_printings")))
+        return JSONResponse(out)
     finally:
         db.close()
 
@@ -6075,11 +6352,14 @@ async def api_resolve(request: Request):
         entry = {"card_name": name, "set_code": set_code,
                  "collector_number": cn, "uuid": None}
         series = watchlist_db.price_series(
-            db, watchlist_db.uuids_for_entry(db, entry), days=90)
+            db, watchlist_db.uuids_for_entry(db, entry), days=90,
+            provider=watchlist_db.USD_SHOPS)
         points = series["points"] if series else []
+        faces = card.get("image_uris") or (card.get("card_faces") or [{}])[0].get("image_uris") or {}
         return JSONResponse({
             "name": name, "set_code": set_code, "collector_number": cn,
             "usd": (card.get("prices") or {}).get("usd"),
+            "image": faces.get("normal") or faces.get("small") or "",
             "chart": watchlist_pages._big_svg(points, name, "$") if points else "",
             "sites": watchlist_pages._site_links(entry, db),
         })
@@ -6109,13 +6389,35 @@ async def api_add(request: Request):
         tp = body.get("target_price")
         if tp is not None and (not isinstance(tp, (int, float)) or tp < 0):
             return JSONResponse({"error": "bad target_price"}, status_code=400)
+        target = {"target_price": tp} if tp is not None else {}
+        raw = body.get("target")                 # the page's free-text box
+        if raw is not None and str(raw).strip():
+            spec = watchlist_targets.parse_spec(str(raw))
+            if spec is None:
+                return JSONResponse({"error": "target should be a price, "
+                                     "'low', 'low-10%', or '-20%'"},
+                                    status_code=400)
+            if "pct_of_current" in spec:
+                # the preview step showed Scryfall's price; take it off that
+                try:
+                    card = await _scryfall_get("/cards/named", {"exact": name})
+                    usd = (card.get("prices") or {}).get("usd")
+                except Exception:
+                    usd = None
+                target = watchlist_targets.resolve(spec, float(usd) if usd else None)
+                if target is None:
+                    return JSONResponse({"error": "no Scryfall price to take a "
+                                         "percentage off — give a number"},
+                                        status_code=400)
+            else:
+                target = watchlist_targets.resolve(spec, None)
         _, entry = watchlist_db.add_card(
             db, row["id"], name,
             set_code=body.get("set_code") or None,
             collector_number=body.get("collector_number") or None,
-            target_price=tp,
-            note=str(body.get("note") or "").strip()[:200] or None)
-        backfilling = (not watchlist_db.entry_price_summary(db, entry)
+            note=str(body.get("note") or "").strip()[:200] or None,
+            **target)
+        backfilling = (not watchlist_db.basis_summary(db, entry)
                        and _schedule_backfill())
         return JSONResponse({"entry_id": entry["entry_id"],
                              "backfilling": backfilling})
@@ -6286,8 +6588,13 @@ async def price_history(params: PriceHistoryInput) -> str:
         uuids = watchlist_db.uuids_for_entry(db, {
             "card_name": params.name, "set_code": params.set_code,
             "collector_number": params.collector_number, "uuid": None})
+        provider = (watchlist_db.USD_SHOPS if params.provider == "all"
+                    else params.provider)
+        if provider not in watchlist_db.ALL_SHOPS and provider != watchlist_db.USD_SHOPS:
+            return (f"Unknown provider {params.provider!r} — use all, "
+                    + ", ".join(watchlist_db.ALL_SHOPS) + ".")
         series = watchlist_db.price_series(db, uuids, days=params.days,
-                                           provider=params.provider)
+                                           provider=provider)
         if not series or not series["points"]:
             return (f"No local history for '{params.name}'. It appears after a "
                     f"watchlist add + nightly ingest; for a spot price use "
@@ -6295,7 +6602,9 @@ async def price_history(params: PriceHistoryInput) -> str:
         pts = "\n".join(f"{d}: {p}" for d, p in series["points"])
         which = (f"{params.set_code.upper()} #{params.collector_number}"
                  if params.set_code else "cheapest printing")
-        return (f"# {params.name} — {params.provider}, {which} "
+        source = ("cheapest across TCGplayer, Card Kingdom and Mana Pool"
+                  if params.provider == "all" else params.provider)
+        return (f"# {params.name} — {source}, {which} "
                 f"({series['uuid']})\n```\n{pts}\n```")
     finally:
         db.close()

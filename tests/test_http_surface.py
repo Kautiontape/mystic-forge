@@ -336,7 +336,8 @@ def test_hits_sort_before_misses(db_path):
     with client() as c:
         page = c.get(f"/w/{pp}").text
     assert page.index("Hit One") < page.index("Miss One")
-    assert 'class="verdict verdict--buy"' in page and "BUY" in page
+    assert "<b>1</b><span>buy windows</span>" in page
+    assert 'class="verdict' not in page          # the BUY/WAIT banner is gone
 
 
 def test_freshness_shows_price_date_not_ingest_date(db_path):
@@ -405,6 +406,9 @@ def _sorting_fixture(db_path):
     list_id, pp, _ = watchlist_db.create_list(db)
     prices = {"Alpha": (10, 12.0), "Beta": (30, 28.0),
               "Gamma": (5, None), "Delta": (50, None), "Omega": (1, None)}
+    # dates relative to today: the deltas are measured from the real clock
+    today = datetime.date.today()
+    d = lambda days: (today - datetime.timedelta(days=days)).isoformat()  # noqa: E731
     for name, (cur, tgt) in prices.items():
         seq, _ = watchlist_db.add_card(db, list_id, name, target_price=tgt)
         u = f"u-{name}"
@@ -412,9 +416,9 @@ def _sorting_fixture(db_path):
                    (name, u))
         d7ref = {"Gamma": cur + 4, "Delta": cur - 1}.get(name, cur)
         d30ref = {"Gamma": cur + 1, "Delta": cur + 20}.get(name, cur)
-        watchlist_db.upsert_price(db, u, "2026-07-09", "tcgplayer", "normal", d30ref)
-        watchlist_db.upsert_price(db, u, "2026-08-01", "tcgplayer", "normal", d7ref)
-        watchlist_db.upsert_price(db, u, "2026-08-08", "tcgplayer", "normal", cur)
+        watchlist_db.upsert_price(db, u, d(30), "tcgplayer", "normal", d30ref)
+        watchlist_db.upsert_price(db, u, d(7), "tcgplayer", "normal", d7ref)
+        watchlist_db.upsert_price(db, u, d(0), "tcgplayer", "normal", cur)
         if name == "Omega":
             watchlist_db.set_bought(db, list_id, seq)
     db.close()
@@ -670,7 +674,7 @@ def test_api_bought_mutes_card_and_leaves_math(db_path):
     assert 'class="card bought"' in page
     assert "✓ bought" in page
     assert "<b>0</b><span>buy windows</span>" in page   # bought leaves the math
-    assert 'class="verdict"' not in page or "BUY" not in page
+    assert "<b>0</b><span>buy windows</span>" in page   # bought: no window
     with client() as c:                                  # and it's reversible
         c.post("/api/bought", json={"key": pp, "entry_id": seq, "bought": False})
         page = c.get(f"/w/{pp}").text
@@ -1307,3 +1311,325 @@ def test_the_version_helper_agrees_with_the_server_constant():
     """Two readers of one file. If they ever disagree the loop would force an
     ingest every hour, on every deploy, forever."""
     assert mystic_forge.version() == server.VERSION
+
+
+# ── 1.3.0: markets dropdown, target rules, export/import, the forge ──────────
+
+def _market_fixture(db_path, **card_kwargs):
+    """Sol Ring at three USD shops and Cardmarket; cheapest USD is Mana Pool."""
+    db = watchlist_db.connect(db_path)
+    list_id, pp, sc = watchlist_db.create_list(db, label="Markets")
+    seq, _ = watchlist_db.add_card(db, list_id, "Sol Ring", **card_kwargs)
+    db.execute("INSERT INTO card_uuids (card_name, uuid, scryfall_id) VALUES"
+               " ('Sol Ring','u1','abc-123')")
+    for prov, price in (("tcgplayer", 1.50), ("cardkingdom", 1.99),
+                        ("manapool", 1.10), ("cardmarket", 0.90)):
+        watchlist_db.upsert_price(db, "u1", "2026-09-13", prov, "normal", price + 0.2)
+        watchlist_db.upsert_price(db, "u1", "2026-09-14", prov, "normal", price)
+    db.close()
+    return list_id, pp, sc, seq
+
+
+def test_board_defaults_to_cheapest_usd_market_with_a_dropdown(db_path):
+    _, pp, _, _ = _market_fixture(db_path)
+    with client() as c:
+        page = c.get(f"/w/{pp}").text
+    assert 'id="shopSel"' in page and "All markets" in page
+    assert '<option value="all"' in page and '<option value="cardmarket"' in page
+    assert "$1.10" in page and "via Mana Pool" in page     # cheapest USD, tagged
+    assert "€0.90" not in page                              # EUR never mixed in
+    assert 'data-basis="manapool"' in page
+    assert 'class="verdict' not in page                     # BUY banner retired
+
+
+def test_dropdown_shop_shows_that_market_and_keeps_the_basis(db_path):
+    _, pp, _, _ = _market_fixture(db_path, target_price=1.20)
+    with client() as c:
+        default = c.get(f"/w/{pp}").text
+        ck = c.get(f"/w/{pp}?shop=cardkingdom").text
+        cm = c.get(f"/w/{pp}?shop=cardmarket").text
+    assert default.count('class="card hit"') == 1           # 1.10 ≤ 1.20
+    assert ck.count('class="card hit"') == 1 and "$1.99" in ck   # display CK, hit stays
+    assert cm.count('class="card hit"') == 1 and "€0.90" in cm
+    assert "target $1.20 (USD)" in cm                        # basis currency named
+    assert "judge the cheapest USD market" in cm
+
+
+def test_pinned_shop_is_the_card_basis(db_path):
+    _, pp, _, seq = _market_fixture(db_path, target_price=1.60, shop="tcgplayer")
+    with client() as c:
+        page = c.get(f"/w/{pp}").text
+    assert "$1.50" in page and "📌 TCGplayer" in page
+    assert page.count('class="card hit"') == 1               # 1.50 ≤ 1.60 at TCG
+    assert 'data-shop="tcgplayer"' in page
+
+
+def test_api_shop_pins_and_clears(db_path):
+    _, pp, sc, seq = _market_fixture(db_path)
+    with client() as c:
+        r = c.post("/api/shop", json={"key": pp, "entry_id": seq, "shop": "cardkingdom"})
+        assert r.status_code == 200 and r.json()["shop"] == "cardkingdom"
+        assert "$1.99" in c.get(f"/w/{pp}").text
+        r = c.post("/api/shop", json={"key": pp, "entry_id": seq, "shop": None})
+        assert r.json()["shop"] is None
+        assert c.post("/api/shop", json={"key": pp, "entry_id": seq,
+                                         "shop": "amazon"}).status_code == 400
+        assert c.post("/api/shop", json={"key": sc, "entry_id": seq,
+                                         "shop": "tcgplayer"}).status_code == 403
+
+
+def test_api_target_installs_a_follow_the_low_rule(db_path):
+    list_id, pp, _, seq = _market_fixture(db_path)
+    with client() as c:
+        r = c.post("/api/target", json={"key": pp, "entry_id": seq,
+                                        "target_mode": "low", "target_pct": 10})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["target_mode"] == "low" and body["target_pct"] == 10
+        # prior low on the USD basis is 1.30 (Mana Pool yesterday) → 1.17
+        assert body["effective"] == 1.17
+        page = c.get(f"/w/{pp}").text
+        assert "historic low −10% (now $1.17)" in page
+        assert 'data-mode="low"' in page and 'data-pct="10"' in page
+        assert c.post("/api/target", json={"key": pp, "entry_id": seq,
+                                           "target_mode": "banana"}).status_code == 400
+        assert c.post("/api/target", json={"key": pp, "entry_id": seq,
+                                           "target_mode": "low",
+                                           "target_pct": 150}).status_code == 400
+        # back to fixed
+        r = c.post("/api/target", json={"key": pp, "entry_id": seq,
+                                        "target_price": 2.0})
+        assert r.json()["target_mode"] == "fixed" and r.json()["effective"] == 2.0
+    hist = client().get(f"/w/{pp}/history").text
+    assert "→ historic low −10%" in hist and "→ $2.00" in hist
+
+
+def test_low_rule_lights_the_card_on_a_new_low(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring", target_mode="low")
+    db.execute("INSERT INTO card_uuids (card_name, uuid) VALUES ('Sol Ring','u1')")
+    watchlist_db.upsert_price(db, "u1", "2026-09-12", "tcgplayer", "normal", 2.0)
+    watchlist_db.upsert_price(db, "u1", "2026-09-13", "tcgplayer", "normal", 1.8)
+    watchlist_db.upsert_price(db, "u1", "2026-09-14", "tcgplayer", "normal", 1.7)
+    db.close()
+    page = client().get(f"/w/{pp}").text
+    assert page.count('class="card hit"') == 1 and "buy window" in page
+    assert "<b>1</b><span>buy windows</span>" in page
+
+
+def test_api_card_serves_one_market_for_the_modal(db_path):
+    _, pp, sc, seq = _market_fixture(db_path)
+    with client() as c:
+        r = c.get(f"/api/card/{sc}/{seq}?shop=cardmarket")     # share pages too
+        assert r.status_code == 200
+        d = r.json()
+        assert d["cur"] == "€" and d["current"] == 0.90 and d["low"] == 0.90
+        assert d["pts"] == [["2026-09-13", 1.1], ["2026-09-14", 0.9]]
+        assert "<svg" in d["chart"] and "2026-09-14" in d["tail"]
+        basis = c.get(f"/api/card/{pp}/{seq}").json()
+        assert basis["provider"] == "manapool" and basis["cur"] == "$"
+        assert c.get(f"/api/card/{pp}/{seq}?shop=ebay").status_code == 400
+        assert c.get(f"/api/card/{pp}/999").status_code == 404
+
+
+def test_modal_carries_image_markets_and_the_new_layout(db_path):
+    _, pp, sc, seq = _market_fixture(db_path)
+    with client() as c:
+        own = c.get(f"/w/{pp}").text
+        share = c.get(f"/s/{sc}").text
+    assert 'data-img="https://api.scryfall.com/cards/abc-123?format=image' in own
+    assert '&quot;manapool&quot;: {&quot;price&quot;: 1.1' in own   # data-shops JSON
+    assert 'id="cardImg"' in own and 'id="shopRow"' in own and 'id="kLow"' in own
+    assert '<details class="histbox">' in own                       # history folded away
+    assert 'id="followLow"' in own and 'id="basisSel"' in own       # target editor
+    assert 'id="scBeat"' in own and "Match historic low" in own
+    assert 'class="act ghost" id="removeBtn"' in own                # remove: far left
+    assert own.index('id="removeBtn"') < own.index('id="tgtSave"') < own.index('id="boughtBtn"')
+    assert 'id="followLow"' not in share and 'id="shopRow"' in share
+    # Card Kingdom and Mana Pool badges join the hop-outs
+    assert "cardkingdom.com/catalog/search" in own and "manapool.com/card/sol-ring" in own
+
+
+def test_image_falls_back_to_a_name_lookup(db_path):
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sram, Senior Edificer")
+    db.close()
+    page = client().get(f"/w/{pp}").text
+    assert ("api.scryfall.com/cards/named?exact=Sram%2C%20Senior%20Edificer"
+            "&amp;format=image") in page
+
+
+def test_export_dialog_and_data_on_both_pages(db_path):
+    list_id, pp, sc, seq = _market_fixture(db_path, target_price=5.0)
+    db = watchlist_db.connect(db_path)
+    watchlist_db.add_card(db, list_id, "Cultivate", set_code="CMM",
+                          collector_number="264", target_mode="low", target_pct=10)
+    db.close()
+    with client() as c:
+        own = c.get(f"/w/{pp}").text
+        share = c.get(f"/s/{sc}").text
+    for page in (own, share):
+        assert 'id="exportBtn"' in page and 'id="exportDlg"' in page
+        assert 'id="xTcg"' in page and 'id="xCk"' in page and 'id="xMp"' in page
+        assert "tcgplayer.com/massentry?productline=Magic&c=" in page
+        assert "cardkingdom.com/builder?c=" in page and "manapool.com/add-deck" in page
+        assert '"name": "Sol Ring", "set": "", "cn": "", "hit": true' in page
+        assert '"spec": "5.00"' in page
+        assert '"name": "Cultivate", "set": "CMM", "cn": "264", "hit": false' in page
+        assert '"spec": "low-10%"' in page
+    assert 'id="importBtn"' in own and 'id="importDlg"' in own
+    assert 'id="importBtn"' not in share and 'id="importDlg"' not in share
+    assert own.index('id="addCard"') < own.index('id="exportBtn"') < own.index('id="importBtn"')
+
+
+def test_export_button_hidden_on_an_empty_list(db_path):
+    db = watchlist_db.connect(db_path)
+    _, pp, _ = watchlist_db.create_list(db)
+    db.close()
+    assert 'id="exportBtn"' not in client().get(f"/w/{pp}").text
+
+
+def _fake_collection(monkeypatch, known):
+    """A /cards/collection fake keyed on name or set+number."""
+    async def _post(endpoint, body):
+        data = []
+        for ident in body["identifiers"]:
+            if "name" in ident:
+                card = known.get(ident["name"].lower())
+            else:
+                card = known.get((ident["set"].lower(), ident["collector_number"]))
+            if card:
+                data.append(card)
+        return {"data": data, "not_found": []}
+
+    async def _get(endpoint, params=None):
+        import httpx
+        req = httpx.Request("GET", "x://x")
+        raise httpx.HTTPStatusError("404", request=req,
+                                    response=httpx.Response(404, request=req))
+    monkeypatch.setattr(server, "_scryfall_post", _post)
+    monkeypatch.setattr(server, "_scryfall_get", _get)
+
+
+def test_api_import_parses_targets_and_pins_on_request(db_path, monkeypatch):
+    sol = {"name": "Sol Ring", "set": "cmm", "collector_number": "464",
+           "prices": {"usd": "2.00"}}
+    _fake_collection(monkeypatch, {"sol ring": sol, ("cmm", "464"): sol,
+                                   "rhystic study": {"name": "Rhystic Study",
+                                                     "prices": {"usd": "40"}},
+                                   "cultivate": {"name": "Cultivate", "prices": {}}})
+    db = watchlist_db.connect(db_path)
+    list_id, pp, sc = watchlist_db.create_list(db)
+    db.close()
+    text = ("1 Sol Ring (CMM) 464 @ -25%\n1x Rhystic Study @ low-10%\n"
+            "Cultivate @ 3\nNonexistent Card\n")
+    with client() as c:
+        assert c.post("/api/import", json={"key": sc, "decklist": text}).status_code == 403
+        assert c.post("/api/import", json={"key": pp, "decklist": text,
+                                           "target": "banana"}).status_code == 400
+        r = c.post("/api/import", json={"key": pp, "decklist": text, "note": "deck"})
+        assert r.status_code == 200
+        d = r.json()
+        assert sorted(d["added"]) == ["Cultivate", "Rhystic Study", "Sol Ring"]
+        assert d["skipped"] == ["Nonexistent Card"]
+    db = watchlist_db.connect(db_path)
+    got = {e["card_name"]: e for e in watchlist_db.current_entries(db, list_id)}
+    assert got["Sol Ring"]["set_code"] is None            # pins are opt-in
+    assert got["Sol Ring"]["target_price"] == 1.5         # 25% under $2.00
+    assert (got["Rhystic Study"]["target_mode"], got["Rhystic Study"]["target_pct"]) == ("low", 10.0)
+    assert got["Cultivate"]["target_price"] == 3.0
+    assert all(e["note"] == "deck" for e in got.values())
+    db.close()
+    with client() as c:
+        r = c.post("/api/import", json={"key": pp, "decklist": "1 Sol Ring (CMM) 464",
+                                        "pin_printings": True})
+        assert r.json()["added"] == ["Sol Ring"]           # a pinned copy is a new entry
+    db = watchlist_db.connect(db_path)
+    pinned = [e for e in watchlist_db.current_entries(db, list_id) if e["set_code"]]
+    assert pinned and pinned[0]["set_code"] == "CMM" and pinned[0]["collector_number"] == "464"
+    db.close()
+
+
+def test_forge_page_and_api_create(db_path, monkeypatch):
+    _fake_collection(monkeypatch, {"sol ring": {"name": "Sol Ring", "prices": {"usd": "2"}}})
+    with client() as c:
+        for path in ("/w/new", "/w/"):
+            r = c.get(path)
+            assert r.status_code == 200, path
+            assert 'id="forgeGo"' in r.text and 'id="newCards"' in r.text
+        r = c.post("/api/create", json={"label": "Forged", "decklist": "1 Sol Ring @ low",
+                                        "note": "seed"})
+        assert r.status_code == 200
+        d = r.json()
+        assert d["passphrase"] and d["share_code"].startswith("SC-")
+        assert d["page"].endswith(f"/w/{d['passphrase']}")
+        assert d["share"].endswith(f"/s/{d['share_code']}")
+        assert d["import"]["added"] == ["Sol Ring"]
+        board = c.get(f"/w/{d['passphrase']}").text
+        assert "Forged" in board and "Sol Ring" in board and "historic low" in board
+        # an empty forge is fine too
+        assert c.post("/api/create", json={}).json()["import"] is None
+        assert c.post("/api/create", json={"target": "??"}).status_code == 400
+
+
+def test_api_create_is_throttled_like_the_tool(db_path, monkeypatch):
+    monkeypatch.setattr(server, "MINT_LIMIT", 2)
+    server._mint_log.clear()
+    with client() as c:
+        assert c.post("/api/create", json={}).status_code == 200
+        assert c.post("/api/create", json={}).status_code == 200
+        assert c.post("/api/create", json={}).status_code == 429
+
+
+def test_api_add_accepts_a_target_rule(db_path, monkeypatch):
+    async def _get(endpoint, params=None):
+        return {"name": "Sol Ring", "prices": {"usd": "4.00"}}
+    monkeypatch.setattr(server, "_scryfall_get", _get)
+    db = watchlist_db.connect(db_path)
+    list_id, pp, _ = watchlist_db.create_list(db)
+    db.close()
+    with client() as c:
+        assert c.post("/api/add", json={"key": pp, "name": "Sol Ring",
+                                        "target": "low-5%"}).status_code == 200
+        assert c.post("/api/add", json={"key": pp, "name": "Cultivate",
+                                        "target": "-50%"}).status_code == 200
+        assert c.post("/api/add", json={"key": pp, "name": "Zzz",
+                                        "target": "nope"}).status_code == 400
+    db = watchlist_db.connect(db_path)
+    got = {e["card_name"]: e for e in watchlist_db.current_entries(db, list_id)}
+    assert (got["Sol Ring"]["target_mode"], got["Sol Ring"]["target_pct"]) == ("low", 5.0)
+    assert got["Cultivate"]["target_price"] == 2.0
+    db.close()
+
+
+def test_csv_export_reports_the_basis_and_the_rule(db_path):
+    _, pp, _, _ = _market_fixture(db_path, target_mode="low", target_pct=10)
+    with client() as c:
+        csv_text = c.get(f"/w/{pp}/export.csv").text
+    head, row = csv_text.strip().splitlines()[:2]
+    assert head.startswith("card,set_code,collector_number,price,currency,shop,")
+    cols = dict(zip(head.split(","), row.split(",")))
+    assert cols["price"] == "1.1" and cols["shop"] == "manapool"
+    assert cols["target_rule"] == "low-10%" and cols["target"] == "1.17"
+    assert cols["low"] == "1.1" and cols["low_date"] == "2026-09-14"
+
+
+def test_mint_throttle_ignores_a_spoofed_forwarded_header(db_path, monkeypatch):
+    """The first X-Forwarded-For entry is caller-written; rotating it must
+    not hand out fresh throttle buckets (the last hop is what the proxy
+    actually accepted)."""
+    monkeypatch.setattr(server, "MINT_LIMIT", 2)
+    server._mint_log.clear()
+    with client() as c:
+        for n in range(2):
+            r = c.post("/api/create", json={},
+                       headers={"x-forwarded-for": f"10.0.0.{n}, 203.0.113.9"})
+            assert r.status_code == 200
+        r = c.post("/api/create", json={},
+                   headers={"x-forwarded-for": "10.0.0.99, 203.0.113.9"})
+        assert r.status_code == 429
+        # a different accepted peer is a different bucket
+        assert c.post("/api/create", json={},
+                      headers={"cf-connecting-ip": "198.51.100.7"}).status_code == 200

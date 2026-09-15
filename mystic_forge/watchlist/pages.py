@@ -1,16 +1,21 @@
 """Server-rendered watchlist pages — the "arcane ledger".
 
 Catppuccin Latte (day) / Macchiato (night), serif display over mono data.
-Two views per list: the main board (cards + sparklines + verdict) and a
-separate history view (revision chain + fork/restore), Google-Docs style.
+Three views: the main board (cards + sparklines), a separate history view
+(revision chain + fork/restore, Google-Docs style), and the forge page that
+mints a new list from pasted cards.
 
 Semantics that keep the numbers honest (persona-review driven):
 - Unpinned cards chart the min-across-printings envelope (watchlist_db).
-- Targets are USD/tcgplayer-basis: hit state is computed against tcgplayer
-  regardless of the display shop, so "at target" never changes meaning.
+- Every card has a price *basis*: its pinned shop, else the cheapest of the
+  USD markets. Hit state is judged on the basis whatever the board's display
+  shop is, so "at target" never changes meaning when you flip the dropdown.
+- A target is a fixed number or a rule that follows the historic low
+  (watchlist/targets.py); the board shows the number the rule resolves to.
 - The freshness line shows the newest PRICE date, not the ingest date.
-All assets inline — no external requests. Revision-modal content is escaped
-client-side (X()) because it round-trips through innerHTML.
+Page assets inline; the browser reaches out only for the card face
+(Scryfall) and the MTGStocks id lookup. Modal content that round-trips
+through innerHTML is escaped client-side (X()).
 """
 
 import json
@@ -21,12 +26,15 @@ from html import escape as esc
 from . import db as watchlist_db
 from . import ingest as watchlist_ingest
 from . import mtgstocks
+from . import targets as watchlist_targets
 
 EVENTS_PER_PAGE = 15
 CARDS_PER_PAGE = 24
 
-SHOPS = {"tcgplayer": "$", "cardkingdom": "$", "cardmarket": "€",
-         "manapool": "$"}
+SHOPS = dict(watchlist_db.SHOP_CURRENCY)     # display shops → currency
+SHOP_NAMES = dict(watchlist_db.SHOP_NAMES)
+ALL = "all"                                   # the cheapest-across-USD view
+USD_LABEL = "cheapest of TCGplayer, Card Kingdom and Mana Pool"
 
 # Public path prefix stripped by the gateway (set from PUBLIC_BASE by server.py).
 # Every emitted link and fetch must include it; empty when served at the root.
@@ -35,8 +43,16 @@ PREFIX = ""
 PUBLIC_BASE = ""
 
 # Chart geometry shared with the inline JS crosshair (keep in sync there).
-CW, CH, CPAD = 640, 220, 34
+# The bottom margin is deeper than the top: it holds two rows of labels
+# (the low price, then the dates), which at phone-width axis sizes need it.
+CW, CH, CPAD, CPADB = 640, 236, 34, 50
 SW, SH = 240, 56
+
+# Where a card can be bought / looked up. Mana Pool numbers printings its own
+# way, so its badge links the card page (every printing) rather than guessing.
+TCG_MASSENTRY = "https://www.tcgplayer.com/massentry?productline=Magic&c="
+CK_BUILDER = "https://www.cardkingdom.com/builder?c="
+MP_ADDDECK = "https://manapool.com/add-deck"
 
 _CSS = """
 :root{
@@ -88,7 +104,7 @@ h1 .iconbtn{font-size:1.05rem;vertical-align:.35rem;margin-left:.2rem}
   margin:.35rem 0 .35rem .8rem}   /* quiet top-right cluster; title flows around */
 #theme{font-size:1.2rem}
 .subtitle{color:var(--sub);font-size:.85rem;margin:.35rem 0 1.2rem}
-.actions{display:flex;align-items:center;gap:.9rem;flex-wrap:wrap;margin-bottom:1.3rem}
+.actions{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:1.3rem}
 .mla{margin-left:auto}
 .textlink{font-family:var(--font-ui);font-size:.85rem;background:none;border:none;
   color:var(--sub);cursor:pointer;text-decoration:none;padding:.25rem .4rem;
@@ -101,6 +117,15 @@ button.chip{cursor:pointer}
 button.chip:hover{border-color:var(--overlay)}
 .shopgrp{display:inline-flex;align-items:center;gap:.4rem}
 .shoplbl{font-size:.8rem;color:var(--sub)}
+select.shopsel,select.sel{font-family:var(--font-ui);font-size:.85rem;color:var(--text);
+  background:var(--mantle);border:1px solid var(--surface1);border-radius:.5rem;
+  padding:.35rem 1.7rem .35rem .6rem;cursor:pointer;appearance:none;-webkit-appearance:none;
+  background-image:linear-gradient(45deg,transparent 50%,var(--sub) 50%),
+    linear-gradient(135deg,var(--sub) 50%,transparent 50%);
+  background-position:calc(100% - .95rem) 55%,calc(100% - .65rem) 55%;
+  background-size:.3rem .3rem;background-repeat:no-repeat}
+select.shopsel:hover,select.sel:hover{border-color:var(--lavender)}
+select.shopsel:focus-visible,select.sel:focus-visible{outline:2px solid var(--lavender);outline-offset:1px}
 .pagehead{font-size:1.1rem;letter-spacing:.05em;text-transform:uppercase;
   color:var(--sub);text-align:center;margin-bottom:.6rem}
 .sortbar{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;
@@ -114,15 +139,6 @@ button.chip:hover{border-color:var(--overlay)}
   color:var(--sub);text-decoration:none;border-bottom:2px solid transparent}
 .shops a.on{color:var(--text);border-bottom-color:var(--mauve);font-weight:600}
 .shops a:not(.on):hover{color:var(--text)}
-.verdict{font-family:var(--font-data);font-size:.9rem;background:var(--card);
-  border:none;border-left:3px solid var(--surface1);
-  border-radius:.5rem;padding:.65rem .95rem;margin-bottom:1rem;
-  backdrop-filter:blur(6px);line-height:1.7}
-.verdict--buy{border-left-color:var(--green)}
-.verdict--wait{border-left-color:var(--yellow)}
-.verdict .buy{color:var(--green-text);font-weight:600}
-.verdict .wait{color:var(--yellow-text);font-weight:600}
-.verdict .quiet{color:var(--sub)}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(9.5rem,1fr));
   gap:.8rem;margin-bottom:1.6rem}
 .stat{background:var(--card);border:none;border-radius:.7rem;
@@ -154,6 +170,8 @@ dialog h3{font-family:var(--font-display)}
   font-size:.78rem;margin:.15rem 0 .4rem;min-height:1em}
 .price{font-family:var(--font-data);font-size:1.5rem;font-weight:600;letter-spacing:-.01em}
 .price small{font-size:.7rem;color:var(--peach-text);font-weight:400}
+.price .via{font-family:var(--font-ui);font-size:.7rem;color:var(--sub);font-weight:400;
+  margin-left:.35rem;letter-spacing:0}
 .deltas{display:flex;gap:.7rem;font-family:var(--font-data);font-size:.75rem;
   color:var(--text);margin:.15rem 0 .35rem;flex-wrap:wrap}
 .deltas .lbl{color:var(--sub)}
@@ -200,8 +218,33 @@ dialog::backdrop{background:#0006;backdrop-filter:blur(3px);
 body:has(dialog[open]){overflow:hidden}   /* page can't scroll behind a sheet */
 @media(prefers-reduced-motion:reduce){
   dialog[open],dialog::backdrop,.card,.spark polyline{animation:none}}
-dialog h3{font-size:1.2rem;margin-bottom:.2rem}
+dialog h3{font-size:1.2rem;margin-bottom:.2rem;padding-right:2rem}
 dialog .sub{color:var(--sub);font-size:.8rem;margin-bottom:.8rem}
+dialog p.sub a{color:var(--sub)}
+/* ── card modal ── */
+.cardhead{display:flex;gap:1rem;align-items:stretch;margin-bottom:.9rem}
+.cardimg{width:8.6rem;flex:none;border-radius:.55rem;aspect-ratio:488/680;
+  object-fit:cover;background:var(--mantle);box-shadow:0 4px 14px var(--shadow)}
+.cardimg[hidden]{display:none}
+.kpis{display:grid;grid-template-columns:1fr 1fr;gap:.55rem;flex:1;align-content:start}
+.kpi{background:var(--card);border:1px solid var(--surface0);border-radius:.7rem;
+  padding:.55rem .75rem;min-width:0}
+.kpi b{display:block;font-family:var(--font-data);font-size:1.25rem;font-weight:600;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi span{font-size:.68rem;color:var(--sub);text-transform:uppercase;letter-spacing:.08em;
+  display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi.hit b{color:var(--green-text)}
+.shoprow{display:flex;gap:.4rem;flex-wrap:wrap;margin:0 0 .6rem;align-items:center}
+.shoprow .lbl{font-size:.75rem;color:var(--sub);margin-right:.1rem}
+.shopchip{font-family:var(--font-data);font-size:.74rem;border:1px solid var(--surface1);
+  background:var(--mantle);color:var(--text);border-radius:.5rem;padding:.25rem .6rem;
+  cursor:pointer;display:inline-flex;gap:.35rem;align-items:center}
+.shopchip .n{font-family:var(--font-ui);color:var(--sub)}
+.shopchip.on{border-color:var(--mauve);box-shadow:0 0 0 1px var(--mauve)}
+.shopchip.best{border-color:var(--green)}
+.shopchip.best .n::after{content:" ✓";color:var(--green-text)}
+.shopchip.pinned .n::before{content:"📌 "}
+.shopchip:disabled{opacity:.55;cursor:default}
 .chart-wrap{position:relative}
 .tip{position:absolute;pointer-events:none;background:var(--crust);border:1px solid var(--surface1);
   border-radius:.5rem;padding:.25rem .55rem;font-family:var(--font-data);font-size:.72rem;
@@ -211,41 +254,124 @@ dialog .sub{color:var(--sub);font-size:.8rem;margin-bottom:.8rem}
   border-radius:.45rem;padding:.2rem .55rem;color:var(--sub);text-decoration:none}
 .sites a:hover{border-color:var(--lavender);color:var(--text)}
 .sites a::after{content:" ↗";color:var(--sub)}
-.tgtedit{display:flex;gap:.5rem;align-items:center;margin-top:.7rem;flex-wrap:wrap}
-.tgtedit label{font-size:.8rem;color:var(--sub)}
-.tgtedit input,#renameInput{font-family:var(--font-data);font-size:.85rem;
+.tgtbox{background:var(--card);border:1px solid var(--surface0);border-radius:.8rem;
+  padding:.8rem .9rem;margin-top:.8rem}
+.tgtrow{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:.25rem 0}
+.tgtrow label,.sclbl{font-size:.8rem;color:var(--sub)}
+.tgtrow label.head{font-weight:600;color:var(--text)}
+.money{display:inline-flex;align-items:center;font-family:var(--font-data);
+  background:var(--mantle);border:1px solid var(--surface1);border-radius:.45rem;
+  padding:0 0 0 .5rem;color:var(--sub)}
+.money input{border:none;background:none;width:5.6rem;font-family:var(--font-data);
+  font-size:.9rem;color:var(--text);padding:.32rem .4rem}
+.money input:focus{outline:none}
+.money:focus-within{outline:2px solid var(--lavender);outline-offset:1px}
+.money input:disabled{color:var(--sub);font-style:italic}
+.money:has(input:disabled){background:var(--crust);border-style:dashed}
+.money:has(input:disabled)::after{content:"⟳";padding:0 .45rem 0 0;font-size:.8rem;color:var(--sub)}
+.tgtedit input,#renameInput,.tgtrow input.txt{font-family:var(--font-data);font-size:.85rem;
   background:var(--mantle);color:var(--text);border:1px solid var(--surface1);
   border-radius:.45rem;padding:.3rem .5rem}
+.tgtedit{display:flex;gap:.5rem;align-items:center;margin-top:.7rem;flex-wrap:wrap}
+.tgtedit label{font-size:.8rem;color:var(--sub)}
 .tgtedit input{width:6.5rem}
-#noteInput{width:14rem;flex:1 1 10rem}
+#noteInput{width:14rem;flex:1 1 12rem;min-width:0}
 #renameInput{width:100%;margin:.5rem 0}
+.sc{font-family:var(--font-ui);font-size:.76rem;border:1px solid var(--surface1);
+  background:var(--mantle);color:var(--text);border-radius:.45rem;padding:.28rem .55rem;
+  cursor:pointer;white-space:nowrap}
+.sc:hover{border-color:var(--lavender)}
+.pctin{font-family:var(--font-data);font-size:.76rem;width:5.2rem;background:var(--mantle);
+  color:var(--text);border:1px solid var(--surface1);border-radius:.45rem;padding:.26rem .4rem}
+.shortcuts{margin:.35rem 0 .1rem;border-top:1px dashed var(--surface0);padding-top:.4rem}
+.shortcuts[hidden]{display:none}
+.scrow{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;margin:.3rem 0}
+.scrow .sclbl{min-width:11rem}
+.scrow .sclbl b{font-family:var(--font-data);color:var(--text);font-weight:600}
+.switch{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;font-size:.82rem;
+  margin:.55rem 0 .2rem;cursor:pointer}
+.switch input{accent-color:var(--mauve);width:1rem;height:1rem}
+.switch select{font-size:.78rem;padding:.2rem 1.5rem .2rem .45rem}
+.hint{font-size:.74rem;color:var(--sub);margin:.15rem 0 0 1.5rem;font-style:italic}
+details.histbox{margin:.8rem 0 .6rem}
+details.histbox summary{cursor:pointer;color:var(--sub);font-size:.82rem;padding:.3rem 0;
+  list-style:none;display:flex;align-items:center;gap:.4rem}
+details.histbox summary::-webkit-details-marker{display:none}
+details.histbox summary::before{content:"▸";font-size:.8rem;transition:transform .15s}
+details.histbox[open] summary::before{transform:rotate(90deg)}
 .err{color:var(--red);font-family:var(--font-data);font-size:.75rem}
+.ok{color:var(--green-text);font-family:var(--font-data);font-size:.78rem}
 table.snap{width:100%;border-collapse:collapse;font-size:.84rem;margin:.5rem 0}
 table.snap th{text-align:left;color:var(--sub);font-size:.72rem;text-transform:uppercase;
   letter-spacing:.06em;padding:.3rem .5rem;border-bottom:1px solid var(--surface1)}
 table.snap td{padding:.32rem .5rem;border-bottom:1px solid var(--surface0)}
 table.snap td.num{font-family:var(--font-data)}
-.btnrow{display:flex;gap:.6rem;margin-top:.9rem;flex-wrap:wrap}
-button.act{font-family:inherit;font-size:.88rem;border-radius:.6rem;cursor:pointer;
-  padding:.45rem 1rem;border:1px solid var(--surface1);background:var(--mantle);color:var(--text)}
-button.act.primary{background:var(--mauve);border-color:var(--mauve);color:var(--base)}
-button.act.danger{color:var(--red);border-color:var(--red)}
-button.act:hover{filter:brightness(1.08)}
+.btnrow{display:flex;gap:.6rem;margin-top:.9rem;flex-wrap:wrap;align-items:center}
+.act{font-family:inherit;font-size:.88rem;border-radius:.6rem;cursor:pointer;
+  padding:.45rem 1rem;border:1px solid var(--surface1);background:var(--mantle);color:var(--text);
+  display:inline-flex;align-items:center;gap:.35rem;text-decoration:none;line-height:1.2}
+.act.primary{background:var(--mauve);border-color:var(--mauve);color:var(--base)}
+.act.secondary{background:var(--card);border-color:var(--lavender);color:var(--text)}
+.act.danger{color:var(--red);border-color:var(--red)}
+.act.ghost{background:none;border-color:transparent;color:var(--red)}
+.act.ghost:hover{background:var(--mantle)}
+.act:hover{filter:brightness(1.08)}
+.act:disabled{opacity:.5;cursor:default;filter:none}
 .xclose{position:absolute;top:.55rem;right:.75rem;background:none;border:none;
   color:var(--sub);font-size:1.15rem;cursor:pointer;line-height:1;padding:.2rem .4rem;
   border-radius:.4rem}
 .xclose:hover{background:var(--mantle);color:var(--text)}
 /* no position override on dialog: the UA's dialog:modal{position:fixed} must win,
    else the sheet anchors to the document and rides up with page scroll */
-.modalend{display:flex;gap:.6rem;margin-top:.9rem;justify-content:flex-start;
+.modalend{display:flex;gap:.6rem;margin-top:1rem;justify-content:flex-end;
   align-items:center;flex-wrap:wrap;position:sticky;bottom:-1.3rem;
-  background:var(--base);padding:.6rem 0;z-index:2}
-.modalend #removeBtn{margin-left:auto}
-#addInput{font-family:var(--font-data);font-size:.85rem;width:100%;margin:.5rem 0;
+  background:var(--base);padding:.7rem 0 .2rem;z-index:2;border-top:1px solid var(--surface0)}
+.modalend .left{margin-right:auto;display:flex;gap:.4rem;align-items:center}
+#addInput,textarea.box{font-family:var(--font-data);font-size:.85rem;width:100%;margin:.5rem 0;
   background:var(--mantle);color:var(--text);border:1px solid var(--surface1);
   border-radius:.45rem;padding:.35rem .5rem}
+textarea.box{min-height:7rem;resize:vertical;line-height:1.45}
+textarea.box:focus,#addInput:focus{outline:2px solid var(--lavender);outline-offset:1px}
 .secret{font-family:var(--font-data);background:var(--mantle);border:1px dashed var(--peach);
   border-radius:.5rem;padding:.5rem .7rem;margin:.5rem 0;word-break:break-all}
+/* ── export / import ── */
+.segs{display:flex;gap:.3rem;flex-wrap:wrap;align-items:center;margin:.2rem 0 .6rem}
+.segs label{font-size:.82rem;border:1px solid var(--surface1);border-radius:2rem;
+  padding:.28rem .8rem;cursor:pointer;display:inline-flex;gap:.35rem;align-items:center;
+  background:var(--mantle)}
+.segs label:has(input:checked){background:var(--mauve);border-color:var(--mauve);color:var(--base)}
+.segs input{position:absolute;opacity:0;width:0;height:0}
+.segs .cnt{font-family:var(--font-data);font-size:.72rem;opacity:.8}
+.picklist{max-height:13rem;overflow:auto;border:1px solid var(--surface0);border-radius:.6rem;
+  padding:.3rem .5rem;background:var(--card);margin-bottom:.6rem}
+.picklist label{display:flex;gap:.5rem;align-items:center;font-size:.82rem;padding:.22rem .1rem;
+  cursor:pointer;border-bottom:1px dashed var(--surface0)}
+.picklist label:last-child{border-bottom:none}
+.picklist input{accent-color:var(--mauve)}
+.picklist .pr{margin-left:auto;font-family:var(--font-data);font-size:.76rem;color:var(--sub);
+  white-space:nowrap}
+.picklist .hitmk{color:var(--green-text);font-size:.7rem}
+.picklist .bmk{color:var(--lavender);font-size:.7rem}
+.xopts{display:flex;gap:1rem;flex-wrap:wrap;font-size:.78rem;color:var(--sub);margin:.2rem 0}
+.xopts label{display:inline-flex;gap:.3rem;align-items:center;cursor:pointer}
+.xopts input{accent-color:var(--mauve)}
+.stores{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+.stores .lbl{font-size:.78rem;color:var(--sub);width:100%}
+/* ── forge (new list) page ── */
+.forge{max-width:40rem;margin:0 auto}
+.forge label.fl{display:block;font-size:.8rem;color:var(--sub);margin-top:.9rem}
+.forge input.txt{width:100%;font-family:var(--font-data);font-size:.9rem;background:var(--mantle);
+  color:var(--text);border:1px solid var(--surface1);border-radius:.45rem;padding:.45rem .6rem;
+  margin-top:.3rem}
+.forge .row{display:flex;gap:1rem;flex-wrap:wrap}
+.forge .row>div{flex:1 1 12rem}
+.forge .foot{margin-top:1rem}
+.forge .switch{flex-wrap:nowrap;align-items:flex-start}
+.forgelinks{line-height:2;font-size:.9rem;word-break:break-all}
+.forgelinks a,dialog .secret a,.claimlink{color:var(--blue)}
+.forgelinks code{font-family:var(--font-data);font-size:.82rem}
+.secret .chip{vertical-align:middle;margin-left:.3rem}
+.forge .switch input{flex:none;margin-top:.15rem}
 footer{margin-top:2.5rem;text-align:center;color:var(--sub);font-size:.75rem}
 footer a{color:var(--sub)}
 .axis{font-family:var(--font-data);font-size:11px;fill:var(--sub)}
@@ -256,14 +382,15 @@ footer a{color:var(--sub)}
   h1{font-size:1.6rem}                         /* full width; pencil rides inside */
   .iconbtn{font-size:1.35rem;padding:.45rem .6rem}
   .mright{float:none;justify-content:flex-end;margin:0 0 .3rem}
-  .actions{gap:.6rem}
+  .actions{gap:.5rem}
   .shopgrp{width:100%;margin-left:0}
-  .shops{display:flex;flex:1}
-  .shops a{flex:1;text-align:center;justify-content:center}
+  .shopgrp select{flex:1}
+  .shops{display:flex;flex:1;overflow-x:auto;scrollbar-width:none}
+  .shops a{flex:none;white-space:nowrap;text-align:center;justify-content:center}
   /* 44px-rule tap targets: height, not font inflation */
-  .chip,.shops a,.pnum,.textlink{min-height:2.75rem;display:inline-flex;align-items:center}
+  .chip,.shops a,.pnum,.textlink,.sc,.shopchip{min-height:2.75rem;display:inline-flex;align-items:center}
   .shops a{display:flex}
-  button.act{min-height:2.75rem;padding:.65rem 1.1rem}
+  .act{min-height:2.75rem;padding:.65rem 1.1rem}
   .xclose{padding:.6rem .8rem}
   .rev{padding:.75rem .3rem;flex-wrap:wrap}
   .rev .d{flex:1 1 100%;white-space:normal;order:9;padding-left:1.15rem}
@@ -271,25 +398,40 @@ footer a{color:var(--sub)}
   .stats{grid-template-columns:repeat(2,1fr);gap:.6rem}
   .stat{padding:.55rem .7rem}
   .stat b{font-size:1.1rem}
-  #addInput,#renameInput,.tgtedit input{font-size:1rem}  /* no iOS zoom-on-focus */
+  #addInput,#renameInput,.tgtedit input,.money input,textarea.box,.forge input.txt{font-size:1rem}  /* no iOS zoom-on-focus */
   .tgtedit input{width:8rem;padding:.5rem .6rem}
+  .cardimg{width:6.2rem}
+  .kpis{grid-template-columns:1fr 1fr;gap:.4rem}
+  .kpi{padding:.45rem .55rem}
+  .kpi b{font-size:1rem}
+  .kpi span{white-space:normal;font-size:.62rem;line-height:1.25}
+  .scrow .sclbl{min-width:100%}
   .axis{font-size:20px}                        /* ≈10px rendered at phone width */
   .badge,.deltas,.rev .a,.sites a,.tip,.boughtnote{font-size:.8rem}
   dialog{width:100vw;max-width:100vw;margin:auto 0 0;border-radius:1rem 1rem 0 0;
     max-height:92dvh;padding:1rem}
   dialog[open]{animation:sheetin .32s cubic-bezier(.2,.9,.3,1.02)}
+  .modalend{bottom:-1rem}
   .card::after{content:"›";position:absolute;top:.8rem;right:.9rem;
     color:var(--sub);font-size:1.1rem}
 }
 @keyframes sheetin{from{opacity:.4;transform:translateY(100%)}}
 """
 
+# Filled by _shell via a single JSON blob (no %-formatting: the JS is full of
+# literal percent signs).
 _JS = r"""
-const KEY=%(key)s, EDITABLE=%(editable)s, CPAD=%(cpad)d, CW=%(cw)d, CH=%(ch)d, CUR=%(cur)s;
-const P=%(prefix)s;                       // gateway path prefix, e.g. '/mtg'
+const CFG=__CFG__;
+const KEY=CFG.key, EDITABLE=CFG.editable, CPAD=CFG.cpad, CPADB=CFG.cpadb, CW=CFG.cw, CH=CFG.ch, CUR=CFG.cur;
+const P=CFG.prefix;                       // gateway path prefix, e.g. '/mtg'
+const SHOP=CFG.shop;                      // the board's display shop ('all' = cheapest USD)
+const SHOPN=CFG.shopNames, SHOPC=CFG.shopCur;
 const U=path=>P+path;                     // build a browser-correct URL
 const X=s=>String(s??'').replace(/[&<>"']/g,
   c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money=(v,c)=>v==null||v===''||isNaN(+v)?'—':(c||'$')+(+v).toFixed(2);
+const J=(el,body)=>fetch(U(el),{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(Object.assign({key:KEY},body))});
 // ── flashless navigation: every internal link and mutation morphs in place ──
 async function morphNavigate(url,push=true){
   try{
@@ -304,6 +446,8 @@ async function morphNavigate(url,push=true){
       document.querySelector('.wrap').replaceWith(nw);
       document.querySelectorAll('body > dialog').forEach(d=>d.remove());
       doc.querySelectorAll('body > dialog').forEach(d=>document.body.append(d));
+      document.querySelectorAll('body > script[type="application/json"]').forEach(d=>d.remove());
+      doc.querySelectorAll('body > script[type="application/json"]').forEach(d=>document.body.append(d));
       document.title=doc.title;
       wire();wireDialogs();
     };
@@ -316,15 +460,18 @@ async function morphNavigate(url,push=true){
 const normName=s=>s.toLowerCase().replace(/[^a-z0-9]/g,'');
 const refresh=()=>morphNavigate(location.href,false);
 window.onpopstate=()=>morphNavigate(location.href,false);
+const flash=(c,text)=>{
+  if(!c.style.minWidth){c.style.minWidth=c.getBoundingClientRect().width+'px';
+    c.style.textAlign='center'}
+  if(!c.dataset.orig)c.dataset.orig=c.textContent;
+  c.textContent=text;clearTimeout(c._t);
+  c._t=setTimeout(()=>{c.textContent=c.dataset.orig},1100);
+};
 const copyable=c=>c.onclick=e=>{
   e.stopPropagation();
   navigator.clipboard.writeText(c.dataset.copy.startsWith('/')
     ?location.origin+c.dataset.copy:c.dataset.copy);
-  if(!c.style.minWidth){c.style.minWidth=c.getBoundingClientRect().width+'px';
-    c.style.textAlign='center'}
-  if(!c.dataset.orig)c.dataset.orig=c.textContent;
-  c.textContent='copied \u2713';clearTimeout(c._t);
-  c._t=setTimeout(()=>{c.textContent=c.dataset.orig},900);
+  flash(c,'copied ✓');
 };
 const enterClicks=(inputId,btnId)=>{const i=document.getElementById(inputId);
   if(i)i.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();
@@ -332,7 +479,7 @@ const enterClicks=(inputId,btnId)=>{const i=document.getElementById(inputId);
 const keyable=el=>{el.setAttribute('tabindex','0');el.setAttribute('role','button');
   el.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();el.click()}}};
 const themeGlyph=()=>{const b=document.getElementById('theme');if(!b)return;
-  b.textContent=document.documentElement.dataset.theme==='latte'?'\u{1F319}':'\u2600\uFE0F';
+  b.textContent=document.documentElement.dataset.theme==='latte'?'\u{1F319}':'☀️';
   b.title='switch to '+(document.documentElement.dataset.theme==='latte'?'macchiato':'latte');};
 let pending=null;
 // ── wire(): bindings inside .wrap — rerun after every morph ──
@@ -349,6 +496,8 @@ function wire(){
   // internal links (shop tabs, pager, history/back chips) morph, never navigate
   document.querySelectorAll('.wrap a[href^="/"]').forEach(a=>
     a.onclick=e=>{e.preventDefault();morphNavigate(a.getAttribute('href'))});
+  const shopSel=document.getElementById('shopSel');
+  if(shopSel)shopSel.onchange=()=>morphNavigate(shopSel.selectedOptions[0].dataset.href);
   const renameBtn=document.getElementById('rename');
   if(renameBtn)renameBtn.onclick=()=>{
     document.getElementById('renameInput').value=renameBtn.dataset.label||'';
@@ -363,8 +512,18 @@ function wire(){
     document.getElementById('addInput').value='';
     document.getElementById('addDlg').showModal();
     document.getElementById('addInput').focus();};
+  const exportBtn=document.getElementById('exportBtn');
+  if(exportBtn)exportBtn.onclick=openExport;
+  const importBtn=document.getElementById('importBtn');
+  if(importBtn)importBtn.onclick=()=>{
+    document.getElementById('imOut').innerHTML='';
+    document.getElementById('imErr').textContent='';
+    document.getElementById('importDlg').showModal();
+    document.getElementById('imText').focus();};
   const alertsBtn=document.getElementById('alerts');
   if(alertsBtn)alertsBtn.onclick=()=>document.getElementById('alertsDlg').showModal();
+  const forgeBtn=document.getElementById('forgeGo');
+  if(forgeBtn)forgeBtn.onclick=forgeFlow;
   if(document.getElementById('cardDlg'))
     document.querySelectorAll('.card[data-name]').forEach(wireCard);
   if(document.getElementById('revDlg'))
@@ -400,8 +559,7 @@ function wireDialogs(){
     b.onclick=()=>b.closest('dialog').close());
   const renameSave=document.getElementById('renameSave');
   if(renameSave){renameSave.onclick=async()=>{
-    const r=await fetch(U('/api/rename'),{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({key:KEY,label:document.getElementById('renameInput').value})});
+    const r=await J('/api/rename',{label:document.getElementById('renameInput').value});
     if(r.ok){document.getElementById('renameDlg').close();refresh()}
     else document.getElementById('renameErr').textContent='could not rename';
   };enterClicks('renameInput','renameSave');}
@@ -410,37 +568,39 @@ function wireDialogs(){
     addLookup.onclick=async()=>{
       const q=document.getElementById('addInput').value.trim();if(!q)return;
       document.getElementById('addErr').textContent='';
-      document.getElementById('addPreview').innerHTML='<p class=sub>consulting Scryfall\u2026</p>';
-      const r=await fetch(U('/api/resolve'),{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({key:KEY,query:q})});
+      document.getElementById('addPreview').innerHTML='<p class=sub>consulting Scryfall…</p>';
+      const r=await J('/api/resolve',{query:q});
       if(!r.ok){document.getElementById('addPreview').innerHTML='';
         document.getElementById('addErr').textContent=(await r.json()).error||'not found';return}
       pending=await r.json();
       const printing=pending.set_code?` <span class=badge>${X(pending.set_code.toUpperCase())} #${X(pending.collector_number)}</span>`:'';
       document.getElementById('addPreview').innerHTML=
-        `<h3>${X(pending.name)}${printing}</h3>`+
-        (pending.usd?`<div class=price>$${(+pending.usd).toFixed(2)}</div>`:'')+
-        (pending.chart||'<p class=nodata>Local history arrives after tonight\u2019s ingest.</p>')+
+        `<div class=cardhead>`+(pending.image?`<img class=cardimg src="${X(pending.image)}" alt="">`:'')+
+        `<div><h3>${X(pending.name)}${printing}</h3>`+
+        (pending.usd?`<div class=price>$${(+pending.usd).toFixed(2)} <span class=via>Scryfall market</span></div>`:'')+
+        `</div></div>`+
+        (pending.chart||'<p class=nodata>Local history arrives after tonight’s ingest.</p>')+
         (pending.sites||'')+
-        `<div class=tgtedit><label>target price ($)</label>`+
-        `<input id=addTarget type=number step=0.01 min=0 placeholder=none>`+
-        `<label>note</label><input id=addNote type=text maxlength=200 `+
-        `placeholder="e.g. deck name"></div>`;
+        `<div class=tgtedit><label for=addTarget>target</label>`+
+        `<input id=addTarget type=text placeholder="e.g. 5, low, -20%" style="width:9rem">`+
+        `<label for=addNote>note</label><input id=addNote type=text maxlength=200 `+
+        `placeholder="e.g. deck name"></div>`+
+        `<p class=hint style="margin-left:0">A number is a fixed target; “low” follows the historic low `+
+        `(“low-10%” stays 10% under it); “-20%” means 20% under today’s price.</p>`;
       document.getElementById('addGo').style.display='';
     };
     enterClicks('addInput','addLookup');
     document.getElementById('addGo').onclick=async()=>{
       const t=document.getElementById('addTarget');
       const n=document.getElementById('addNote');
-      const r=await fetch(U('/api/add'),{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({key:KEY,name:pending.name,set_code:pending.set_code,
+      const r=await J('/api/add',{name:pending.name,set_code:pending.set_code,
           collector_number:pending.collector_number,
-          target_price:t&&t.value.trim()!==''?+t.value:null,
-          note:n&&n.value.trim()!==''?n.value.trim():null})});
-      if(!r.ok){document.getElementById('addErr').textContent='could not add';return}
+          target:t&&t.value.trim()!==''?t.value.trim():null,
+          note:n&&n.value.trim()!==''?n.value.trim():null});
+      if(!r.ok){document.getElementById('addErr').textContent=(await r.json()).error||'could not add';return}
       const d=await r.json();
       if(d.backfilling)document.getElementById('addPreview').innerHTML+=
-        '<p class=sub>added \u2713 \u2014 pulling 90 days of history from the '+
+        '<p class=sub>added ✓ — pulling 90 days of history from the '+
         'cached price data; it appears within a minute or two.</p>';
       setTimeout(()=>{document.getElementById('addDlg').close();refresh()},
                  d.backfilling?1500:0);
@@ -448,9 +608,8 @@ function wireDialogs(){
   }
   const boughtBtn=document.getElementById('boughtBtn');
   if(boughtBtn)boughtBtn.onclick=async()=>{
-    const r=await fetch(U('/api/bought'),{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({key:KEY,entry_id:+boughtBtn.dataset.entry,
-                           bought:!boughtBtn.dataset.bought})});
+    const r=await J('/api/bought',{entry_id:+boughtBtn.dataset.entry,
+                                   bought:!boughtBtn.dataset.bought});
     if(r.ok){document.getElementById('cardDlg').close();refresh()}
   };
   const removeBtn=document.getElementById('removeBtn');
@@ -461,31 +620,13 @@ function wireDialogs(){
       document.getElementById('rmConfirm').style.display='none';
       removeBtn.style.display='';};
     document.getElementById('rmYes').onclick=async()=>{
-      const r=await fetch(U('/api/remove'),{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({key:KEY,entry_id:+removeBtn.dataset.entry})});
+      const r=await J('/api/remove',{entry_id:+removeBtn.dataset.entry});
       if(r.ok){document.getElementById('cardDlg').close();refresh()}
     };
   }
-  const tgtSave=document.getElementById('tgtSave');
-  if(tgtSave){tgtSave.onclick=async()=>{
-    const te=document.getElementById('tgtEdit'),eid=+te.dataset.entry;
-    const tv=document.getElementById('tgtInput').value.trim();
-    const nv=document.getElementById('noteInput').value.trim();
-    const calls=[];                       // only send what actually changed
-    if(tv!==(te.dataset.target||''))
-      calls.push(['/api/target',{key:KEY,entry_id:eid,
-                                 target_price:tv===''?null:+tv}]);
-    if(nv!==(te.dataset.note||''))
-      calls.push(['/api/note',{key:KEY,entry_id:eid,note:nv}]);
-    if(!calls.length){document.getElementById('cardDlg').close();return}
-    for(const [ep,payload] of calls){
-      const r=await fetch(U(ep),{method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify(payload)});
-      if(!r.ok){document.getElementById('tgtErr').textContent='could not save';return}
-    }
-    document.getElementById('cardDlg').close();refresh();
-  };enterClicks('tgtInput','tgtSave');enterClicks('noteInput','tgtSave');}
+  wireTargetEditor();
+  wireExport();
+  wireImport();
   const forkBtn=document.getElementById('forkBtn');
   if(forkBtn){
     forkBtn.onclick=e=>doFork('fork',e.target.dataset.seq);
@@ -496,16 +637,44 @@ function wireDialogs(){
 async function claimFlow(){
   const dlg=document.getElementById('claimDlg');dlg.showModal();
   const out=document.getElementById('claimOut');
-  out.innerHTML='<p class=sub>minting your copy\u2026</p>';
-  const r=await fetch(U('/api/fork'),{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({key:KEY,mode:'fork'})});
+  out.innerHTML='<p class=sub>minting your copy…</p>';
+  const r=await J('/api/fork',{mode:'fork'});
   if(!r.ok){out.innerHTML='<p class=err>could not create a copy</p>';return}
   const d=await r.json();
-  out.innerHTML=`<div class=secret>Your key (screenshot this \u2014 it is shown once):<br>`+
-    `<b>${d.passphrase}</b></div>`+
-    `<p class=sub>That key is how you edit your list \u2014 open `+
-    `<a href="${d.page}">your page</a> or tell it to Claude in chat. `+
+  out.innerHTML=`<div class=secret>Your key (screenshot this — it is shown once):<br>`+
+    `<b>${X(d.passphrase)}</b></div>`+
+    `<p class=sub>That key is how you edit your list — open `+
+    `<a href="${X(d.page)}">your page</a> or tell it to Claude in chat. `+
     `Your copy starts with everything on this board and is yours alone.</p>`;
+}
+/* ── the forge page: mint a list, optionally seeded from pasted cards ── */
+async function forgeFlow(){
+  const btn=document.getElementById('forgeGo'),out=document.getElementById('forgeOut');
+  btn.disabled=true;out.hidden=false;out.innerHTML='<p class=sub>forging…</p>';
+  const r=await fetch(U('/api/create'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({label:document.getElementById('newLabel').value.trim(),
+      decklist:document.getElementById('newCards').value,
+      note:document.getElementById('newNote').value.trim(),
+      target:document.getElementById('newTarget').value.trim(),
+      pin_printings:document.getElementById('newPin').checked})});
+  btn.disabled=false;
+  if(!r.ok){out.innerHTML='<p class=err>'+X((await r.json().catch(()=>({}))).error||'could not create the list')+'</p>';return}
+  const d=await r.json();
+  const copy=(v,label)=>`<button class=chip data-copy="${X(v)}" title="Copy ${label}">${label} ⧉</button>`;
+  let h=`<div class=secret>⚠ shown once — your passphrase:<br><b>${X(d.passphrase)}</b> `+copy(d.passphrase,'copy')+`</div>`+
+    `<p class=sub>The passphrase <i>is</i> the list: anyone holding it can edit. `+
+    `Keep it somewhere safe or tell it to Claude in chat.</p>`+
+    `<p class=forgelinks><b>Board</b> <a href="${X(d.page)}">${X(d.page)}</a> ${copy(d.page,'copy link')}<br>`+
+    `<b>Connector URL</b> for Claude <code>${X(d.url)}</code> ${copy(d.url,'copy')}<br>`+
+    `<b>Read-only share</b> <code>${X(d.share_code)}</code> · <a href="${X(d.share)}">${X(d.share)}</a> ${copy(d.share,'copy link')}</p>`;
+  if(d.import){const i=d.import;
+    h+=`<p class=sub><span class=ok>Added ${i.added.length} card(s)</span>`+(i.updated.length?`, ${i.updated.length} merged`:'')+
+      (i.skipped.length?` · <span class=err>${i.skipped.length} not recognised: ${X(i.skipped.slice(0,12).join(', '))}</span>`:'')+'.</p>';
+    if(i.error)h+=`<p class=err>${X(i.error)}</p>`;}
+  h+=`<div class=btnrow><a class="act primary" style="text-decoration:none" href="${X(d.page)}">Open the board →</a></div>`;
+  out.innerHTML=h;out.hidden=false;
+  out.querySelectorAll('[data-copy]').forEach(copyable);
+  document.getElementById('forgeForm').hidden=true;
 }
 /* MTGStocks refuses this server's hosting provider outright, so the badge
    cannot be rendered server-side. Your browser can reach them, and it is
@@ -553,10 +722,7 @@ async function maybeStocks(card){
     if(!hit)return;
     url=hit.url;
     try{localStorage.setItem(ck,url);}catch(e){}
-    fetch(U('/api/mtgstocks'),{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({key:KEY,card_name:name,set_code:set,
-                           print_id:hit.id,slug:hit.slug})}).catch(()=>{});
+    J('/api/mtgstocks',{card_name:name,set_code:set,print_id:hit.id,slug:hit.slug}).catch(()=>{});
   }
   /* The dialog is shared, so a slow lookup must not land on another card. */
   if(document.getElementById('cardTitle').textContent!==name)return;
@@ -567,39 +733,262 @@ async function maybeStocks(card){
   box.insertBefore(a,box.lastElementChild);
   card.dataset.sites=host.innerHTML;
 }
+/* ── card modal ── */
+let M=null;                                   // the card the modal is showing
+function kpi(id,val,lbl,cls){const el=document.getElementById(id);if(!el)return;
+  el.querySelector('b').textContent=val;el.querySelector('span').textContent=lbl;
+  el.className='kpi'+(cls?' '+cls:'');}
+function renderShops(){
+  const row=document.getElementById('shopRow');if(!row)return;
+  const shops=M.shops||{};let h='<span class=lbl>markets</span>';
+  const best=M.basisProv;
+  for(const s of ['tcgplayer','cardkingdom','manapool','cardmarket']){
+    const p=shops[s];const on=M.view===s?' on':'';
+    const cls=(M.shop===s?' pinned':'')+(best===s&&!M.shop?' best':'')+(p?'':' none');
+    h+=`<button class="shopchip${on}${cls}" data-shop="${s}"${p?'':' disabled'} `+
+       `title="${p?X(SHOPN[s])+' on '+X(p.date):'no price at '+X(SHOPN[s])}">`+
+       `<span class=n>${X(SHOPN[s])}</span>${p?money(p.price,SHOPC[s]):'—'}</button>`;
+  }
+  row.innerHTML=h;
+  row.querySelectorAll('.shopchip').forEach(b=>b.onclick=()=>viewShop(b.dataset.shop));
+}
+async function viewShop(shop){
+  if(!M||M.view===shop)return;
+  const eid=M.entry;
+  const r=await fetch(U('/api/card/'+encodeURIComponent(KEY)+'/'+eid+'?shop='+encodeURIComponent(shop)));
+  if(!r.ok||!M||M.entry!==eid)return;
+  const d=await r.json();
+  M.view=shop;
+  document.getElementById('chartHost').innerHTML=d.chart||'<p class=nodata>Not enough history yet.</p>';
+  document.getElementById('snapHost').innerHTML=d.tail||'';
+  document.getElementById('cardSub').textContent=M.sub0+' · viewing '+SHOPN[shop];
+  kpi('kNow',money(d.current,d.cur),'now · '+SHOPN[shop]);
+  kpi('kLow',money(d.low,d.cur),'lowest · '+(d.low_date||'—'));
+  if(d.pts&&d.pts.length)armCrosshair(d.pts,d.cur);
+  renderShops();
+}
 function wireCard(card){
   keyable(card);
   card.onclick=()=>{
-    const cardDlg=document.getElementById('cardDlg');
-    document.getElementById('cardTitle').textContent=card.dataset.name;
-    document.getElementById('cardSub').textContent=card.dataset.sub;
-    document.getElementById('chartHost').innerHTML=card.dataset.chart||'';
-    document.getElementById('snapHost').innerHTML=card.dataset.tail||'';
-    document.getElementById('siteHost').innerHTML=card.dataset.sites||'';
+    const cardDlg=document.getElementById('cardDlg'),d=card.dataset;
+    const shops=d.shops?JSON.parse(d.shops):{};
+    M={entry:+d.entry,name:d.name,set:d.set||'',shop:d.shop||'',mode:d.mode||'fixed',
+       pct:+(d.pct||0),target:d.target||'',note:d.note||'',cur:d.cur||'$',
+       current:d.current!==''?+d.current:null,low:d.low!==''?+d.low:null,lowDate:d.lowdate||'',
+       ref:d.ref!==''?+d.ref:null,eff:d.eff!==''?+d.eff:null,hit:!!d.hit,
+       shops:shops,basisProv:d.basis||'',sub0:d.sub,view:d.shop||'basis'};
+    document.getElementById('cardTitle').textContent=d.name;
+    document.getElementById('cardSub').textContent=d.sub;
+    const im=document.getElementById('cardImg');
+    if(im){if(d.img){im.hidden=false;im.src=d.img;im.alt=d.name+' card face';}
+      else{im.hidden=true;im.removeAttribute('src');}}
+    document.getElementById('chartHost').innerHTML=d.chart||'<p class=nodata>Not enough history yet.</p>';
+    document.getElementById('snapHost').innerHTML=d.tail||'';
+    document.getElementById('siteHost').innerHTML=d.sites||'';
+    const where=M.shop?SHOPN[M.shop]+' (pinned)':(M.basisProv?SHOPN[M.basisProv]:'—');
+    kpi('kNow',money(M.current,M.cur),'now · '+where);
+    kpi('kLow',money(M.low,M.cur),'lowest · '+(M.lowDate||'—'));
+    const tl=M.eff!=null?money(M.eff,M.cur):(M.mode==='low'?'—':'none');
+    kpi('kTarget',tl,M.mode==='low'?'target · follows the low':'target',M.hit?'hit':'');
+    const d30=d.d30!==''?+d.d30:null;
+    kpi('kD30',d30==null?'—':(d30<0?'▼':d30>0?'▲':'·')+money(Math.abs(d30),M.cur).slice(0),'30-day change');
+    renderShops();
     const te=document.getElementById('tgtEdit');
-    if(te){te.dataset.entry=card.dataset.entry;
-      te.dataset.target=card.dataset.target||'';
-      te.dataset.note=card.dataset.note||'';
-      document.getElementById('tgtInput').value=card.dataset.target||'';
-      document.getElementById('noteInput').value=card.dataset.note||'';
-      document.getElementById('tgtErr').textContent='';}
+    if(te){te.dataset.entry=d.entry;
+      document.getElementById('noteInput').value=M.note;
+      document.getElementById('tgtErr').textContent='';
+      document.getElementById('tgtCur').textContent=M.cur;
+      const bs=document.getElementById('basisSel');if(bs)bs.value=M.shop;
+      document.getElementById('scCur').textContent=money(M.current,M.cur);
+      document.getElementById('scLow').textContent=money(M.low,M.cur);
+      document.getElementById('shortcuts').hidden=true;
+      document.getElementById('scMore').textContent='More shortcuts ▾';
+      const fl=document.getElementById('followLow');fl.checked=M.mode==='low';
+      const fp=document.getElementById('followPct');
+      fp.querySelectorAll('option[data-custom]').forEach(o=>o.remove());
+      if(![...fp.options].some(o=>+o.value===M.pct)){   /* a rule typed as low-15% keeps its 15 */
+        const o=document.createElement('option');o.value=String(M.pct);o.dataset.custom='1';
+        o.textContent=M.pct?`stay ${M.pct}% below`:'match it';fp.append(o);}
+      fp.value=String(M.pct);
+      document.getElementById('tgtInput').value=M.mode==='fixed'?M.target:'';
+      syncFollow();}
     const bb=document.getElementById('boughtBtn'),rb=document.getElementById('removeBtn');
-    if(bb){bb.dataset.entry=card.dataset.entry;
-      bb.textContent=card.dataset.bought?'Not bought after all':'Bought \u2713';
-      bb.dataset.bought=card.dataset.bought||'';}
-    if(rb){rb.dataset.entry=card.dataset.entry;
+    if(bb){bb.dataset.entry=d.entry;
+      bb.textContent=d.bought?'Not bought after all':'Bought ✓';
+      bb.dataset.bought=d.bought||'';}
+    if(rb){rb.dataset.entry=d.entry;
       document.getElementById('rmConfirm').style.display='none';rb.style.display='';}
-    const pts=card.dataset.pts?JSON.parse(card.dataset.pts):[];
-    if(pts.length)armCrosshair(pts);
+    const pts=d.pts?JSON.parse(d.pts):[];
+    if(pts.length)armCrosshair(pts,M.cur);
     cardDlg.showModal();
     maybeStocks(card);
+    /* the board is showing one market: open the chart on that market too */
+    if(SHOP!=='all'&&SHOP!==M.view&&shops[SHOP])viewShop(SHOP);
+  };
+}
+/* ── target editor: fixed number or follow-the-low rule ── */
+function syncFollow(){
+  const fl=document.getElementById('followLow'),inp=document.getElementById('tgtInput');
+  const pct=+document.getElementById('followPct').value;
+  const hint=document.getElementById('followHint');
+  if(fl.checked){
+    inp.disabled=true;
+    const ref=M&&M.ref!=null?M.ref:null;
+    inp.value=ref!=null?(ref*(1-pct/100)).toFixed(2):'';
+    inp.placeholder=ref!=null?'':'needs 2 days of history';
+    hint.textContent=ref!=null
+      ?`Lowest before today: ${money(ref,M.cur)}${pct?` → ${pct}% under it is ${money(ref*(1-pct/100),M.cur)}`:''}. Each new low moves the target.`
+      :'Two days of price history are needed before the low can be followed; the rule is saved now and starts working then.';
+  }else{inp.disabled=false;inp.placeholder='none';hint.textContent='';}
+}
+function setFixed(v){
+  const fl=document.getElementById('followLow');fl.checked=false;syncFollow();
+  document.getElementById('tgtInput').value=v==null?'':(Math.max(0,v)).toFixed(2);
+}
+function wireTargetEditor(){
+  const te=document.getElementById('tgtEdit');if(!te)return;
+  const fl=document.getElementById('followLow');
+  fl.onchange=syncFollow;
+  document.getElementById('followPct').onchange=()=>{if(!fl.checked){fl.checked=true}syncFollow()};
+  document.getElementById('scMore').onclick=()=>{const s=document.getElementById('shortcuts');
+    s.hidden=!s.hidden;document.getElementById('scMore').textContent=s.hidden?'More shortcuts ▾':'Fewer shortcuts ▴'};
+  const cur=()=>M&&M.current!=null?M.current:null;
+  const low=()=>M&&M.low!=null?M.low:null;      /* the KPI's number: lowest ever, today included */
+  document.getElementById('scBeat').onclick=()=>{const c=cur();if(c!=null)setFixed(Math.floor((c-0.01)*100)/100)};
+  document.getElementById('scMatchLow').onclick=()=>{const l=low();if(l!=null)setFixed(l)};
+  te.querySelectorAll('.sc[data-from]').forEach(b=>b.onclick=()=>{
+    const base=b.dataset.from==='cur'?cur():low();if(base==null)return;
+    setFixed(base*(1-(+b.dataset.pct)/100));});
+  te.querySelectorAll('.pctin').forEach(i=>i.onchange=()=>{
+    const base=i.dataset.from==='cur'?cur():low();const p=+i.value;
+    if(base==null||!(p>=0&&p<100))return;setFixed(base*(1-p/100));i.value='';});
+  const save=document.getElementById('tgtSave');
+  save.onclick=async()=>{
+    const eid=+te.dataset.entry;
+    const mode=fl.checked?'low':'fixed';
+    const pct=+document.getElementById('followPct').value;
+    const tv=document.getElementById('tgtInput').value.trim();
+    const nv=document.getElementById('noteInput').value.trim();
+    const bs=document.getElementById('basisSel');
+    const calls=[];                       // only send what actually changed
+    const tgtChanged=mode!==M.mode||(mode==='low'&&pct!==M.pct)||(mode==='fixed'&&tv!==M.target);
+    if(tgtChanged)calls.push(['/api/target',{entry_id:eid,
+      target_price:mode==='fixed'?(tv===''?null:+tv):null,target_mode:mode,target_pct:pct}]);
+    if(nv!==M.note)calls.push(['/api/note',{entry_id:eid,note:nv}]);
+    if(bs&&bs.value!==M.shop)calls.push(['/api/shop',{entry_id:eid,shop:bs.value||null}]);
+    if(!calls.length){document.getElementById('cardDlg').close();return}
+    save.disabled=true;
+    for(const [ep,payload] of calls){
+      const r=await J(ep,payload);
+      if(!r.ok){save.disabled=false;
+        document.getElementById('tgtErr').textContent=(await r.json().catch(()=>({}))).error||'could not save';return}
+    }
+    save.disabled=false;
+    document.getElementById('cardDlg').close();refresh();
+  };
+  enterClicks('tgtInput','tgtSave');enterClicks('noteInput','tgtSave');
+}
+/* ── export: plain "1 Card Name" lines for TCGplayer, Mana Pool, Card Kingdom ── */
+let XD=[];
+function exportRows(){
+  const mode=(document.querySelector('input[name=xsel]:checked')||{}).value||'all';
+  const withBought=document.getElementById('xBought').checked;
+  return XD.filter(e=>{
+    if(e.bought&&!withBought)return false;
+    if(mode==='hit')return e.hit;
+    if(mode==='pick')return e.picked;
+    return true;});
+}
+function exportLines(rows,store){
+  const printing=document.getElementById('xPrinting').checked;
+  const targets=!store&&document.getElementById('xTargets').checked;
+  return rows.map(e=>{
+    let l='1 '+e.name;
+    if(printing&&e.set){l+=store==='tcg'||store==='mp'?` [${e.set}] ${e.cn}`:` (${e.set}) ${e.cn}`}
+    if(targets&&e.spec)l+=' @ '+e.spec;
+    return l;});
+}
+function renderExport(){
+  const rows=exportRows();
+  const mode=(document.querySelector('input[name=xsel]:checked')||{}).value||'all';
+  const list=document.getElementById('xList');
+  const withBought=document.getElementById('xBought').checked;
+  list.innerHTML=XD.filter(e=>withBought||!e.bought).map(e=>
+    `<label><input type=checkbox data-id="${e.id}" ${rows.includes(e)?'checked':''}>`+
+    `<span>${X(e.name)}${e.set?` <span class=badge>${X(e.set)} #${X(e.cn)}</span>`:''}</span>`+
+    (e.hit?'<span class=hitmk>\u{1F3AF} at target</span>':'')+(e.bought?'<span class=bmk>✓ bought</span>':'')+
+    `<span class=pr>${money(e.price,e.cur)}</span></label>`).join('')||'<p class=nodata>nothing to export</p>';
+  list.querySelectorAll('input').forEach(i=>i.onchange=()=>{
+    const e=XD.find(x=>x.id===+i.dataset.id);if(e)e.picked=i.checked;
+    if(mode!=='pick'){XD.forEach(x=>{x.picked=rows.includes(x)});if(e)e.picked=i.checked;
+      document.querySelector('input[name=xsel][value=pick]').checked=true;}
+    renderExport();});
+  document.getElementById('xText').value=exportLines(rows).join('\n');
+  document.getElementById('xCount').textContent=rows.length+' card'+(rows.length===1?'':'s');
+  document.querySelectorAll('#exportDlg .btnrow button').forEach(b=>b.disabled=!rows.length);
+  document.getElementById('xHint').textContent='';
+}
+function openExport(){
+  const raw=document.getElementById('exportData');
+  XD=raw?JSON.parse(raw.textContent):[];
+  XD.forEach(e=>{e.picked=false});
+  const hits=XD.filter(e=>e.hit&&!e.bought).length;
+  document.getElementById('xHitCnt').textContent=hits;
+  document.getElementById('xAllCnt').textContent=XD.filter(e=>!e.bought).length;
+  document.querySelector('input[name=xsel][value='+(hits?'hit':'all')+']').checked=true;
+  renderExport();
+  document.getElementById('exportDlg').showModal();
+}
+function wireExport(){
+  const dlg=document.getElementById('exportDlg');if(!dlg)return;
+  dlg.querySelectorAll('input[name=xsel],#xBought,#xPrinting,#xTargets').forEach(i=>i.onchange=renderExport);
+  const hint=t=>document.getElementById('xHint').textContent=t;
+  document.getElementById('xCopy').onclick=e=>{
+    navigator.clipboard.writeText(document.getElementById('xText').value);flash(e.currentTarget,'copied ✓')};
+  document.getElementById('xTcg').onclick=()=>{
+    const lines=exportLines(exportRows(),'tcg');
+    window.open(CFG.tcg+encodeURIComponent(lines.join('||')),'_blank','noopener');
+    hint('Opened TCGplayer Mass Entry with '+lines.length+' card(s).');};
+  document.getElementById('xCk').onclick=()=>{
+    const lines=exportLines(exportRows(),'ck');
+    window.open(CFG.ck+encodeURIComponent(lines.join('\n')),'_blank','noopener');
+    hint('Opened the Card Kingdom deck builder with '+lines.length+' card(s).');};
+  document.getElementById('xMp').onclick=e=>{
+    const lines=exportLines(exportRows(),'mp');
+    navigator.clipboard.writeText(lines.join('\n'));
+    window.open(CFG.mp,'_blank','noopener');
+    hint('Mana Pool has no link-in, so the list is on your clipboard — paste it into the box on the page that just opened.');
+    flash(e.currentTarget,'copied ✓');};
+}
+/* ── import: paste lines, optional "@ target", into this list ── */
+function wireImport(){
+  const go=document.getElementById('imGo');if(!go)return;
+  go.onclick=async()=>{
+    const text=document.getElementById('imText').value;
+    const err=document.getElementById('imErr'),out=document.getElementById('imOut');
+    err.textContent='';if(!text.trim()){err.textContent='paste at least one card';return}
+    go.disabled=true;out.innerHTML='<p class=sub>checking names with Scryfall…</p>';
+    const r=await J('/api/import',{decklist:text,
+      note:document.getElementById('imNote').value.trim()||null,
+      target:document.getElementById('imTarget').value.trim()||null,
+      pin_printings:document.getElementById('imPin').checked});
+    go.disabled=false;
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){out.innerHTML='';err.textContent=d.error||'import failed';return}
+    let h=`<p class=ok>Added ${d.added.length} card(s)`+(d.updated.length?`, ${d.updated.length} already watched (target/note updated)`:'')+'.</p>';
+    if(d.skipped.length)h+=`<p class=err>Not recognised by Scryfall: ${X(d.skipped.join(', '))}</p>`;
+    if(d.unpriced&&d.unpriced.length)h+=`<p class=err>No price to take a percent off for: ${X(d.unpriced.join(', '))} (added without a target)</p>`;
+    if(d.backfilling)h+='<p class=sub>Fetching price history now — it appears within a minute or two.</p>';
+    out.innerHTML=h;
+    if(!d.skipped.length&&!(d.unpriced||[]).length)setTimeout(()=>{document.getElementById('importDlg').close();refresh()},d.backfilling?1800:600);
+    else refresh();
   };
 }
 function wireRev(r){
   keyable(r);r.onclick=async()=>{
     const seq=r.dataset.seq,revDlg=document.getElementById('revDlg');
     document.getElementById('revTitle').textContent='Revision #'+seq;
-    document.getElementById('revBody').innerHTML='<p class=sub>consulting the ledger\u2026</p>';
+    document.getElementById('revBody').innerHTML='<p class=sub>consulting the ledger…</p>';
     document.getElementById('forkOut').innerHTML='';
     revDlg.showModal();
     const res=await fetch(U('/api/revision/'+encodeURIComponent(KEY)+'/'+seq));
@@ -608,8 +997,10 @@ function wireRev(r){
     let h='<table class=snap><tr><th>Card</th><th>Printing</th><th>Target</th><th>Note</th></tr>';
     if(!d.entries.length)h+='<tr><td colspan=4><i>empty at this revision</i></td></tr>';
     for(const e of d.entries){
+      const t=e.target_mode==='low'?('historic low'+(e.target_pct?' −'+e.target_pct+'%':''))
+             :(e.target_price!=null?'$'+(+e.target_price).toFixed(2):'—');
       h+=`<tr><td>${X(e.card_name)}</td><td class=num>${e.set_code?X(e.set_code)+' #'+X(e.collector_number):'cheapest'}</td>`+
-         `<td class=num>${e.target_price!=null?'$'+(+e.target_price).toFixed(2):'\u2014'}</td><td>${X(e.note||'')}</td></tr>`;
+         `<td class=num>${X(t)}</td><td>${X(e.note||'')}</td></tr>`;
     }
     document.getElementById('revBody').innerHTML=h+'</table>';
     document.getElementById('forkBtn').dataset.seq=seq;
@@ -618,17 +1009,17 @@ function wireRev(r){
   };
 }
 async function doFork(mode,seq){
-  const res=await fetch(U('/api/fork'),{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({key:KEY,at_seq:+seq,mode})});
+  const res=await J('/api/fork',{at_seq:+seq,mode});
   const out=document.getElementById('forkOut');
   if(!res.ok){out.textContent='Fork failed: '+await res.text();return}
   const d=await res.json();
-  out.innerHTML=`<div class=secret>\u26a0 shown once \u2014 passphrase: <b>${d.passphrase}</b><br>`+
-    `page: <a href="${d.page}">${d.page}</a> \u00b7 share: ${d.share_code}</div>`+
+  out.innerHTML=`<div class=secret>⚠ shown once — passphrase: <b>${X(d.passphrase)}</b><br>`+
+    `page: <a href="${X(d.page)}">${X(d.page)}</a> · share: ${X(d.share_code)}</div>`+
     (mode==='recover'?'<p class=sub>The current list is now marked superseded.</p>':'');
 }
-function armCrosshair(pts){
+function armCrosshair(pts,cur){
   const svg=document.querySelector('#chartHost svg');if(!svg)return;
+  cur=cur||CUR;
   const tip=document.getElementById('tip');
   const ns='http://www.w3.org/2000/svg';
   const vline=document.createElementNS(ns,'line');
@@ -636,6 +1027,8 @@ function armCrosshair(pts){
   const dot=document.createElementNS(ns,'circle');
   dot.setAttribute('r','4');dot.setAttribute('fill','var(--blue)');
   dot.setAttribute('stroke','var(--base)');dot.setAttribute('stroke-width','2');
+  dot.setAttribute('cx','-9');dot.setAttribute('cy','-9');   /* parked until the pointer arrives */
+  vline.setAttribute('x1','-9');vline.setAttribute('x2','-9');
   svg.append(vline,dot);
   const lo=Math.min(...pts.map(p=>p[1])),hi=Math.max(...pts.map(p=>p[1]));
   const pad=(hi-lo)||1;
@@ -644,13 +1037,13 @@ function armCrosshair(pts){
     const fx=Math.min(1,Math.max(0,(e.clientX-r.left)/r.width));
     const i=Math.round(fx*(pts.length-1));
     const x=CPAD+(CW-2*CPAD)*(pts.length>1?i/(pts.length-1):.5);
-    const y=CH-CPAD-(CH-2*CPAD)*((pts[i][1]-lo)/pad);
+    const y=CH-CPADB-(CH-CPAD-CPADB)*((pts[i][1]-lo)/pad);
     vline.setAttribute('x1',x);vline.setAttribute('x2',x);
-    vline.setAttribute('y1',CPAD);vline.setAttribute('y2',CH-CPAD);
+    vline.setAttribute('y1',CPAD);vline.setAttribute('y2',CH-CPADB);
     dot.setAttribute('cx',x);dot.setAttribute('cy',y);
     tip.style.display='block';
     tip.style.left=(x/CW*r.width)+'px';tip.style.top=(y/CH*r.height)+'px';
-    tip.textContent=pts[i][0]+' \u00b7 '+CUR+pts[i][1].toFixed(2);
+    tip.textContent=pts[i][0]+' · '+cur+pts[i][1].toFixed(2);
   };
   svg.onpointermove=show;svg.onpointerdown=show;
   svg.onpointerleave=()=>{tip.style.display='none';
@@ -671,7 +1064,8 @@ wire();wireDialogs();
 """
 
 
-def _coords(points, w, h, pad):
+def _coords(points, w, h, pad, padb=None):
+    padb = pad if padb is None else padb
     lo = min(p[1] for p in points)
     hi = max(p[1] for p in points)
     rng = (hi - lo) or 1.0
@@ -679,7 +1073,7 @@ def _coords(points, w, h, pad):
     out = []
     for i, (_, v) in enumerate(points):
         x = pad + (w - 2 * pad) * (i / (n - 1) if n > 1 else 0.5)
-        y = h - pad - (h - 2 * pad) * ((v - lo) / rng)
+        y = h - padb - (h - pad - padb) * ((v - lo) / rng)
         out.append((round(x, 1), round(y, 1)))
     return out, lo, hi
 
@@ -704,23 +1098,24 @@ def _spark_svg(points, name, color="var(--blue)"):
 def _big_svg(points, name, cur, target=None, bought_at=None):
     if len(points) < 2:
         return "<p class=nodata>Not enough history yet.</p>"
-    xy, lo, hi = _coords(points, CW, CH, CPAD)
+    xy, lo, hi = _coords(points, CW, CH, CPAD, CPADB)
+    bottom = CH - CPADB
     pl = " ".join(f"{x},{y}" for x, y in xy)
     grid = "".join(f'<line class="gridline" x1="{CPAD}" y1="{y}" x2="{CW - CPAD}" y2="{y}"/>'
-                   for y in (CPAD, CH / 2, CH - CPAD))
+                   for y in (CPAD, (CPAD + bottom) / 2, bottom))
     bline = ""
     if bought_at and points[0][0] <= bought_at <= points[-1][0]:
         # nearest point index for the purchase date → vertical marker
         bi = max(i for i, (d, _) in enumerate(points) if d <= bought_at)
         bx = xy[bi][0]
-        bline = (f'<line x1="{bx}" y1="{CPAD}" x2="{bx}" y2="{CH - CPAD}"'
+        bline = (f'<line x1="{bx}" y1="{CPAD}" x2="{bx}" y2="{bottom}"'
                  f' stroke="var(--lavender)" stroke-width="1.5" stroke-dasharray="2 4"/>'
                  f'<text class="axis" x="{bx + 4}" y="{CPAD + 12}"'
                  f' fill="var(--lavender)">bought {esc(bought_at)}</text>')
     tline = ""
     if target is not None and lo <= target <= hi:
         rng = (hi - lo) or 1.0
-        ty = round(CH - CPAD - (CH - 2 * CPAD) * ((target - lo) / rng), 1)
+        ty = round(bottom - (bottom - CPAD) * ((target - lo) / rng), 1)
         tline = (f'<line class="targetline" x1="{CPAD}" y1="{ty}"'
                  f' x2="{CW - CPAD}" y2="{ty}"/>'
                  f'<text class="axis" x="{CW - CPAD}" y="{ty - 5}"'
@@ -729,7 +1124,7 @@ def _big_svg(points, name, cur, target=None, bought_at=None):
         f'<svg viewBox="0 0 {CW} {CH}" style="width:100%;height:auto;touch-action:pan-y" role="img">'
         f'<title>{esc(name)} — 90 day price history</title>{grid}{tline}{bline}'
         f'<text class="axis" x="{CPAD}" y="{CPAD - 6}">{cur}{hi:.2f}</text>'
-        f'<text class="axis" x="{CPAD}" y="{CH - CPAD + 14}">{cur}{lo:.2f}</text>'
+        f'<text class="axis" x="{CPAD}" y="{bottom + 14}">{cur}{lo:.2f}</text>'
         f'<text class="axis" x="{CW - CPAD}" y="{CPAD - 6}" text-anchor="end">now {cur}{points[-1][1]:.2f}</text>'
         f'<text class="axis" x="{CPAD}" y="{CH - 6}">{esc(points[0][0])}</text>'
         f'<text class="axis" x="{CW - CPAD}" y="{CH - 6}" text-anchor="end">{esc(points[-1][0])}</text>'
@@ -769,46 +1164,89 @@ def _tail_table(points, cur):
             + rows + "</table>") if rows else ""
 
 
+def _slug(name: str) -> str:
+    return "".join(ch for ch in name.lower().replace(" ", "-")
+                   if ch.isalnum() or ch == "-")
+
+
 def _site_links(entry, db=None) -> str:
     """External hop-out badges. Pinned printings deep-link where possible.
 
     MTGStocks is the odd one out: it has no name-addressable URL, only
-    `/prints/<id>`, so its badge appears only once the ingest has resolved and
-    cached that id (see `watchlist/mtgstocks.py`). Omitted rather than linked
-    to a search page that 404s."""
+    `/prints/<id>`, so its badge appears only once that id is cached (see
+    `watchlist/mtgstocks.py`). Omitted rather than linked to a search page
+    that 404s. Mana Pool numbers printings its own way, so its badge links
+    the card page, which lists every printing."""
     name = entry["card_name"]
+    front = name.split(" // ")[0].strip()
     q = urllib.parse.quote(name)
-    slug = "".join(ch for ch in name.lower().replace(" ", "-") if ch.isalnum() or ch == "-")
+    slug = _slug(front)
     if entry.get("set_code") and entry.get("collector_number"):
         scry = (f"https://scryfall.com/card/{entry['set_code'].lower()}/"
                 f"{urllib.parse.quote(entry['collector_number'])}")
     else:
         scry = f"https://scryfall.com/search?q={urllib.parse.quote(f'!\"{name}\"')}"
     stocks = mtgstocks.cached_url(db, name, entry.get("set_code"))
+    ck = ("https://www.cardkingdom.com/catalog/search?search=header&filter[name]="
+          + urllib.parse.quote_plus(front))
     links = [
         ("Scryfall", scry),
         ("EDHREC", f"https://edhrec.com/cards/{slug}"),
         *([("MTGStocks", stocks)] if stocks else []),
         ("TCGplayer", f"https://www.tcgplayer.com/search/magic/product?q={q}"),
+        ("Card Kingdom", ck),
+        ("Mana Pool", f"https://manapool.com/card/{slug}"),
     ]
     return '<div class="sites">' + "".join(
         f'<a href="{esc(u)}" target="_blank" rel="noopener">{n}</a>'
         for n, u in links) + "</div>"
 
 
-def _hit(entry, s) -> bool:
-    return bool(s and entry.get("target_price") is not None
-                and s["current"] <= entry["target_price"])
+def _image_url(db, entry, uuid=None) -> str:
+    """The card face, from Scryfall: the cheapest printing's when known,
+    else the name's default printing. Fetched by the browser on modal open."""
+    sid = watchlist_db.scryfall_id_for(db, entry, uuid)
+    if sid:
+        return f"https://api.scryfall.com/cards/{sid}?format=image&version=normal"
+    front = entry["card_name"].split(" // ")[0].strip()
+    return ("https://api.scryfall.com/cards/named?exact="
+            + urllib.parse.quote(front) + "&format=image&version=normal")
 
 
-def _card_html(db, entry, s, hit, idx, shop, cur, filling=False):
-    """One board card. `s` is the DISPLAY-shop summary; `hit` was computed on
-    the tcgplayer basis (targets are USD) so it never flips with the shop."""
+def _hit(entry, s, target) -> bool:
+    return watchlist_db.is_hit(entry, s, target)
+
+
+class _Card:
+    """Everything the board and the modal know about one entry, computed
+    once: basis summary (pinned shop, else cheapest USD), display summary
+    for the board's shop, effective target, hit state."""
+
+    def __init__(self, db, entry, shop):
+        self.e = entry
+        self.base = watchlist_db.basis_summary(db, entry)
+        self.disp = (self.base if shop == ALL
+                     else watchlist_db.entry_price_summary(db, entry, provider=shop))
+        self.target = watchlist_db.effective_target(db, entry, self.base)
+        self.bought = bool(entry.get("bought_at"))
+        self.hit = _hit(entry, self.base, self.target)
+        self.cur = watchlist_db.entry_currency(entry)          # basis currency
+        self.dcur = self.cur if shop == ALL else SHOPS[shop]   # display currency
+
+
+def _card_html(db, c: _Card, idx, shop, filling=False):
+    """One board card. Price shown is the display shop's (or the basis when
+    the board shows "all markets"); hit state is the basis' and never flips
+    with the dropdown."""
+    entry, s, base = c.e, c.disp, c.base
+    cur = c.dcur
+    uuids = watchlist_db.uuids_for_entry(db, entry)
+    finish = (s or base or {}).get("finish", "normal")
+    providers = watchlist_db.entry_shops(entry) if shop == ALL else shop
     points = []
     if s:
-        series = watchlist_db.price_series(
-            db, watchlist_db.uuids_for_entry(db, entry), days=90, provider=shop,
-            finish=s.get("finish", "normal"))
+        series = watchlist_db.price_series(db, uuids, days=90, provider=providers,
+                                           finish=finish)
         points = series["points"] if series else []
     name = esc(entry["card_name"])
     bought_at = entry.get("bought_at")
@@ -818,7 +1256,11 @@ def _card_html(db, entry, s, hit, idx, shop, cur, filling=False):
     note = f'<p class="note">{esc(entry["note"] or "")}</p>'
     if s:
         foil = ' <small>(foil)</small>' if s.get("finish") == "foil" else ""
-        price = f'<div class="price">{cur}{s["current"]:.2f}{foil}</div>'
+        via = ""
+        if shop == ALL and s.get("provider"):
+            pin = "📌 " if entry.get("shop") else "via "
+            via = f' <span class="via">{pin}{esc(SHOP_NAMES[s["provider"]])}</span>'
+        price = f'<div class="price">{cur}{s["current"]:.2f}{foil}{via}</div>'
         deltas = (f'<div class="deltas">{_delta_pct(s["d7"], s["current"], "7d", cur)}'
                   f'{_delta_pct(s["d30"], s["current"], "30d", cur)}</div>')
     else:
@@ -826,72 +1268,94 @@ def _card_html(db, entry, s, hit, idx, shop, cur, filling=False):
                  if filling else
                  '<div class="nodata">no prices yet</div>')
         deltas = ""
+    rule = watchlist_targets.describe(entry, c.cur, effective=c.target)
     target = ""
     if bought_at:
         target = f'<div class="boughtnote">✓ bought {esc(bought_at)}</div>'
-    elif entry.get("target_price") is not None:
-        usd_hint = " (USD)" if cur != "$" else ""
-        if hit:
+    elif rule:
+        basis_hint = (f" ({'USD' if c.cur == '$' else 'EUR'})"
+                      if cur != c.cur else "")
+        if c.hit:
             target = (f'<div class="target hit">🎯 at target '
-                      f'${entry["target_price"]:.2f}{usd_hint} — buy window</div>')
+                      f'{esc(rule)}{basis_hint} — buy window</div>')
         else:
-            gap = (f' · ${s["current"] - entry["target_price"]:.2f} above'
-                   if s and shop == "tcgplayer" else "")
-            target = f'<div class="target">target ${entry["target_price"]:.2f}{usd_hint}{gap}</div>'
+            gap = ""
+            if base and c.target is not None and cur == c.cur:
+                gap = f' · {c.cur}{base["current"] - c.target:.2f} above'
+            elif c.target is None:
+                gap = " · needs 2 days of history"
+            target = f'<div class="target">target {esc(rule)}{basis_hint}{gap}</div>'
     spark_color = ("var(--overlay)" if bought_at
-                   else "var(--green)" if hit else "var(--blue)")
+                   else "var(--green)" if c.hit else "var(--blue)")
     spark = _spark_svg(points, entry["card_name"], spark_color) if points else ""
+    where = (f"{SHOP_NAMES[entry['shop']]} only" if entry.get("shop")
+             else USD_LABEL if shop == ALL else SHOP_NAMES[shop])
     sub = (f'{entry["set_code"]} #{entry["collector_number"]}'
-           if entry.get("set_code") else "cheapest printing") + f" · {shop}"
+           if entry.get("set_code") else "cheapest printing") + f" · {where}"
     tgt_attr = (f'{entry["target_price"]:.2f}'
                 if entry.get("target_price") is not None else "")
+    ref = None
+    if uuids:
+        ref = watchlist_db.reference_low(db, uuids, watchlist_db.entry_shops(entry),
+                                         finish)
+    shops = {p: {"price": v[0], "date": v[1]}
+             for p, v in watchlist_db.latest_by_shop(db, uuids, finish).items()}
+    chart_target = c.target if cur == c.cur and not bought_at else None
     data = (f' data-name="{name}" data-sub="{esc(sub)}"'
             f' data-set="{esc((entry.get("set_code") or "").upper())}"'
             f' data-entry="{entry["entry_id"]}"'
             f' data-target="{tgt_attr}"'
+            f' data-mode="{esc(entry.get("target_mode") or "fixed")}"'
+            f' data-pct="{float(entry.get("target_pct") or 0):g}"'
+            f' data-shop="{esc(entry.get("shop") or "")}"'
+            f' data-basis="{esc((base or {}).get("provider") or "")}"'
+            f' data-cur="{c.cur}"'
+            f' data-current="{base["current"] if base else ""}"'
+            f' data-d30="{base["d30"] if base and base["d30"] is not None else ""}"'
+            f' data-low="{base["low"] if base and base.get("low") is not None else ""}"'
+            f' data-lowdate="{esc((base or {}).get("low_date") or "")}"'
+            f' data-ref="{ref[0] if ref else ""}"'
+            f' data-eff="{c.target if c.target is not None else ""}"'
+            f' data-hit="{"1" if c.hit else ""}"'
             f' data-note="{esc(entry["note"] or "")}"'
             f' data-bought="{esc(bought_at) if bought_at else ""}"'
             f' data-sites="{esc(_site_links(entry, db))}"'
+            f' data-img="{esc(_image_url(db, entry, (base or {}).get("uuid")))}"'
+            f' data-shops="{esc(json.dumps(shops))}"'
             f' data-pts="{esc(json.dumps(points))}"'
-            f' data-chart="{esc(_big_svg(points, entry["card_name"], cur, entry.get("target_price") if shop == "tcgplayer" and not bought_at else None, bought_at))}"'
+            f' data-chart="{esc(_big_svg(points, entry["card_name"], cur, chart_target, bought_at))}"'
             f' data-tail="{esc(_tail_table(points, cur))}"')
-    cls = "card bought" if bought_at else ("card hit" if hit else "card")
+    cls = "card bought" if bought_at else ("card hit" if c.hit else "card")
     return (f'<article class="{cls}" '
             f'aria-label="{name} details" style="animation-delay:{idx * 45}ms"{data}>'
             f'<h3>{name}{badge}</h3>{note}{price}{deltas}{target}{spark}</article>')
 
 
-def _verdict(pairs) -> str:
-    """One server-rendered sentence: BUY / WAIT / nothing close.
-
-    tcgplayer basis. Rule: at/below target → BUY when well under (≥10%) or no
-    longer falling; WAIT while it just crossed and is still dropping."""
-    buys, waits = [], []
-    misses = []
-    for entry, s, hit in pairs:
-        if hit:
-            well_under = s["current"] <= entry["target_price"] * 0.9
-            falling = s["d7"] is not None and s["d7"] < 0
-            pct = (1 - s["current"] / entry["target_price"]) * 100
-            if well_under or not falling:
-                buys.append(f'<span class="buy">BUY</span> {esc(entry["card_name"])} '
-                            f'${s["current"]:.2f} ({pct:.0f}% under target)')
-            else:
-                waits.append(f'<span class="wait">WAIT</span> {esc(entry["card_name"])} '
-                             f'${s["current"]:.2f} (under target, still falling)')
-        elif s and entry.get("target_price") is not None:
-            misses.append((s["current"] - entry["target_price"], entry, s))
-    parts = buys + waits
-    if not parts:
-        if misses:
-            gap, entry, s = min(misses, key=lambda t: t[0])
-            return (f'<div class="verdict verdict--quiet"><span class="quiet">'
-                    f'No buy windows open — closest: {esc(entry["card_name"])} '
-                    f'${gap:.2f} above target.</span></div>')
-        return ""
-    mood = "verdict--buy" if buys else "verdict--wait"
-    return (f'<div class="verdict {mood}">'
-            + ' <span class="quiet">·</span> '.join(parts) + "</div>")
+def card_payload(db, entry, shop) -> dict:
+    """What the modal needs to show one card at one shop (or its basis when
+    `shop` is 'basis'): chart, tail table, points, current and lowest."""
+    if shop == "basis":
+        providers = watchlist_db.entry_shops(entry)
+        cur = watchlist_db.entry_currency(entry)
+    else:
+        providers, cur = shop, SHOPS[shop]
+    s = watchlist_db.entry_price_summary(db, entry, provider=providers)
+    if not s:
+        return {"chart": "", "tail": "", "pts": [], "current": None,
+                "low": None, "low_date": None, "cur": cur, "provider": None}
+    series = watchlist_db.price_series(
+        db, watchlist_db.uuids_for_entry(db, entry), days=90,
+        provider=providers, finish=s["finish"])
+    points = series["points"] if series else []
+    target = watchlist_db.effective_target(db, entry, s)
+    same_cur = cur == watchlist_db.entry_currency(entry)
+    return {"chart": _big_svg(points, entry["card_name"], cur,
+                              target if same_cur and not entry.get("bought_at") else None,
+                              entry.get("bought_at")),
+            "tail": _tail_table(points, cur), "pts": points,
+            "current": s["current"], "low": s.get("low"),
+            "low_date": s.get("low_date"), "cur": cur,
+            "provider": s.get("provider")}
 
 
 def _pager(base, param, page, total, per, keep=""):
@@ -925,14 +1389,18 @@ def _pager(base, param, page, total, per, keep=""):
             f'{nxt}</nav>')
 
 
-def _shell(row, editable, body, dialogs, cur="$", subtitle="", rightnav=""):
+def _shell(row, editable, body, dialogs, cur="$", subtitle="", rightnav="",
+           shop=ALL, extra=""):
     key = row["_key"]
     label = row["label"] or "Watchlist"
     title = esc(label)
     long_cls = ' class="long"' if len(label) > 16 else ""
-    js = _JS % {"key": json.dumps(key), "editable": json.dumps(editable),
-                "cpad": CPAD, "cw": CW, "ch": CH, "cur": json.dumps(cur),
-                "prefix": json.dumps(PREFIX)}
+    cfg = {"key": key, "editable": editable, "cpad": CPAD, "cpadb": CPADB,
+           "cw": CW, "ch": CH,
+           "cur": cur, "prefix": PREFIX, "shop": shop,
+           "shopNames": SHOP_NAMES, "shopCur": SHOPS,
+           "tcg": TCG_MASSENTRY, "ck": CK_BUILDER, "mp": MP_ADDDECK}
+    js = _JS.replace("__CFG__", json.dumps(cfg).replace("</", "<\\/"))
     rename = (f'<button class="iconbtn" id="rename" title="Rename list" '
               f'aria-label="Rename list" data-label="{esc(row["label"] or "")}">✎</button>'
               if editable else "")
@@ -970,9 +1438,11 @@ document.querySelector('meta[name=theme-color]').content=
 {f'<p class="subtitle">{subtitle}</p>' if subtitle else ''}
 {body}
 <footer>forged in the Mystic Forge · card price watchlist ·
+<a href="{PREFIX}/w/new" title="Forge a new list from pasted cards">new list</a> ·
 <a href="{PREFIX}/health" title="server status">status</a></footer>
 </div>
 {dialogs}
+{extra}
 <script>{js}</script>
 </body></html>"""
 
@@ -988,9 +1458,10 @@ def _norm(s: str) -> str:
     return "".join(ch for ch in s.lower() if ch.isalnum())
 
 
-def _sort_key(sort, e, base_s, disp_s):
+def _sort_key(sort, c: _Card):
     """Ordering value, smaller first. No-signal entries sink (never above
     priced/targeted ones); bought partitioning happens outside."""
+    e, base_s, disp_s = c.e, c.base, c.disp
     if sort == "age":
         return -e["entry_id"]                       # newest added first
     if sort == "price":
@@ -999,20 +1470,76 @@ def _sort_key(sort, e, base_s, disp_s):
         return disp_s["d7"] if disp_s and disp_s["d7"] is not None else _INF
     if sort == "d30":
         return disp_s["d30"] if disp_s and disp_s["d30"] is not None else _INF
-    # default "target": USD distance to target — buy windows go negative,
-    # so "target met first" falls out of the same ordering.
-    if base_s and e.get("target_price") is not None:
-        return base_s["current"] - e["target_price"]
+    # default "target": distance to target on the basis — buy windows go
+    # negative, so "target met first" falls out of the same ordering.
+    if base_s and c.target is not None:
+        return base_s["current"] - c.target
     return _INF
 
 
-def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
+def _export_data(cards) -> str:
+    """The whole list (not just this page) for the export modal, as JSON."""
+    rows = []
+    for c in cards:
+        e = c.e
+        rows.append({"id": e["entry_id"], "name": e["card_name"],
+                     "set": (e.get("set_code") or "").upper(),
+                     "cn": e.get("collector_number") or "",
+                     "hit": c.hit, "bought": c.bought,
+                     "price": c.base["current"] if c.base else None,
+                     "cur": c.cur, "spec": watchlist_targets.to_spec(e)})
+    return ('<script type="application/json" id="exportData">'
+            + json.dumps(rows).replace("</", "<\\/") + "</script>")
+
+
+def _target_editor() -> str:
+    """The modal's target box: a number, gg.deals-style shortcuts off the
+    current price and the historic low, and the follow-the-low switch."""
+    basis_opts = '<option value="">cheapest across USD markets</option>' + "".join(
+        f'<option value="{s}">{SHOP_NAMES[s]}{" (€)" if SHOPS[s] == "€" else ""} only</option>'
+        for s in SHOPS)
+    pcts = lambda frm: "".join(  # noqa: E731
+        f'<button class="sc" data-from="{frm}" data-pct="{p}">−{p}%</button>'
+        for p in (10, 20, 30))
+    return (
+        '<div class="tgtbox" id="tgtEdit">'
+        '<div class="tgtrow"><label class="head" for="tgtInput">Your target</label>'
+        '<span class="money"><span id="tgtCur">$</span>'
+        '<input id="tgtInput" type="number" step="0.01" min="0" placeholder="none"></span>'
+        '<button class="sc" id="scBeat" title="one cent under today\'s price">Beat current</button>'
+        '<button class="sc" id="scMatchLow" title="the lowest price seen so far">Match historic low</button>'
+        '<button class="textlink" id="scMore">More shortcuts ▾</button></div>'
+        '<div class="shortcuts" id="shortcuts" hidden>'
+        f'<div class="scrow"><span class="sclbl">Current <b id="scCur"></b></span>{pcts("cur")}'
+        '<input class="pctin" data-from="cur" type="number" min="0" max="99" '
+        'placeholder="custom %" aria-label="custom percent under the current price"></div>'
+        '<div class="scrow"><span class="sclbl">Historic low <b id="scLow"></b></span>'
+        '<button class="sc" data-from="low" data-pct="0">Match</button>'
+        f'{pcts("low")}'
+        '<input class="pctin" data-from="low" type="number" min="0" max="99" '
+        'placeholder="custom %" aria-label="custom percent under the historic low"></div>'
+        '</div>'
+        '<label class="switch"><input type="checkbox" id="followLow">'
+        '<span>Follow the historic low — when a new low is set, the target moves to it</span>'
+        '<select class="sel" id="followPct"><option value="0">match it</option>'
+        '<option value="5">stay 5% below</option><option value="10">stay 10% below</option>'
+        '<option value="20">stay 20% below</option><option value="30">stay 30% below</option></select></label>'
+        '<p class="hint" id="followHint"></p>'
+        '<div class="tgtrow"><label for="noteInput">note</label>'
+        '<input id="noteInput" class="txt" type="text" maxlength="200" '
+        'placeholder="e.g. Cloud deck, batch 2">'
+        '<label for="basisSel">price basis</label>'
+        f'<select class="sel" id="basisSel">{basis_opts}</select></div>'
+        '<span class="err" id="tgtErr"></span></div>')
+
+
+def render_main(db, row, editable: bool, cp: int = 1, shop: str = ALL,
                 filling: bool = False, sort: str = "target",
                 show_bought: bool = True, q: str = "") -> str:
-    """The board: verdict + stat tiles + card grid, buy windows first."""
+    """The board: stat tiles + card grid, buy windows first."""
     key = row["_key"]
-    shop = shop if shop in SHOPS else "tcgplayer"
-    cur = SHOPS[shop]
+    shop = shop if shop in SHOPS or shop == ALL else ALL
+    cur = "$" if shop == ALL else SHOPS[shop]
     base = (f"{PREFIX}/w/{esc(key)}" if editable
             else f"{PREFIX}/s/{esc(key)}")
     sort = sort if sort in dict(SORTS) else "target"
@@ -1021,75 +1548,73 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
     # view-state query string, minus defaults; cp handled by the pager
     state = [p for p in (
         f"sort={sort}" if sort != "target" else "",
-        f"shop={shop}" if shop != "tcgplayer" else "",
+        f"shop={shop}" if shop != ALL else "",
         "" if show_bought else "bought=hide",
         f"q={qq}" if q else "") if p]
 
     def _url(**over):
         parts = [p for p in (
             f"sort={over.get('sort', sort)}" if over.get('sort', sort) != "target" else "",
-            f"shop={over.get('shop', shop)}" if over.get('shop', shop) != "tcgplayer" else "",
+            f"shop={over.get('shop', shop)}" if over.get('shop', shop) != ALL else "",
             "" if over.get('show_bought', show_bought) else "bought=hide",
             f"q={qq}" if q else "") if p]
         return base + ("?" + "&".join(parts) if parts else "")
 
     keep = "".join(f"&{p}" for p in state)
-    qshop = f"?shop={shop}" if shop != "tcgplayer" else ""
+    qshop = f"?shop={shop}" if shop != ALL else ""
     entries = watchlist_db.current_entries(db, row["id"])
 
-    # tcgplayer basis for hits/verdict (targets are USD); display shop for
+    # basis for hits (pinned shop, else cheapest USD); display shop for the
     # prices. Bought cards keep their spot in history but leave the math.
-    pairs = []
-    for e in entries:
-        base_s = watchlist_db.entry_price_summary(db, e, provider="tcgplayer")
-        disp_s = (base_s if shop == "tcgplayer"
-                  else watchlist_db.entry_price_summary(db, e, provider=shop))
-        bought = bool(e.get("bought_at"))
-        pairs.append((e, base_s, disp_s, _hit(e, base_s) and not bought, bought))
+    cards = [_Card(db, e, shop) for e in entries]
     # chosen ordering; bought always last regardless of sort
-    pairs.sort(key=lambda t: (t[4], _sort_key(sort, t[0], t[1], t[2])))
-    bought_n = sum(1 for t in pairs if t[4])
-    grid_pairs = pairs if show_bought else [t for t in pairs if not t[4]]
+    cards.sort(key=lambda c: (c.bought, _sort_key(sort, c)))
+    bought_n = sum(1 for c in cards if c.bought)
+    grid = cards if show_bought else [c for c in cards if not c.bought]
     if q:
         nq = _norm(q)
-        grid_pairs = [t for t in grid_pairs
-                      if nq in _norm(t[0]["card_name"])]
+        grid = [c for c in grid if nq in _norm(c.e["card_name"])]
 
-    active = [(e, bs, ds, h) for e, bs, ds, h, b in pairs if not b]
-    total_val = sum(s["current"] for _, _, s, _ in active if s)
-    net7 = sum(s["d7"] for _, _, s, _ in active if s and s["d7"] is not None)
-    hits = sum(1 for _, _, _, h in active if h)
-    through = db.execute("SELECT MAX(date) FROM prices WHERE provider=?",
-                         (shop,)).fetchone()[0]
-    last_ingest = db.execute(
-        "SELECT value FROM meta WHERE key='last_ingest'").fetchone()
-    last_ingest = last_ingest["value"] if last_ingest else "never"
+    active = [c for c in cards if not c.bought]
+    if shop == ALL:
+        priced = [c.base for c in active if c.base and c.cur == "$"]
+    else:
+        priced = [c.disp for c in active if c.disp]
+    total_val = sum(s["current"] for s in priced)
+    net7 = sum(s["d7"] for s in priced if s["d7"] is not None)
+    hits = sum(1 for c in active if c.hit)
+    through_shops = watchlist_db.USD_SHOPS if shop == ALL else (shop,)
+    through = db.execute(
+        f"SELECT MAX(date) FROM prices WHERE provider IN "
+        f"({','.join('?' * len(through_shops))})", through_shops).fetchone()[0]
 
-    page = grid_pairs[(cp - 1) * CARDS_PER_PAGE: cp * CARDS_PER_PAGE]
+    page = grid[(cp - 1) * CARDS_PER_PAGE: cp * CARDS_PER_PAGE]
     empty_msg = (f'No cards match “{esc(q)}”.' if q else
-                 'Nothing watched yet — use “Add card” or ask Claude.')
-    cards = "".join(_card_html(db, e, disp_s, h, i, shop, cur, filling)
-                    for i, (e, _, disp_s, h, _b) in enumerate(page)) or \
+                 'Nothing watched yet — use “Add card”, “Import”, or ask Claude.')
+    cards_html = "".join(_card_html(db, c, i, shop, filling)
+                         for i, c in enumerate(page)) or \
         f'<p class="nodata">{empty_msg}</p>'
 
-    shop_names = {"tcgplayer": "TCGplayer", "cardkingdom": "Card Kingdom",
-                  "cardmarket": "Cardmarket", "manapool": "Mana Pool"}
-    shop_links = "".join(
-        f'<a href="{_url(shop=s)}" class="{"on" if s == shop else ""}">{shop_names[s]}</a>'
-        for s in SHOPS)
+    shop_opts = [(ALL, "All markets · cheapest")] + [
+        (s, f"{SHOP_NAMES[s]}{' (€)' if SHOPS[s] == '€' else ''}") for s in SHOPS]
+    shop_select = (
+        '<select class="shopsel" id="shopSel" aria-label="Which market\'s prices to show">'
+        + "".join(f'<option value="{s}" data-href="{_url(shop=s)}"'
+                  f'{" selected" if s == shop else ""}>{label}</option>'
+                  for s, label in shop_opts) + "</select>")
     sort_links = "".join(
         f'<a href="{_url(sort=k)}" class="{"on" if k == sort else ""}">{label}</a>'
         for k, label in SORTS)
     bought_toggle = ""
     if bought_n:
-        bought_toggle = (f'<a class="textlink mla" href="{_url(show_bought=not show_bought)}">'
+        bought_toggle = (f'<a class="textlink" href="{_url(show_bought=not show_bought)}">'
                          f'{"hide" if show_bought else "show"} bought ({bought_n})</a>')
     filterbox = (f'<input id="filter" class="filterbox mla" type="search" '
                  f'placeholder="filter cards…" value="{esc(q)}" '
                  f'aria-label="Filter cards by name">')
     sortbar = (f'<div class="sortbar"><span class="shoplbl">sort:</span>'
                f'<span class="shops">{sort_links}</span>'
-               f'{filterbox}{bought_toggle.replace(" mla", "") if bought_toggle else ""}</div>')
+               f'{filterbox}{bought_toggle}</div>')
     share_path = f"{PREFIX}/s/{esc(row['share_code'])}"
     share = (f'<button class="textlink" data-copy="{share_path}" '
              f'title="Copy the read-only link (code {esc(row["share_code"])})">'
@@ -1102,26 +1627,28 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
     tgt_edit = ""
     modal_actions = ""
     if editable:
-        tgt_edit = ('<div class="tgtedit" id="tgtEdit"><label for="tgtInput">'
-                    'target price ($)</label><input id="tgtInput" type="number" '
-                    'step="0.01" min="0" placeholder="none">'
-                    '<label for="noteInput">note</label>'
-                    '<input id="noteInput" type="text" maxlength="200" '
-                    'placeholder="e.g. Cloud deck, batch 2">'
-                    '<button class="act" id="tgtSave">Save</button>'
-                    '<span class="err" id="tgtErr"></span></div>')
+        tgt_edit = _target_editor()
         modal_actions = (
             '<div class="modalend">'
-            '<button class="act" id="boughtBtn">Bought ✓</button>'
-            '<button class="act danger" id="removeBtn">Remove</button>'
+            '<span class="left"><button class="act ghost" id="removeBtn">Remove</button>'
             '<span id="rmConfirm" style="display:none">Really remove? '
             '<button class="act danger" id="rmYes">Yes, remove</button> '
-            '<button class="act" id="rmNo">Keep</button></span></div>')
+            '<button class="act" id="rmNo">Keep</button></span></span>'
+            '<button class="act primary" id="tgtSave">Save</button>'
+            '<button class="act" id="boughtBtn">Bought ✓</button></div>')
+    else:
+        modal_actions = ('<div class="modalend"><button class="act close">Close</button></div>')
     xbtn = '<button class="xclose" aria-label="Close">×</button>'
+    kpis = ("".join(f'<div class="kpi" id="{i}"><b></b><span></span></div>'
+                    for i in ("kNow", "kLow", "kTarget", "kD30")))
     dialogs = (f'<dialog id="cardDlg">{xbtn}<h3 id="cardTitle"></h3><p class="sub" id="cardSub"></p>'
+               f'<div class="cardhead"><img class="cardimg" id="cardImg" alt="" loading="lazy" hidden>'
+               f'<div class="kpis">{kpis}</div></div>'
+               f'<div class="shoprow" id="shopRow"></div>'
                f'<div class="chart-wrap"><div id="chartHost"></div><div class="tip" id="tip"></div></div>'
-               f'{tgt_edit}{modal_actions}<div id="siteHost"></div><div id="snapHost"></div>'
-               f'</dialog>')
+               f'{tgt_edit}<div id="siteHost"></div>'
+               f'<details class="histbox"><summary>Recent prices</summary><div id="snapHost"></div></details>'
+               f'{modal_actions}</dialog>')
     topic = watchlist_ingest.ntfy_topic(row["share_code"])
     dialogs += (f'<dialog id="alertsDlg">{xbtn}<h3>Buy-window alerts</h3>'
                 f'<p class="sub">When a card first drops to its target, this list '
@@ -1133,6 +1660,30 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
                 f'<a href="{esc(watchlist_ingest.NTFY_BASE)}/{esc(topic)}" '
                 f'target="_blank" rel="noopener">{esc(watchlist_ingest.NTFY_BASE)}/{esc(topic)}</a></p>'
                 f'</dialog>')
+    dialogs += (
+        f'<dialog id="exportDlg">{xbtn}<h3>Export</h3>'
+        '<p class="sub">Plain <code>1 Card Name</code> lines — paste into TCGplayer '
+        'Mass Entry, Mana Pool, Card Kingdom, Moxfield, Archidekt, anywhere.</p>'
+        '<div class="segs" role="radiogroup" aria-label="Which cards">'
+        '<label><input type="radio" name="xsel" value="all" checked>Everything '
+        '<span class="cnt" id="xAllCnt"></span></label>'
+        '<label><input type="radio" name="xsel" value="hit">At target '
+        '<span class="cnt" id="xHitCnt"></span></label>'
+        '<label><input type="radio" name="xsel" value="pick">Picked by hand</label>'
+        '<label class="mla" style="border:none;background:none"><input type="checkbox" id="xBought" '
+        'style="position:static;opacity:1;width:1rem;height:1rem;accent-color:var(--mauve)">'
+        'include bought</label></div>'
+        '<div class="picklist" id="xList"></div>'
+        '<div class="xopts"><label><input type="checkbox" id="xPrinting" checked> printing, where pinned</label>'
+        '<label title="Appends each card\'s target after @ so the list can be imported back here"><input type="checkbox" id="xTargets"> include targets (for re-import)</label>'
+        '<span class="mla" id="xCount"></span></div>'
+        '<textarea class="box" id="xText" readonly rows="6" aria-label="Export text"></textarea>'
+        '<div class="btnrow"><button class="act primary" id="xCopy">Copy ⧉</button>'
+        '<span class="shoplbl">open in</span>'
+        '<button class="act" id="xTcg">TCGplayer ↗</button>'
+        '<button class="act" id="xCk">Card Kingdom ↗</button>'
+        '<button class="act" id="xMp" title="Copies the list; Mana Pool has no link-in">Mana Pool ↗</button></div>'
+        '<p class="sub" id="xHint" style="margin-top:.5rem"></p></dialog>')
     if editable:
         dialogs += (f'<dialog id="renameDlg">{xbtn}<h3>Rename list</h3>'
                     '<input id="renameInput" maxlength="80">'
@@ -1148,12 +1699,38 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
                     '<div class="btnrow"><button class="act" id="addLookup">Preview</button>'
                     '<button class="act primary" id="addGo" style="display:none">Add to watchlist</button></div>'
                     '</dialog>')
+        dialogs += (
+            f'<dialog id="importDlg">{xbtn}<h3>Import cards</h3>'
+            '<p class="sub">One card per line — quantities and Archidekt/Moxfield '
+            'suffixes are fine. Put a target after <code>@</code>: a price '
+            '(<code>Rhystic Study @ 25</code>), <code>@ low</code> to follow the '
+            'historic low, <code>@ low-10%</code> to stay 10% under it, or '
+            '<code>@ -20%</code> for 20% under today\'s price.</p>'
+            '<textarea class="box" id="imText" rows="8" placeholder="1 Sol Ring&#10;'
+            '1 Rhystic Study @ 25&#10;Smothering Tithe @ low-10%&#10;'
+            'Dockside Extortionist (2X2) 96 @ -20%"></textarea>'
+            '<div class="tgtedit"><label for="imTarget">default target</label>'
+            '<input id="imTarget" type="text" placeholder="e.g. 5, low, -20%" style="width:11rem">'
+            '<label for="imNote">note</label><input id="imNote" type="text" maxlength="200" '
+            'placeholder="e.g. deck name" style="width:11rem">'
+            '<label class="switch" style="margin:0" title="Deck exports name the printing you own; '
+            'a watchlist usually wants the cheapest one"><input type="checkbox" id="imPin"> '
+            'pin printings</label></div>'
+            '<span class="err" id="imErr"></span><div id="imOut"></div>'
+            '<div class="btnrow"><button class="act primary" id="imGo">Import</button>'
+            '<button class="act close">Cancel</button></div></dialog>')
     else:
         dialogs += (f'<dialog id="claimDlg">{xbtn}<h3>Your own watchlist</h3>'
                     '<div id="claimOut"></div></dialog>')
 
     add_btn = ('<button class="act primary" id="addCard">＋ Add card</button>'
                if editable else "")
+    export_btn = ('<button class="act secondary" id="exportBtn" '
+                  'title="Copy as a decklist or open it in a store">⇪ Export</button>'
+                  if entries else "")
+    import_btn = ('<button class="act" id="importBtn" '
+                  'title="Paste a decklist or shopping list">⇩ Import</button>'
+                  if editable else "")
     hist_title = ("Every change ever made to this list — inspect or restore any point"
                   if editable else "See every change made to this list")
     if through:
@@ -1163,20 +1740,20 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
                      "new server takes a few minutes; this page refreshes itself")
     else:
         freshness = "No price data yet"
-    usd_note = (" · targets always compare against TCGplayer USD"
-                if shop != "tcgplayer" else "")
+    where = (USD_LABEL if shop == ALL else SHOP_NAMES[shop])
+    basis_note = ("" if shop == ALL else
+                  " · targets still judge the cheapest USD market (or a card's pinned shop)")
     ro_note = "" if editable else "Read-only view · "
-    subtitle = (f"{ro_note}{freshness} · ▼ green = cheaper · ▲ red = pricier "
-                f"(these are buy prices){usd_note}")
+    subtitle = (f"{ro_note}{freshness} · {where} · ▼ green = cheaper · "
+                f"▲ red = pricier{basis_note}")
     rightnav = (f'<button class="textlink" id="alerts">Alerts</button>'
                 f'<a class="textlink" href="{base}/history{qshop}" '
                 f'title="{hist_title}">History</a>')
     net_cls = "dn" if net7 < 0 else "up" if net7 > 0 else "fl"
     body = f"""
-<div class="actions">{add_btn}{claim}{share}
-<span class="shopgrp mla"><span class="shoplbl">prices:</span><span class="shops">{shop_links}</span></span></div>
+<div class="actions">{add_btn}{export_btn}{import_btn}{claim}{share}
+<span class="shopgrp mla"><label class="shoplbl" for="shopSel">prices:</label>{shop_select}</span></div>
 {superseded}
-{_verdict([(e, bs, h) for e, bs, _, h, b in pairs if not b])}
 <div class="stats">
 <div class="stat"><b>{hits}</b><span>buy windows</span></div>
 <div class="stat" title="sum of 7-day changes — down is good">
@@ -1185,10 +1762,11 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = "tcgplayer",
 <div class="stat"><b>{len(entries)}</b><span>cards</span></div>
 </div>
 {sortbar}
-<div class="grid">{cards}</div>
-{_pager(base, "cp", cp, len(grid_pairs), CARDS_PER_PAGE, keep=keep)}"""
+<div class="grid">{cards_html}</div>
+{_pager(base, "cp", cp, len(grid), CARDS_PER_PAGE, keep=keep)}"""
     return _shell(row, editable, body, dialogs, cur,
-                  subtitle=subtitle, rightnav=rightnav)
+                  subtitle=subtitle, rightnav=rightnav, shop=shop,
+                  extra=_export_data(cards))
 
 
 _ACTION_LABELS = {"create": ("forged", "var(--mauve)"),
@@ -1196,6 +1774,7 @@ _ACTION_LABELS = {"create": ("forged", "var(--mauve)"),
                   "remove": ("removed", "var(--red)"),
                   "set_target": ("target set", "var(--yellow)"),
                   "set_note": ("note set", "var(--yellow)"),
+                  "set_shop": ("basis set", "var(--yellow)"),
                   "set_label": ("renamed", "var(--yellow)"),
                   "bought": ("bought", "var(--lavender)"),
                   "unbought": ("unbought", "var(--yellow)"),
@@ -1203,12 +1782,12 @@ _ACTION_LABELS = {"create": ("forged", "var(--mauve)"),
 
 
 def render_history(db, row, editable: bool, hp: int = 1,
-                   shop: str = "tcgplayer") -> str:
+                   shop: str = ALL) -> str:
     """The stashed-away revision view: full chain, revision modal, fork/restore."""
     key = row["_key"]
     base = (f"{PREFIX}/w/{esc(key)}" if editable
             else f"{PREFIX}/s/{esc(key)}")
-    qshop = f"?shop={shop}" if shop in SHOPS and shop != "tcgplayer" else ""
+    qshop = f"?shop={shop}" if shop in SHOPS else ""
     total_ev = db.execute("SELECT COUNT(*) FROM events WHERE list_id=?",
                           (row["id"],)).fetchone()[0]
     events = db.execute(
@@ -1226,8 +1805,11 @@ def render_history(db, row, editable: bool, hp: int = 1,
         if not d and payload.get("entry_id") in adds:
             d = adds[payload["entry_id"]]
         if ev["action"] == "set_target" and d:
-            tp = payload.get("target_price")
-            d += " → no target" if tp is None else f" → ${tp:.2f}"
+            rule = watchlist_targets.describe(payload)
+            d += f" → {rule}" if rule else " → no target"
+        if ev["action"] == "set_shop" and d:
+            s = payload.get("shop")
+            d += f" → {SHOP_NAMES[s]} only" if s in SHOP_NAMES else " → cheapest USD"
         return d
 
     revs = ""
@@ -1261,3 +1843,35 @@ def render_history(db, row, editable: bool, hp: int = 1,
         keep=qshop.replace("?", "&") if qshop else "")}</div>"""
     return _shell(row, editable, body, dialogs,
                   subtitle=intro, rightnav=rightnav)
+
+
+def render_new() -> str:
+    """The forge: mint a list by hand — name it, paste cards, get the key.
+
+    The same thing `watchlist_create` + `watchlist_bulk_add` do from chat,
+    for people who would rather not go through an assistant."""
+    row = {"_key": "", "label": "New watchlist", "share_code": "",
+           "superseded_by": None}
+    body = """
+<div class="forge rail" id="forgeForm">
+<label class="fl" for="newLabel">Name</label>
+<input class="txt" id="newLabel" maxlength="80" placeholder="e.g. Eriette upgrades">
+<label class="fl" for="newCards">Cards <span style="font-weight:400">(optional — one per line; a target may follow <code>@</code>)</span></label>
+<textarea class="box" id="newCards" rows="9" placeholder="1 Sol Ring&#10;1 Rhystic Study @ 25&#10;Smothering Tithe @ low-10%&#10;Dockside Extortionist @ -20%"></textarea>
+<div class="row">
+<div><label class="fl" for="newTarget">Default target</label>
+<input class="txt" id="newTarget" placeholder="e.g. 5, low, -20%"></div>
+<div><label class="fl" for="newNote">Note for every card</label>
+<input class="txt" id="newNote" maxlength="200" placeholder="e.g. deck name"></div>
+</div>
+<label class="switch" style="margin-top:.9rem"><input type="checkbox" id="newPin"> pin the printings named on the lines</label>
+<p class="hint" style="margin-left:0">Deck exports name the copy you own; a watchlist usually wants the cheapest printing, so this is off by default.</p>
+<p class="hint" style="margin-left:0">A number is a fixed target. <code>low</code> follows the historic low as it moves; <code>low-10%</code> stays 10% under it; <code>-20%</code> means 20% under today's price.</p>
+<div class="btnrow foot"><button class="act primary" id="forgeGo">✦ Forge the list</button>
+<span class="shoplbl">You get a passphrase — it is the key to the list, shown once.</span></div>
+</div>
+<div class="forge rail" id="forgeOut" hidden></div>"""
+    subtitle = ("Prices from TCGplayer, Card Kingdom, Mana Pool and Cardmarket, "
+                "updated nightly · targets, history, alerts, and a read-only "
+                "share link — no account, just a passphrase")
+    return _shell(row, False, body, "", subtitle=subtitle)

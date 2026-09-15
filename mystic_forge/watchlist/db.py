@@ -15,6 +15,18 @@ from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = os.environ.get("MYSTIC_FORGE_DB", "mystic_forge.db")
+
+# Price providers the ingest tracks. The USD three form the default "cheapest
+# across markets" basis; Cardmarket is EUR and only ever stands on its own.
+ALL_SHOPS = ("tcgplayer", "cardkingdom", "cardmarket", "manapool")
+USD_SHOPS = ("tcgplayer", "cardkingdom", "manapool")
+SHOP_CURRENCY = {"tcgplayer": "$", "cardkingdom": "$", "cardmarket": "€",
+                 "manapool": "$"}
+SHOP_NAMES = {"tcgplayer": "TCGplayer", "cardkingdom": "Card Kingdom",
+              "cardmarket": "Cardmarket", "manapool": "Mana Pool"}
+# A target is either a fixed number or a rule that follows the historic low
+# (target = lowest price seen before today, less target_pct percent).
+TARGET_MODES = ("fixed", "low")
 _WORDS_FILE = Path(__file__).parent.parent / "data" / "watchlist_words.txt"
 _SHARE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"  # no 0/O/1/I/L/U confusables
 
@@ -47,6 +59,10 @@ CREATE TABLE IF NOT EXISTS watchlist_current (
   target_price REAL,
   note TEXT,
   added_at TEXT NOT NULL,
+  bought_at TEXT,
+  target_mode TEXT NOT NULL DEFAULT 'fixed',
+  target_pct REAL NOT NULL DEFAULT 0,
+  shop TEXT,
   PRIMARY KEY (list_id, entry_id)
 );
 CREATE TABLE IF NOT EXISTS prices (
@@ -104,6 +120,13 @@ def init_db(db: sqlite3.Connection) -> None:
     cols = [r[1] for r in db.execute("PRAGMA table_info(watchlist_current)")]
     if "bought_at" not in cols:  # migration for pre-"bought" databases
         db.execute("ALTER TABLE watchlist_current ADD COLUMN bought_at TEXT")
+    if "target_mode" not in cols:  # migration for fixed-target-only databases
+        db.execute("ALTER TABLE watchlist_current ADD COLUMN target_mode TEXT"
+                   " NOT NULL DEFAULT 'fixed'")
+        db.execute("ALTER TABLE watchlist_current ADD COLUMN target_pct REAL"
+                   " NOT NULL DEFAULT 0")
+    if "shop" not in cols:         # migration for pre-per-card-shop databases
+        db.execute("ALTER TABLE watchlist_current ADD COLUMN shop TEXT")
     cols = [r[1] for r in db.execute("PRAGMA table_info(mtgstocks_prints)")]
     if "source" not in cols:     # migration for pre-vote databases
         db.execute("ALTER TABLE mtgstocks_prints ADD COLUMN source TEXT"
@@ -206,10 +229,49 @@ def _find_entry(db, list_id: int, entry_id=None, name=None,
     return db.execute(q, args).fetchone()
 
 
+def _norm_target(target_price, target_mode, target_pct):
+    """Canonical (price, mode, pct) triple. A 'low' rule carries no fixed
+    price; a fixed target carries no percentage."""
+    mode = target_mode if target_mode in TARGET_MODES else "fixed"
+    pct = float(target_pct or 0)
+    if mode == "low":
+        return None, "low", max(0.0, min(pct, 99.0))
+    return target_price, "fixed", 0.0
+
+
+def _write_target(db, list_id: int, entry, target_price, target_mode,
+                  target_pct) -> int:
+    """Append a set_target event and materialize it. Returns the seq."""
+    price, mode, pct = _norm_target(target_price, target_mode, target_pct)
+    seq = append_event(db, list_id, "set_target",
+                       {"entry_id": entry["entry_id"],
+                        "card_name": entry["card_name"],
+                        "target_price": price, "target_mode": mode,
+                        "target_pct": pct})
+    db.execute("UPDATE watchlist_current SET target_price=?, target_mode=?,"
+               " target_pct=? WHERE list_id=? AND entry_id=?",
+               (price, mode, pct, list_id, entry["entry_id"]))
+    return seq
+
+
+def _target_differs(entry, target_price, target_mode, target_pct) -> bool:
+    price, mode, pct = _norm_target(target_price, target_mode, target_pct)
+    return (price != entry["target_price"]
+            or mode != (entry["target_mode"] or "fixed")
+            or pct != float(entry["target_pct"] or 0))
+
+
 def add_card(db, list_id: int, card_name: str, set_code: str | None = None,
              collector_number: str | None = None, target_price: float | None = None,
-             note: str | None = None) -> tuple[int, dict]:
-    """Append add (or set_target/set_note for an existing entry) and materialize.
+             note: str | None = None, target_mode: str | None = None,
+             target_pct: float | None = None,
+             shop: str | None = None) -> tuple[int, dict]:
+    """Append add (or set_target/set_note/set_shop for an existing entry) and
+    materialize.
+
+    `target_mode='low'` makes the target follow the historic low (less
+    `target_pct` percent) instead of a fixed `target_price`. `shop` pins the
+    card's price basis to one market; None means cheapest across USD shops.
 
     Returns (last_seq, entry_dict)."""
     existing = _find_entry(db, list_id, name=card_name, set_code=set_code,
@@ -217,34 +279,49 @@ def add_card(db, list_id: int, card_name: str, set_code: str | None = None,
     if existing:
         seq = existing["entry_id"]
         eid = existing["entry_id"]
-        if target_price is not None and target_price != existing["target_price"]:
-            seq = append_event(db, list_id, "set_target",
-                              {"entry_id": eid, "card_name": existing["card_name"],
-                               "target_price": target_price})
-            db.execute("UPDATE watchlist_current SET target_price=?"
-                       " WHERE list_id=? AND entry_id=?",
-                       (target_price, list_id, eid))
+        wants_target = target_price is not None or target_mode == "low"
+        if wants_target and _target_differs(existing, target_price,
+                                            target_mode, target_pct):
+            seq = _write_target(db, list_id, existing, target_price,
+                                target_mode, target_pct)
         if note is not None and note != existing["note"]:
             seq = append_event(db, list_id, "set_note",
                               {"entry_id": eid, "card_name": existing["card_name"],
                                "note": note})
             db.execute("UPDATE watchlist_current SET note=?"
                        " WHERE list_id=? AND entry_id=?", (note, list_id, eid))
+        if shop is not None and shop != existing["shop"]:
+            seq = _write_shop(db, list_id, existing, shop)
         db.commit()
         return seq, dict(_find_entry(db, list_id, entry_id=eid))
 
     added_at = _now()
+    price, mode, pct = _norm_target(target_price, target_mode, target_pct)
+    shop = shop if shop in ALL_SHOPS else None
     payload = {"card_name": card_name, "set_code": set_code,
                "collector_number": collector_number,
-               "target_price": target_price, "note": note, "added_at": added_at}
+               "target_price": price, "target_mode": mode, "target_pct": pct,
+               "shop": shop, "note": note, "added_at": added_at}
     seq = append_event(db, list_id, "add", payload)
     db.execute(
         "INSERT INTO watchlist_current (list_id, entry_id, card_name, set_code,"
-        " collector_number, target_price, note, added_at) VALUES (?,?,?,?,?,?,?,?)",
+        " collector_number, target_price, target_mode, target_pct, shop, note,"
+        " added_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (list_id, seq, card_name, set_code, collector_number,
-         target_price, note, added_at))
+         price, mode, pct, shop, note, added_at))
     db.commit()
     return seq, dict(_find_entry(db, list_id, entry_id=seq))
+
+
+def _write_shop(db, list_id: int, entry, shop) -> int:
+    """Append a set_shop event (None = back to cheapest USD) and materialize."""
+    shop = shop if shop in ALL_SHOPS else None
+    seq = append_event(db, list_id, "set_shop",
+                       {"entry_id": entry["entry_id"],
+                        "card_name": entry["card_name"], "shop": shop})
+    db.execute("UPDATE watchlist_current SET shop=? WHERE list_id=? AND entry_id=?",
+               (shop, list_id, entry["entry_id"]))
+    return seq
 
 
 def remove_entry(db, list_id: int, entry_id: int | None = None,
@@ -272,11 +349,18 @@ def state_at(db, list_id: int, seq: int | None = None) -> dict[int, dict]:
             break
         payload = json.loads(ev["payload_json"])
         if ev["action"] == "add":
-            entries[ev["seq"]] = {"entry_id": ev["seq"], **payload}
+            entries[ev["seq"]] = {"entry_id": ev["seq"], "target_mode": "fixed",
+                                  "target_pct": 0.0, "shop": None, **payload}
         elif ev["action"] == "remove":
             entries.pop(payload["entry_id"], None)
         elif ev["action"] == "set_target":
-            entries[payload["entry_id"]]["target_price"] = payload["target_price"]
+            # pre-rule payloads carry only a price: they are fixed targets
+            e = entries[payload["entry_id"]]
+            e["target_price"] = payload["target_price"]
+            e["target_mode"] = payload.get("target_mode", "fixed")
+            e["target_pct"] = payload.get("target_pct", 0.0)
+        elif ev["action"] == "set_shop":
+            entries[payload["entry_id"]]["shop"] = payload.get("shop")
         elif ev["action"] == "set_note":
             entries[payload["entry_id"]]["note"] = payload["note"]
         elif ev["action"] == "bought":
@@ -317,6 +401,9 @@ def clone_list(db, source_list_id: int, at_seq: int | None = None,
                  set_code=entry.get("set_code"),
                  collector_number=entry.get("collector_number"),
                  target_price=entry.get("target_price"),
+                 target_mode=entry.get("target_mode"),
+                 target_pct=entry.get("target_pct"),
+                 shop=entry.get("shop"),
                  note=entry.get("note"))
     if recovery:
         db.execute("UPDATE lists SET superseded_by=? WHERE id=?",
@@ -333,50 +420,76 @@ def upsert_price(db, uuid: str, date: str, provider: str, finish: str,
         db.commit()
 
 
-def _cheapest_latest(db, uuids, provider, finish):
-    """(uuid, price, date) with the lowest most-recent price, else None."""
-    if not uuids:
-        return None
+def _providers(provider) -> tuple:
+    """A provider argument may name one shop or a group of them."""
+    if isinstance(provider, str):
+        return (provider,)
+    return tuple(provider)
+
+
+def _cheapest_on(db, uuids, providers, finish, date, price):
+    """The (uuid, provider) that set the envelope's price on `date`."""
     marks = ",".join("?" * len(uuids))
+    pmarks = ",".join("?" * len(providers))
     row = db.execute(
-        f"""SELECT uuid, price, date FROM (
-              SELECT uuid, price, date,
-                     ROW_NUMBER() OVER (PARTITION BY uuid ORDER BY date DESC) rn
-              FROM prices
-              WHERE provider=? AND finish=? AND uuid IN ({marks}))
-            WHERE rn=1 ORDER BY price ASC LIMIT 1""",
-        [provider, finish, *uuids]).fetchone()
-    return (row["uuid"], row["price"], row["date"]) if row else None
+        f"SELECT uuid, provider FROM prices WHERE date=? AND finish=?"
+        f" AND provider IN ({pmarks}) AND uuid IN ({marks})"
+        f" ORDER BY price ASC, provider ASC LIMIT 1",
+        [date, finish, *providers, *uuids]).fetchone()
+    if row is None:                      # cannot happen for an envelope row
+        return None, None
+    return row["uuid"], row["provider"]
 
 
 def _envelope(db, uuids, provider, finish):
-    """Per-date minimum across printings: the price a buyer actually pays.
+    """Per-date minimum across printings — and across the given shops, when
+    `provider` names several: the price a buyer actually pays.
 
     Tracking one uuid would silently rewrite history when a reprint changes
     which printing is cheapest; the envelope keeps deltas honest."""
     if not uuids:
         return []
+    providers = _providers(provider)
     marks = ",".join("?" * len(uuids))
+    pmarks = ",".join("?" * len(providers))
     return db.execute(
         f"SELECT date, MIN(price) AS price FROM prices"
-        f" WHERE provider=? AND finish=? AND uuid IN ({marks})"
+        f" WHERE provider IN ({pmarks}) AND finish=? AND uuid IN ({marks})"
         f" GROUP BY date ORDER BY date",
-        [provider, finish, *uuids]).fetchall()
+        [*providers, finish, *uuids]).fetchall()
 
 
-def price_summary(db, uuids, provider: str = "tcgplayer",
+def envelope_low(env, exclude_latest: bool = False):
+    """(price, date) of the lowest point on an envelope, or None.
+
+    With `exclude_latest` the newest date is left out — the reference a
+    'low' target rule measures today's price against, so that a brand-new
+    low can be recognised as one (today can't undercut itself)."""
+    rows = env[:-1] if exclude_latest else env
+    if not rows:
+        return None
+    best = min(rows, key=lambda r: (r["price"], r["date"]))
+    return best["price"], best["date"]
+
+
+def price_summary(db, uuids, provider="tcgplayer",
                   finish: str = "normal", today: str | None = None):
     """Cheapest-available price + 7d/30d deltas on the min-across-printings
-    envelope, or None if no data. `uuid` is today's cheapest printing."""
+    envelope, or None if no data. `uuid` is today's cheapest printing and
+    `provider` the shop that set it (meaningful when several were given).
+    `low` is the lowest point ever recorded on this envelope."""
     uuids = list(uuids)
-    env = _envelope(db, uuids, provider, finish)
+    providers = _providers(provider)
+    env = _envelope(db, uuids, providers, finish)
     if not env:
         return None
     current, date = env[-1]["price"], env[-1]["date"]
-    best = _cheapest_latest(db, uuids, provider, finish)
+    uuid, shop = _cheapest_on(db, uuids, providers, finish, date, current)
     today = today or _date.today().isoformat()
-    out = {"uuid": best[0] if best else None, "current": current,
-           "date": date, "d7": None, "d30": None}
+    low = envelope_low(env)
+    out = {"uuid": uuid, "provider": shop, "current": current,
+           "date": date, "d7": None, "d30": None,
+           "low": low[0] if low else None, "low_date": low[1] if low else None}
     for key, days in (("d7", 7), ("d30", 30)):
         ref_date = (_date.fromisoformat(today) - timedelta(days=days)).isoformat()
         ref = None
@@ -390,19 +503,63 @@ def price_summary(db, uuids, provider: str = "tcgplayer",
     return out
 
 
-def price_series(db, uuids, days: int = 90, provider: str = "tcgplayer",
+def price_series(db, uuids, days: int = 90, provider="tcgplayer",
                  finish: str = "normal", today: str | None = None):
     uuids = list(uuids)
-    env = _envelope(db, uuids, provider, finish)
+    providers = _providers(provider)
+    env = _envelope(db, uuids, providers, finish)
     if not env:
         return None
     today = today or _date.today().isoformat()
     start = (_date.fromisoformat(today) - timedelta(days=days)).isoformat()
-    best = _cheapest_latest(db, uuids, provider, finish)
-    return {"uuid": best[0] if best else None, "provider": provider,
-            "finish": finish,
+    uuid, shop = _cheapest_on(db, uuids, providers, finish,
+                              env[-1]["date"], env[-1]["price"])
+    return {"uuid": uuid, "provider": shop, "finish": finish,
             "points": [(r["date"], r["price"]) for r in env
                        if r["date"] >= start]}
+
+
+def latest_by_shop(db, uuids, finish: str = "normal") -> dict:
+    """Newest price at every shop that has one: {provider: (price, date)},
+    cheapest printing per shop. One query per card, for the modal's
+    cross-market row."""
+    uuids = list(uuids)
+    if not uuids:
+        return {}
+    marks = ",".join("?" * len(uuids))
+    rows = db.execute(
+        f"""SELECT provider, price, date FROM (
+              SELECT provider, price, date,
+                     ROW_NUMBER() OVER (PARTITION BY provider
+                                        ORDER BY date DESC, price ASC) rn
+              FROM prices WHERE finish=? AND uuid IN ({marks}))
+            WHERE rn=1""", [finish, *uuids]).fetchall()
+    return {r["provider"]: (r["price"], r["date"]) for r in rows
+            if r["provider"] in ALL_SHOPS}
+
+
+def scryfall_id_for(db, entry: dict, uuid: str | None = None):
+    """A Scryfall id to show the card's face: the given printing's, else
+    the pinned printing's, else any printing of the name."""
+    if uuid:
+        row = db.execute("SELECT scryfall_id FROM card_uuids WHERE uuid=?"
+                         " AND scryfall_id IS NOT NULL", (uuid,)).fetchone()
+        if row:
+            return row["scryfall_id"]
+    for u in uuids_for_entry(db, entry):
+        row = db.execute("SELECT scryfall_id FROM card_uuids WHERE uuid=?"
+                         " AND scryfall_id IS NOT NULL", (u,)).fetchone()
+        if row:
+            return row["scryfall_id"]
+    return None
+
+
+def reference_low(db, uuids, provider="tcgplayer", finish: str = "normal"):
+    """The lowest envelope price before the newest date — what a 'low'
+    target rule is measured against. None with fewer than two points."""
+    env = _envelope(db, list(uuids), provider, finish)
+    low = envelope_low(env, exclude_latest=True)
+    return low
 
 
 def uuids_for_entry(db, entry: dict) -> list[str]:
@@ -420,9 +577,10 @@ def uuids_for_entry(db, entry: dict) -> list[str]:
     return [r["uuid"] for r in db.execute(q, args)]
 
 
-def entry_price_summary(db, entry: dict, provider: str = "tcgplayer",
+def entry_price_summary(db, entry: dict, provider="tcgplayer",
                         today: str | None = None):
-    """Price summary for an entry's tracked printings.
+    """Price summary for an entry's tracked printings at one shop (or the
+    cheapest across several, when `provider` is a tuple).
 
     Prefers normal finish; falls back to foil so foil-only collector
     printings still show a price. Adds a 'finish' key to the result."""
@@ -438,16 +596,75 @@ def entry_price_summary(db, entry: dict, provider: str = "tcgplayer",
     return None
 
 
-def set_entry_target(db, list_id: int, entry_id: int, target_price):
-    """Set (or clear, with None) an entry's target; appends a set_target event."""
+def entry_shops(entry: dict) -> tuple:
+    """The shops an entry's price basis is drawn from: its pinned shop, else
+    the cheapest across the USD markets."""
+    shop = entry.get("shop")
+    return (shop,) if shop in ALL_SHOPS else USD_SHOPS
+
+
+def entry_currency(entry: dict) -> str:
+    """Currency symbol of the entry's basis (and therefore of its target)."""
+    return SHOP_CURRENCY.get(entry.get("shop") or "", "$")
+
+
+def basis_summary(db, entry: dict, today: str | None = None):
+    """The summary hit state is judged on: the entry's pinned shop, else the
+    cheapest across USD shops. Every consumer of "is this at target" —
+    board, tools, push alerts — must read through here so they agree."""
+    return entry_price_summary(db, entry, provider=entry_shops(entry),
+                               today=today)
+
+
+def effective_target(db, entry: dict, summary=None):
+    """The number an entry's price is compared against right now.
+
+    fixed → the stored target_price. low → the lowest basis price recorded
+    before the newest one, less target_pct percent (None until there are two
+    points of history)."""
+    mode = entry.get("target_mode") or "fixed"
+    if mode != "low":
+        return entry.get("target_price")
+    uuids = uuids_for_entry(db, entry)
+    if not uuids:
+        return None
+    finish = summary.get("finish", "normal") if summary else "normal"
+    low = reference_low(db, uuids, entry_shops(entry), finish)
+    if low is None:
+        return None
+    pct = float(entry.get("target_pct") or 0)
+    return round(low[0] * (1 - pct / 100), 2)
+
+
+def is_hit(entry: dict, summary, target) -> bool:
+    """At/below target on its basis. Bought cards never count."""
+    return bool(summary and target is not None and not entry.get("bought_at")
+                and summary["current"] <= target)
+
+
+def set_entry_target(db, list_id: int, entry_id: int, target_price,
+                     target_mode: str | None = None,
+                     target_pct: float | None = None):
+    """Set (or clear, with None) an entry's target; appends a set_target event.
+
+    target_mode='low' installs a historic-low rule (target_pct percent under
+    it) in place of a fixed price."""
     row = _find_entry(db, list_id, entry_id=entry_id)
     if row is None:
         raise NotFound(f"No entry #{entry_id}")
-    append_event(db, list_id, "set_target",
-                 {"entry_id": entry_id, "card_name": row["card_name"],
-                  "target_price": target_price})
-    db.execute("UPDATE watchlist_current SET target_price=?"
-               " WHERE list_id=? AND entry_id=?", (target_price, list_id, entry_id))
+    _write_target(db, list_id, row, target_price, target_mode, target_pct)
+    db.commit()
+    return dict(_find_entry(db, list_id, entry_id=entry_id))
+
+
+def set_entry_shop(db, list_id: int, entry_id: int, shop):
+    """Pin an entry's price basis to one shop (None = cheapest USD)."""
+    row = _find_entry(db, list_id, entry_id=entry_id)
+    if row is None:
+        raise NotFound(f"No entry #{entry_id}")
+    if shop is not None and shop not in ALL_SHOPS:
+        raise ValueError(f"unknown shop {shop!r}")
+    _write_shop(db, list_id, row, shop)
     db.commit()
     return dict(_find_entry(db, list_id, entry_id=entry_id))
 

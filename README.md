@@ -119,14 +119,21 @@ cp .env.example .env
 Personal MTG price watchlists with 120 days of daily MTGJSON history plus
 weekly averages further back — the server keeps its own price store, so history
 outlives MTGJSON's rolling ~90-day window.
-Lists are identified by a passphrase (shown once at `watchlist_create`):
+Lists are identified by a passphrase (shown once at `watchlist_create`, or
+forged by hand at `https://mcp.kautiontape.com/mtg/w/new`):
 use it in a personal connector URL (`https://mcp.kautiontape.com/mtg/mcp/<passphrase>`)
 or pass it to tools in chat. Share codes (`SC-…`) grant read-only viewing at
 `https://mcp.kautiontape.com/mtg/s/<code>`. Every change is an append-only event —
 see the full chain at `https://mcp.kautiontape.com/mtg/w/<passphrase>` and recover
 any revision with `watchlist_clone(at_seq=N)` (mints a new passphrase).
 Prices ingest nightly from MTGJSON
-(tcgplayer/cardkingdom/cardmarket/manapool retail).
+(tcgplayer/cardkingdom/cardmarket/manapool retail). A card's price *basis* is
+the cheapest of the USD shops unless it is pinned to one market; targets are
+judged on the basis. A target is a fixed price or a rule — `low` follows the
+historic low, `low-10%` stays 10% under it, `-20%` resolves to 20% under
+today's price — written after ` @ ` in bulk adds and imports. The board
+exports `1 Card Name` lists straight into TCGplayer Mass Entry, the Card
+Kingdom deck builder, or Mana Pool, and imports them back.
 Health: `GET /health`.
 
 ## Data Sources
