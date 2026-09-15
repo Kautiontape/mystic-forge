@@ -1,0 +1,26 @@
+<article class="entry" data-version="1.3.2">
+  <div class="entry-date">2026-09-15 &middot; v1.3.2</div>
+  <h2 class="entry-title">The board paints first and fills in after</h2>
+  <p class="entry-body">
+    A board now sends its title, theme and layout the instant you ask for
+    it, then the cards arrive as the prices are read &mdash; so the page is
+    on screen in a blink even when the server is cold, and a slow board no
+    longer holds up Claude's tool calls while it renders. The reading itself
+    got much cheaper too: each card's price history is fetched once instead
+    of three times, the newest price at each shop is found by lookup rather
+    than by reading every price on record, and the index every board reads
+    from now carries the price itself, so a card's history is one run of
+    pages rather than a scatter of them. Also fixes a mistake in 1.3.1: the
+    index it added to answer the &ldquo;prices through&rdquo; line could
+    tempt the database into reading every price at a shop when the board
+    was set to that single market. That line is now answered from the
+    board's own cards, and the index is gone.
+  </p>
+  <p class="entry-teaser">
+    A board now paints its title and layout instantly and fills in the cards as prices are read &mdash; on screen in a blink even from a cold server. Reading got cheaper too: history fetched once per card, newest shop prices by lookup, and a covering index so a card's history is one run of pages. Also fixes 1.3.1's single-market slowdown. See full changelog for more.
+  </p>
+  <div class="tools">
+    <span class="tool-tag">watchlist_view</span>
+    <span class="tool-tag">watchlist_report</span>
+  </div>
+</article>
