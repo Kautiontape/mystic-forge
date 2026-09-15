@@ -1,0 +1,22 @@
+<article class="entry" data-version="1.3.1">
+  <div class="entry-date">2026-09-15 &middot; v1.3.1</div>
+  <h2 class="entry-title">Boards open in a blink again</h2>
+  <p class="entry-body">
+    Every board took three to four seconds to open, and a little longer each
+    day. The line at the bottom that says which date the prices run through
+    was to blame: answering it meant reading every price on record for the
+    shops on the board &mdash; a million and a half rows, and growing with
+    each nightly ingest. The database now keeps an index shaped for exactly
+    that question, and the same line resolves in three lookups. A side effect
+    worth having: link previews in Slack, Discord and the like had started
+    giving up before the page arrived and falling back to a bare domain name;
+    they get the board's title and banner again.
+  </p>
+  <p class="entry-teaser">
+    Boards took three to four seconds to open and were getting slower by the day &mdash; the &ldquo;prices through&rdquo; footer was reading every price on record to find the newest date. A purpose-built index answers it in three lookups, and link previews that had been timing out work again. See full changelog for more.
+  </p>
+  <div class="tools">
+    <span class="tool-tag">watchlist_view</span>
+    <span class="tool-tag">watchlist_report</span>
+  </div>
+</article>
