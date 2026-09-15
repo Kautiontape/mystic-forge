@@ -1391,16 +1391,21 @@ def _pager(base, param, page, total, per, keep=""):
 
 def _shell(row, editable, body, dialogs, cur="$", subtitle="", rightnav="",
            shop=ALL, extra=""):
-    key = row["_key"]
+    return (_shell_open(row, editable, rightnav) + _subtitle(subtitle)
+            + _shell_close(row, editable, body, dialogs, cur, shop, extra))
+
+
+def _subtitle(subtitle):
+    return f'<p class="subtitle">{subtitle}</p>\n' if subtitle else ""
+
+
+def _shell_open(row, editable, rightnav=""):
+    """Head and masthead: everything a page knows from its row alone, not
+    one price read. Streamed first, so the board paints its title and
+    theme -- and link previews get their tags -- while the cards render."""
     label = row["label"] or "Watchlist"
     title = esc(label)
     long_cls = ' class="long"' if len(label) > 16 else ""
-    cfg = {"key": key, "editable": editable, "cpad": CPAD, "cpadb": CPADB,
-           "cw": CW, "ch": CH,
-           "cur": cur, "prefix": PREFIX, "shop": shop,
-           "shopNames": SHOP_NAMES, "shopCur": SHOPS,
-           "tcg": TCG_MASSENTRY, "ck": CK_BUILDER, "mp": MP_ADDDECK}
-    js = _JS.replace("__CFG__", json.dumps(cfg).replace("</", "<\\/"))
     rename = (f'<button class="iconbtn" id="rename" title="Rename list" '
               f'aria-label="Rename list" data-label="{esc(row["label"] or "")}">✎</button>'
               if editable else "")
@@ -1435,8 +1440,18 @@ document.querySelector('meta[name=theme-color]').content=
 <div class="wrap">
 <header class="masthead"><span class="mright">{rightnav}<button class="iconbtn" id="theme" aria-label="Toggle theme"></button></span>
 <h1{long_cls}><span class="rune">✦</span> {title_html}</h1></header>
-{f'<p class="subtitle">{subtitle}</p>' if subtitle else ''}
-{body}
+"""
+
+
+def _shell_close(row, editable, body, dialogs, cur="$", shop=ALL, extra=""):
+    """The rest of the page: body, footer, dialogs and the script."""
+    cfg = {"key": row["_key"], "editable": editable, "cpad": CPAD,
+           "cpadb": CPADB, "cw": CW, "ch": CH,
+           "cur": cur, "prefix": PREFIX, "shop": shop,
+           "shopNames": SHOP_NAMES, "shopCur": SHOPS,
+           "tcg": TCG_MASSENTRY, "ck": CK_BUILDER, "mp": MP_ADDDECK}
+    js = _JS.replace("__CFG__", json.dumps(cfg).replace("</", "<\\/"))
+    return f"""{body}
 <footer>forged in the Mystic Forge · card price watchlist ·
 <a href="{PREFIX}/w/new" title="Forge a new list from pasted cards">new list</a> ·
 <a href="{PREFIX}/health" title="server status">status</a></footer>
@@ -1533,12 +1548,87 @@ def _target_editor() -> str:
         '<span class="err" id="tgtErr"></span></div>')
 
 
+def _norm_shop(shop: str) -> str:
+    return shop if shop in SHOPS or shop == ALL else ALL
+
+
+def board_through(db, list_id: int, shop: str = ALL) -> str | None:
+    """The newest price date among the board's own cards at its shops --
+    the "prices through" line. Constrained to the cards on view so it is a
+    seek per (shop, finish, printing) on the covering index; asked of the
+    whole table it was a scan of every row at those shops."""
+    shops = (watchlist_db.USD_SHOPS if _norm_shop(shop) == ALL
+             else (_norm_shop(shop),))
+    uuids = sorted({u for e in watchlist_db.current_entries(db, list_id)
+                    for u in watchlist_db.uuids_for_entry(db, e)})
+    if not uuids:
+        return None
+    return db.execute(
+        f"SELECT MAX(date) FROM prices WHERE provider IN "
+        f"({','.join('?' * len(shops))}) AND finish IN ('normal', 'foil')"
+        f" AND uuid IN ({','.join('?' * len(uuids))})",
+        [*shops, *uuids]).fetchone()[0]
+
+
+_WAIT = '<p class="nodata" id="wait">Reading prices…</p>\n'
+
+
+def render_main_head(row, editable: bool, shop: str = ALL) -> str:
+    """The instant half of a board: head, masthead and a placeholder the
+    body replaces. Built from the list row alone -- no price is read."""
+    key = row["_key"]
+    shop = _norm_shop(shop)
+    base = (f"{PREFIX}/w/{esc(key)}" if editable
+            else f"{PREFIX}/s/{esc(key)}")
+    qshop = f"?shop={shop}" if shop != ALL else ""
+    hist_title = ("Every change ever made to this list — inspect or restore any point"
+                  if editable else "See every change made to this list")
+    rightnav = (f'<button class="textlink" id="alerts">Alerts</button>'
+                f'<a class="textlink" href="{base}/history{qshop}" '
+                f'title="{hist_title}">History</a>')
+    return _shell_open(row, editable, rightnav) + _WAIT
+
+
+def _board_subtitle(shop, editable, filling, through) -> str:
+    if through:
+        freshness = f"Buy prices through {esc(through)}"
+    elif filling:
+        freshness = ("⏳ Fetching 90 days of price history now — first run on a "
+                     "new server takes a few minutes; this page refreshes itself")
+    else:
+        freshness = "No price data yet"
+    where = (USD_LABEL if shop == ALL else SHOP_NAMES[shop])
+    basis_note = ("" if shop == ALL else
+                  " · targets still judge the cheapest USD market (or a card's pinned shop)")
+    ro_note = "" if editable else "Read-only view · "
+    return _subtitle(f"{ro_note}{freshness} · {where} · ▼ green = cheaper · "
+                     f"▲ red = pricier{basis_note}")
+
+
+def render_main_error() -> str:
+    """What a streamed board says when its body fails after the head has
+    already gone out: the status can no longer change, so say so in-page."""
+    return ('<script>document.getElementById("wait")?.remove()</script>'
+            '<p class="nodata">Something went wrong reading this list\'s '
+            'prices. <a href="">Try again</a>.</p></div></body></html>')
+
+
 def render_main(db, row, editable: bool, cp: int = 1, shop: str = ALL,
                 filling: bool = False, sort: str = "target",
                 show_bought: bool = True, q: str = "") -> str:
     """The board: stat tiles + card grid, buy windows first."""
+    return (render_main_head(row, editable, shop)
+            + render_main_rest(db, row, editable, cp, shop, filling, sort,
+                               show_bought, q))
+
+
+def render_main_rest(db, row, editable: bool, cp: int = 1, shop: str = ALL,
+                     filling: bool = False, sort: str = "target",
+                     show_bought: bool = True, q: str = "") -> str:
+    """The slow half: subtitle, stat tiles, cards, dialogs, script. Reads
+    every watched card's history; render_main_head has already gone out."""
     key = row["_key"]
-    shop = shop if shop in SHOPS or shop == ALL else ALL
+    shop = _norm_shop(shop)
     cur = "$" if shop == ALL else SHOPS[shop]
     base = (f"{PREFIX}/w/{esc(key)}" if editable
             else f"{PREFIX}/s/{esc(key)}")
@@ -1562,6 +1652,16 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = ALL,
 
     keep = "".join(f"&{p}" for p in state)
     qshop = f"?shop={shop}" if shop != ALL else ""
+    with watchlist_db.envelope_memo():
+        subtitle = _board_subtitle(shop, editable, filling,
+                                   board_through(db, row["id"], shop))
+        return subtitle + _render_board(db, row, editable, cp, shop, filling,
+                                        sort, show_bought, q, cur, base,
+                                        _url, keep)
+
+
+def _render_board(db, row, editable, cp, shop, filling, sort, show_bought,
+                  q, cur, base, _url, keep):
     entries = watchlist_db.current_entries(db, row["id"])
 
     # basis for hits (pinned shop, else cheapest USD); display shop for the
@@ -1583,11 +1683,6 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = ALL,
     total_val = sum(s["current"] for s in priced)
     net7 = sum(s["d7"] for s in priced if s["d7"] is not None)
     hits = sum(1 for c in active if c.hit)
-    through_shops = watchlist_db.USD_SHOPS if shop == ALL else (shop,)
-    through = db.execute(
-        f"SELECT MAX(date) FROM prices WHERE provider IN "
-        f"({','.join('?' * len(through_shops))})", through_shops).fetchone()[0]
-
     page = grid[(cp - 1) * CARDS_PER_PAGE: cp * CARDS_PER_PAGE]
     empty_msg = (f'No cards match “{esc(q)}”.' if q else
                  'Nothing watched yet — use “Add card”, “Import”, or ask Claude.')
@@ -1731,26 +1826,8 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = ALL,
     import_btn = ('<button class="act" id="importBtn" '
                   'title="Paste a decklist or shopping list">⇩ Import</button>'
                   if editable else "")
-    hist_title = ("Every change ever made to this list — inspect or restore any point"
-                  if editable else "See every change made to this list")
-    if through:
-        freshness = f"Buy prices through {esc(through)}"
-    elif filling:
-        freshness = ("⏳ Fetching 90 days of price history now — first run on a "
-                     "new server takes a few minutes; this page refreshes itself")
-    else:
-        freshness = "No price data yet"
-    where = (USD_LABEL if shop == ALL else SHOP_NAMES[shop])
-    basis_note = ("" if shop == ALL else
-                  " · targets still judge the cheapest USD market (or a card's pinned shop)")
-    ro_note = "" if editable else "Read-only view · "
-    subtitle = (f"{ro_note}{freshness} · {where} · ▼ green = cheaper · "
-                f"▲ red = pricier{basis_note}")
-    rightnav = (f'<button class="textlink" id="alerts">Alerts</button>'
-                f'<a class="textlink" href="{base}/history{qshop}" '
-                f'title="{hist_title}">History</a>')
     net_cls = "dn" if net7 < 0 else "up" if net7 > 0 else "fl"
-    body = f"""
+    body = f"""<script>document.getElementById("wait")?.remove()</script>
 <div class="actions">{add_btn}{export_btn}{import_btn}{claim}{share}
 <span class="shopgrp mla"><label class="shoplbl" for="shopSel">prices:</label>{shop_select}</span></div>
 {superseded}
@@ -1764,9 +1841,8 @@ def render_main(db, row, editable: bool, cp: int = 1, shop: str = ALL,
 {sortbar}
 <div class="grid">{cards_html}</div>
 {_pager(base, "cp", cp, len(grid), CARDS_PER_PAGE, keep=keep)}"""
-    return _shell(row, editable, body, dialogs, cur,
-                  subtitle=subtitle, rightnav=rightnav, shop=shop,
-                  extra=_export_data(cards))
+    return _shell_close(row, editable, body, dialogs, cur, shop,
+                        extra=_export_data(cards))
 
 
 _ACTION_LABELS = {"create": ("forged", "var(--mauve)"),

@@ -12,16 +12,48 @@ def test_init_db_creates_tables(db):
             "card_uuids"} <= names
 
 
-def test_board_through_date_is_an_index_seek(db):
-    """The "prices through <date>" line on every board is MAX(date) over a
-    set of shops. It must resolve from the (provider, date) index -- the
-    older (provider, finish, uuid, date) index answers it too, but only by
-    walking every row of those shops, which took 3.8s per page in
-    production."""
+def test_single_shop_envelope_is_a_seek_not_a_shop_scan(db):
+    """A one-shop board asks for envelopes with `provider IN (?)`. 1.3.1's
+    (provider, date) index tempted the planner into satisfying the GROUP BY
+    from it and scanning every row at that shop -- 30s a page. The plan
+    must be the fully constrained covering index, with no other index on
+    prices left around to lure it."""
+    names = {r["name"] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='prices'")}
+    assert names == {"sqlite_autoindex_prices_1", "idx_prices_pfudp"}, names
     plan = " ".join(r[3] for r in db.execute(
-        "EXPLAIN QUERY PLAN SELECT MAX(date) FROM prices"
-        " WHERE provider IN (?, ?, ?)", ("tcgplayer", "cardkingdom", "manapool")))
-    assert "idx_prices_pd" in plan, plan
+        "EXPLAIN QUERY PLAN SELECT date, MIN(price) FROM prices"
+        " WHERE provider IN (?) AND finish=? AND uuid IN (?, ?)"
+        " GROUP BY date ORDER BY date", ("cardkingdom", "normal", "u1", "u2")))
+    assert "COVERING INDEX idx_prices_pfudp (provider=? AND finish=? AND uuid=?)" in plan, plan
+
+
+def test_envelope_is_answered_from_a_covering_index(db):
+    """A printing's history at one shop must come straight off the index:
+    rows live in the table in ingest order, so a card's history is a random
+    page read per row on a cold cache without `price` in the index."""
+    plan = " ".join(r[3] for r in db.execute(
+        "EXPLAIN QUERY PLAN SELECT date, MIN(price) FROM prices"
+        " WHERE provider IN (?, ?) AND finish=? AND uuid IN (?, ?)"
+        " GROUP BY date", ("tcgplayer", "cardkingdom", "normal", "u1", "u2")))
+    assert "COVERING INDEX idx_prices_pfudp" in plan, plan
+
+
+def test_init_db_drops_the_superseded_price_index(db):
+    db.execute("CREATE INDEX IF NOT EXISTS idx_prices_pfud"
+               " ON prices(provider, finish, uuid, date)")
+    watchlist_db.init_db(db)
+    names = {r["name"] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'")}
+    assert "idx_prices_pfud" not in names and "idx_prices_pfudp" in names
+
+
+def test_init_db_drops_the_planner_trap_index(db):
+    db.execute("CREATE INDEX IF NOT EXISTS idx_prices_pd ON prices(provider, date)")
+    watchlist_db.init_db(db)
+    names = {r["name"] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'")}
+    assert "idx_prices_pd" not in names
 
 
 def test_mint_passphrase_format():

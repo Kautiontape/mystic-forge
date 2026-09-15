@@ -474,6 +474,37 @@ def test_sort_state_survives_shop_switch(db_path):
     assert f"/w/{pp}?sort=d7&shop=cardkingdom&bought=hide" in page
 
 
+async def test_board_streams_its_head_before_reading_prices(db_path):
+    """The head -- title, theme, OG tags -- goes out as its own chunk before
+    any card is rendered, so the page paints (and unfurlers get their tags)
+    while the prices are still being read. TestClient collects the whole
+    body, so the chunks are read off the response's iterator directly."""
+    from starlette.requests import Request
+    db = watchlist_db.connect(db_path)
+    _, pp, sc = watchlist_db.create_list(db, label="Streamed")
+    db.close()
+    for key, editable in ((pp, True), (sc, False)):
+        row = dict(watchlist_db.get_list_by_passphrase(
+            watchlist_db.connect(db_path), pp))
+        row["_key"] = key
+        request = Request({"type": "http", "method": "GET", "path": "/",
+                           "query_string": b"sort=price", "headers": []})
+        resp = server._stream_board(request, row, editable, False)
+        assert resp.media_type == "text/html"
+        chunks = [ch async for ch in resp.body_iterator]
+        assert len(chunks) == 2
+        head, body = chunks
+        assert 'og:title" content="Streamed · a Magic price watchlist"' in head
+        assert 'id="wait"' in head and 'class="grid"' not in head
+        assert 'class="subtitle"' in body and 'class="subtitle"' not in head
+        assert 'class="grid"' in body and body.rstrip().endswith("</html>")
+        assert 'class="on">cheapest</a>' in body     # query params reach the body
+    with client() as c:
+        r = c.get(f"/w/{pp}")
+        assert r.status_code == 200 and "content-length" not in r.headers
+        assert r.text.count("<!doctype html>") == 1
+
+
 def test_og_preview_tags_static_and_served(db_path):
     """Link previews get a real card; nothing perishable in the description."""
     db = watchlist_db.connect(db_path)

@@ -11,6 +11,8 @@ import json
 import os
 import secrets
 import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -103,18 +105,21 @@ CREATE TABLE IF NOT EXISTS mtgstocks_votes (
   PRIMARY KEY (card_name, set_code, voter)
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
-CREATE INDEX IF NOT EXISTS idx_prices_pfud
-  ON prices(provider, finish, uuid, date);
--- "Prices through <date>" on every board is MAX(date) for a set of shops.
--- Without a (provider, date) index that walks every row of those shops --
--- 3.8s on 1.5M rows, and growing daily -- with it, three index seeks.
-CREATE INDEX IF NOT EXISTS idx_prices_pd
-  ON prices(provider, date);
+-- Covering: every board query walks a printing's history at one shop and
+-- needs the price of each row. Rows sit in the table in ingest order, so a
+-- card's history is scattered over the whole file and each row was a
+-- random page read on a cold cache. Carrying price makes it sequential:
+-- 1.4s -> 0.4s for a 33-card board with nothing cached.
+CREATE INDEX IF NOT EXISTS idx_prices_pfudp
+  ON prices(provider, finish, uuid, date, price);
 """
 
 
 def connect(path: str | None = None) -> sqlite3.Connection:
-    db = sqlite3.connect(path or DB_PATH)
+    # 30s, not the 5s default: init_db builds a new index across 1.5M price
+    # rows on the first start after a schema change (~20s in production),
+    # and a page request arriving meanwhile should wait, not 500.
+    db = sqlite3.connect(path or DB_PATH, timeout=30)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     return db
@@ -122,6 +127,13 @@ def connect(path: str | None = None) -> sqlite3.Connection:
 
 def init_db(db: sqlite3.Connection) -> None:
     db.executescript(SCHEMA)
+    # superseded by idx_prices_pfudp (same prefix, plus price)
+    db.execute("DROP INDEX IF EXISTS idx_prices_pfud")
+    # 1.3.1's (provider, date) index made "prices through" instant but, with
+    # no ANALYZE stats, the planner also chose it for a single-shop board's
+    # envelopes -- ordered by date, so a scan of every row at that shop, per
+    # card. Nothing needs it now; see pages.board_through.
+    db.execute("DROP INDEX IF EXISTS idx_prices_pd")
     cols = [r[1] for r in db.execute("PRAGMA table_info(watchlist_current)")]
     if "bought_at" not in cols:  # migration for pre-"bought" databases
         db.execute("ALTER TABLE watchlist_current ADD COLUMN bought_at TEXT")
@@ -446,6 +458,24 @@ def _cheapest_on(db, uuids, providers, finish, date, price):
     return row["uuid"], row["provider"]
 
 
+# A board render asks for the same card's envelope up to three times (basis
+# summary, 'low' target reference, sparkline). Inside envelope_memo() the
+# first answer is reused; outside it nothing is cached, so the ingest loop
+# and the tools always read fresh. Context-local, so concurrent renders in
+# different threads never share a memo.
+_ENV_MEMO: ContextVar[dict | None] = ContextVar("envelope_memo", default=None)
+
+
+@contextmanager
+def envelope_memo():
+    """Reuse envelopes for the duration of one render."""
+    token = _ENV_MEMO.set({})
+    try:
+        yield
+    finally:
+        _ENV_MEMO.reset(token)
+
+
 def _envelope(db, uuids, provider, finish):
     """Per-date minimum across printings — and across the given shops, when
     `provider` names several: the price a buyer actually pays.
@@ -455,13 +485,20 @@ def _envelope(db, uuids, provider, finish):
     if not uuids:
         return []
     providers = _providers(provider)
+    memo = _ENV_MEMO.get()
+    key = (tuple(uuids), providers, finish)
+    if memo is not None and key in memo:
+        return memo[key]
     marks = ",".join("?" * len(uuids))
     pmarks = ",".join("?" * len(providers))
-    return db.execute(
+    env = db.execute(
         f"SELECT date, MIN(price) AS price FROM prices"
         f" WHERE provider IN ({pmarks}) AND finish=? AND uuid IN ({marks})"
         f" GROUP BY date ORDER BY date",
         [*providers, finish, *uuids]).fetchall()
+    if memo is not None:
+        memo[key] = env
+    return env
 
 
 def envelope_low(env, exclude_latest: bool = False):
@@ -532,15 +569,24 @@ def latest_by_shop(db, uuids, finish: str = "normal") -> dict:
     if not uuids:
         return {}
     marks = ",".join("?" * len(uuids))
-    rows = db.execute(
-        f"""SELECT provider, price, date FROM (
-              SELECT provider, price, date,
-                     ROW_NUMBER() OVER (PARTITION BY provider
-                                        ORDER BY date DESC, price ASC) rn
-              FROM prices WHERE finish=? AND uuid IN ({marks}))
-            WHERE rn=1""", [finish, *uuids]).fetchall()
-    return {r["provider"]: (r["price"], r["date"]) for r in rows
-            if r["provider"] in ALL_SHOPS}
+    pmarks = ",".join("?" * len(ALL_SHOPS))
+    # Two steps, both answered from the (provider, finish, uuid, date) index:
+    # the newest date per shop never touches a price, and the cheapest price
+    # on that date is a handful of point reads. The one-query form -- a
+    # window over every historical row of every printing -- read a price for
+    # each of them, and was a quarter of a board's render time.
+    newest = db.execute(
+        f"SELECT provider, MAX(date) AS date FROM prices"
+        f" WHERE provider IN ({pmarks}) AND finish=? AND uuid IN ({marks})"
+        f" GROUP BY provider", [*ALL_SHOPS, finish, *uuids]).fetchall()
+    out = {}
+    for n in newest:
+        price = db.execute(
+            f"SELECT MIN(price) FROM prices WHERE provider=? AND finish=?"
+            f" AND uuid IN ({marks}) AND date=?",
+            [n["provider"], finish, *uuids, n["date"]]).fetchone()[0]
+        out[n["provider"]] = (price, n["date"])
+    return out
 
 
 def scryfall_id_for(db, entry: dict, uuid: str | None = None):

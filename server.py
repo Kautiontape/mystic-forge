@@ -5824,7 +5824,9 @@ async def watchlist_clone(params: WatchlistCloneInput) -> str:
 from html import escape as _esc
 
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
+                                 StreamingResponse)
 
 
 @mcp.custom_route("/og.png", methods=["GET"])
@@ -5937,6 +5939,41 @@ def _page_row(db, request, param, by_share: bool):
     return row
 
 
+def _stream_board(request: Request, row, editable: bool,
+                  filling: bool) -> StreamingResponse:
+    """A board in two chunks: the head goes out at once, the cards follow.
+
+    The title, theme and layout paint before a single price is read, and
+    link unfurlers get their tags in milliseconds instead of after the
+    whole render. The body is built in a worker thread on its own
+    connection -- sqlite objects are bound to the thread that made them, and
+    the handler's connection is already closed by the time this runs -- so a
+    slow board no longer stalls the event loop for every MCP call either."""
+    shop = request.query_params.get("shop", watchlist_pages.ALL)
+    kw = dict(cp=_page_int(request, "cp"), shop=shop, filling=filling,
+              sort=request.query_params.get("sort", "target"),
+              show_bought=request.query_params.get("bought") != "hide",
+              q=request.query_params.get("q", ""))
+
+    def rest() -> str:
+        db = _wl_db()
+        try:
+            return watchlist_pages.render_main_rest(db, row, editable, **kw)
+        finally:
+            db.close()
+
+    async def parts():
+        yield watchlist_pages.render_main_head(row, editable, shop)
+        try:
+            yield await run_in_threadpool(rest)
+        except Exception:
+            # The 200 is already on the wire; the page has to say it itself.
+            logging.getLogger("mystic_forge").exception("board render failed")
+            yield watchlist_pages.render_main_error()
+
+    return StreamingResponse(parts(), media_type="text/html")
+
+
 def _ensure_history_for(db, row) -> bool:
     """Opening a board is itself a request for history: if anything watched
     still lacks prices, start the fill now rather than waiting for a cycle."""
@@ -5966,15 +6003,9 @@ async def watch_page(request: Request):
         if row is None:
             return HTMLResponse("unknown passphrase", status_code=404)
         filling = _ensure_history_for(db, row)
-        return HTMLResponse(watchlist_pages.render_main(
-            db, row, editable=True, cp=_page_int(request, "cp"),
-            shop=request.query_params.get("shop", watchlist_pages.ALL),
-            filling=filling,
-            sort=request.query_params.get("sort", "target"),
-            show_bought=request.query_params.get("bought") != "hide",
-            q=request.query_params.get("q", "")))
     finally:
         db.close()
+    return _stream_board(request, row, True, filling)
 
 
 @mcp.custom_route("/w/{passphrase}/history", methods=["GET"])
@@ -6052,15 +6083,9 @@ async def share_page(request: Request):
         if row is None:
             return HTMLResponse("unknown share code", status_code=404)
         filling = _ensure_history_for(db, row)
-        return HTMLResponse(watchlist_pages.render_main(
-            db, row, editable=False, cp=_page_int(request, "cp"),
-            shop=request.query_params.get("shop", watchlist_pages.ALL),
-            filling=filling,
-            sort=request.query_params.get("sort", "target"),
-            show_bought=request.query_params.get("bought") != "hide",
-            q=request.query_params.get("q", "")))
     finally:
         db.close()
+    return _stream_board(request, row, False, filling)
 
 
 @mcp.custom_route("/s/{share_code}/history", methods=["GET"])
