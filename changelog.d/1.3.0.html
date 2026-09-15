@@ -1,0 +1,55 @@
+<article class="entry" data-version="1.3.0">
+  <div class="entry-date">2026-09-15 &middot; v1.3.0</div>
+  <h2 class="entry-title">Every market at once, targets that move, and lists that travel</h2>
+  <p class="entry-body">
+    The watchlist board now compares all four price sources. The
+    <b>prices</b> dropdown opens on <i>All markets</i>, where each card shows
+    the cheapest of TCGplayer, Card Kingdom and Mana Pool and names which one
+    it is; pick a single market to see everything at that shop instead
+    (Cardmarket stays in euro and is never mixed into the cheapest). A card
+    can also be pinned to one market for good, from its own modal, when that
+    is the only place you would buy it &mdash; targets, the board and the
+    push alerts all judge the same basis, so a lit card and a notification
+    never disagree.
+  </p>
+  <p class="entry-body">
+    Targets learned to move. Besides a fixed number, a card can
+    <b>follow the historic low</b>: the target sits at the lowest price
+    recorded so far (or a chosen percentage under it) and shifts whenever a
+    new low is set, so a buy window opens only on a genuine dip. The modal
+    offers gg.deals-style shortcuts &mdash; beat the current price, match the
+    low, ten, twenty or thirty percent under either &mdash; and the same
+    grammar works everywhere a target is typed: <code>@ low</code>,
+    <code>@ low-10%</code>, <code>@ -20%</code> on a line, or the new
+    <code>target_rule</code> and <code>shop</code> inputs on
+    <code>watchlist_add</code> and <code>watchlist_bulk_add</code>.
+  </p>
+  <p class="entry-body">
+    The card modal was rebuilt around what you do there: the card face
+    beside four figures (now, lowest, target, thirty-day change), a market
+    row that flips the chart between shops, the target editor, hop-outs
+    that now include Card Kingdom and Mana Pool, and the daily table folded
+    away under <i>Recent prices</i>. Remove sits far left, Save and Bought
+    far right. The BUY/WAIT banner above the board is gone.
+  </p>
+  <p class="entry-body">
+    Lists travel. <b>Export</b> writes plain <code>1 Card Name</code> lines
+    for everything, for the cards at target, or for a hand-picked set, and
+    opens them in TCGplayer Mass Entry or the Card Kingdom deck builder, or
+    copies them for Mana Pool. <b>Import</b> takes the same lines back, with
+    targets after <code>@</code> and an optional pin to the printing each
+    line names. And a list no longer needs an assistant to exist:
+    <a href="/mtg/w/new">/mtg/w/new</a> forges one by hand from a name and a
+    pasted list, and hands over the passphrase once.
+  </p>
+  <p class="entry-teaser">
+    The board compares <b>all four markets</b> at once and lets you pin a card to one; targets can <b>follow the historic low</b> instead of sitting still; the card modal shows the card face, per-market prices and a proper target editor; lists <b>export</b> straight into TCGplayer, Card Kingdom or Mana Pool and <b>import</b> back; and <b>/mtg/w/new</b> forges a list by hand, no assistant needed. See full changelog for more.
+  </p>
+  <div class="tools">
+    <span class="tool-tag">watchlist_add</span>
+    <span class="tool-tag">watchlist_bulk_add</span>
+    <span class="tool-tag">watchlist_list</span>
+    <span class="tool-tag">watchlist_report</span>
+    <span class="tool-tag">price_history</span>
+  </div>
+</article>
