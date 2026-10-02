@@ -54,7 +54,7 @@ jobs:
       NEW_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - name: Check out mcp-servers
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Kautiontape/mcp-servers
           token: ${{ secrets.MCP_SERVERS_RELEASE_TOKEN }}
@@ -64,7 +64,7 @@ jobs:
 
       # The same interpreter release-checks.yml uses, so the pre-flight here
       # and the gate on the PR cannot disagree about the scripts they share.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
 
