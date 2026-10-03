@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Mystic Forge is an MCP (Model Context Protocol) server for Magic: The Gathering. It exposes 46 tools that wrap several public MTG APIs (Scryfall, EDHRec, Archidekt, Commander Spellbook, MTGJSON) behind a unified FastMCP server, plus a deck simulator and a price watchlist of its own.
+Mystic Forge is an MCP (Model Context Protocol) server for Magic: The Gathering. It exposes 46 tools that wrap several public MTG APIs (Scryfall, EDHRec, Archidekt, Commander Spellbook, MTGJSON) behind a unified MCPServer (mcp 2), plus a deck simulator and a price watchlist of its own.
 
 All tool declarations live in `server.py` at the repo root; supporting code lives in the `mystic_forge/` package: `mystic_forge/rulebook.py` (Comprehensive Rules parsing), `mystic_forge/watchlist/` (`db.py` / `ingest.py` / `pages.py` / `sidecar.py` / `mtgstocks.py`), `mystic_forge/goldfish/` (simulation engine), and `mystic_forge/data/` (vendored assets: `MagicCompRules.txt`, `watchlist_words.txt`, `og.png`). The `@mcp.tool(name=...)` declarations must stay in root `server.py` — `mcp-servers/scripts/check_release.py` greps that exact path at the pinned commit; moving them breaks the release gate. There is no build step, but there **is** a SQLite database backing the watchlist — path from `MYSTIC_FORGE_DB`, defaulting to `mystic_forge.db`.
 
@@ -87,7 +87,7 @@ Every source follows the same three-layer shape, so match it when adding tools:
 
 - **Tools return human-readable strings, not JSON.** Shared `_format_*` helpers (`_format_card`, `_format_card_list`, `_format_cardlist`, `_format_combo`) build the output. Reuse them for consistency.
 - **Field validation lives in the Pydantic models** (`min_length`, `max_length`, `ge`/`le`, `Enum` types like `ScryfallSearchOrder`, `TopPeriod`, `TopColor`). Keep validation there rather than inside tool bodies.
-- **`format_archidekt` is privileged.** The server's `instructions=` (in the `FastMCP(...)` constructor) direct clients to always use `format_archidekt` for decklist output and to prefer these tools over web search. If you add a data source, add a matching line to `instructions=` so clients know to prefer it.
+- **`format_archidekt` is privileged.** The server's `instructions=` (in the `MCPServer(...)` constructor) direct clients to always use `format_archidekt` for decklist output and to prefer these tools over web search. If you add a data source, add a matching line to `instructions=` so clients know to prefer it.
 - **Caching is manual and rare.** Only the MTGJSON precon deck list is cached, via the module-global `_deck_list_cache` dict with a 24h TTL. There is no general cache layer.
 - **Archidekt private decks** use optional `ARCHIDEKT_USERNAME`/`ARCHIDEKT_PASSWORD` env vars (see `.env.example`); self-host only, never deploy credentials on a shared server.
 
