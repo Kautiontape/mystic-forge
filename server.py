@@ -28,7 +28,7 @@ from difflib import SequenceMatcher
 
 import httpx
 from pydantic import BaseModel, Field, ConfigDict, model_validator
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from mystic_forge.watchlist import db as watchlist_db
 from mystic_forge.watchlist import ingest as watchlist_ingest
@@ -100,7 +100,7 @@ def _finish_marker(finish: Optional[str]) -> str:
 
 # ── Server ───────────────────────────────────────────────────────────────────
 
-mcp = FastMCP(
+mcp = MCPServer(
     "mystic_forge",
     instructions=(
         "Mystic Forge is a Magic: The Gathering toolkit. "
@@ -153,10 +153,6 @@ mcp = FastMCP(
         "To add MORE THAN ONE card, always use watchlist_bulk_add with all of "
         "them in one call — never loop watchlist_add per card."
     ),
-    host="0.0.0.0",
-    port=8000,
-    stateless_http=True,
-    transport_security=None,
 )
 
 
@@ -342,7 +338,10 @@ async def sidecar_build_once():
 
 
 def build_app():
-    return PassphraseMiddleware(mcp.streamable_http_app())
+    # mcp 2 moved these off the constructor. host only picks the security
+    # default: 127.0.0.1 would turn on DNS-rebinding checks that reject every
+    # proxied Host header.
+    return PassphraseMiddleware(mcp.streamable_http_app(stateless_http=True, host="0.0.0.0"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
