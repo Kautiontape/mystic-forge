@@ -1664,3 +1664,66 @@ def test_mint_throttle_ignores_a_spoofed_forwarded_header(db_path, monkeypatch):
         # a different accepted peer is a different bucket
         assert c.post("/api/create", json={},
                       headers={"cf-connecting-ip": "198.51.100.7"}).status_code == 200
+
+
+# ── The MCP endpoint itself, through the passphrase middleware ───────────────
+# mcp 2 reports an exception raised in a tool body as a bare "Error executing
+# tool X", and moved stateless_http/host off the constructor. These pin what a
+# production client (through Caddy, with a foreign Host header) must still see.
+
+_MCP_HEADERS = {"Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json"}
+
+
+def _rpc(c, path, method, params=None, **headers):
+    import json
+    r = c.post(path, headers={**_MCP_HEADERS, **headers},
+               json={"jsonrpc": "2.0", "id": 1, "method": method,
+                     "params": params or {}})
+    body = next((ln[5:] for ln in r.text.splitlines() if ln.startswith("data:")),
+                r.text)
+    return r, json.loads(body)
+
+
+def test_mcp_is_stateless_and_accepts_a_proxied_host(db_path):
+    """No initialize, no session id, and Caddy's Host header is not rejected
+    (host='127.0.0.1' would turn DNS-rebinding checks on)."""
+    with client() as c:
+        r, body = _rpc(c, "/mcp", "tools/list", Host="mcp.kautiontape.com",
+                       Origin="https://claude.ai")
+    assert r.status_code == 200
+    assert len(body["result"]["tools"]) >= 46
+    assert "mcp-session-id" not in r.headers
+
+
+def test_mcp_input_validator_message_reaches_the_client(db_path):
+    """A model_validator's ValueError is shown to the model verbatim."""
+    with client() as c:
+        _, body = _rpc(c, "/mcp", "tools/call", {
+            "name": "scryfall_price",
+            "arguments": {"params": {"name": "Sol Ring",
+                                     "collector_number": "284"}}})
+    res = body["result"]
+    assert res["isError"] is True
+    assert "collector_number requires set_code" in res["content"][0]["text"]
+
+
+def test_mcp_unrecognized_passphrase_message_reaches_the_client(db_path):
+    with client() as c:
+        _, body = _rpc(c, "/mcp", "tools/call", {
+            "name": "watchlist_report",
+            "arguments": {"params": {"passphrase": "no-such-pass-phrase-00"}}})
+    assert "not recognized" in body["result"]["content"][0]["text"]
+
+
+def test_mcp_personal_url_resolves_and_unknown_passphrase_is_404(db_path):
+    db = watchlist_db.connect(db_path)
+    _, pp, _ = watchlist_db.create_list(db, label="Mine")
+    db.close()
+    with client() as c:
+        _, body = _rpc(c, f"/mcp/{pp}", "tools/call", {
+            "name": "watchlist_list", "arguments": {"params": {}}})
+        r404 = c.post("/mcp/not-a-real-pass-phrase-99", headers=_MCP_HEADERS,
+                      json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert "not recognized" not in body["result"]["content"][0]["text"]
+    assert r404.status_code == 404
