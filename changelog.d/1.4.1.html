@@ -1,0 +1,21 @@
+<article class="entry" data-version="1.4.1">
+  <div class="entry-date">2026-10-28 &middot; v1.4.1</div>
+  <h2 class="entry-title">The health check stops recounting price history</h2>
+  <p class="entry-body">
+    The status page at <code>/mtg/health</code> reports how much price history
+    the server keeps: about 74 million prices in a 1.35&nbsp;GB file. It used
+    to count them every time it was asked, and the server's own container
+    check asks every minute, so the count ran about every two minutes. The
+    machine Mystic Forge runs on can't hold that file in memory, so each count
+    read about 2&nbsp;GB from disk, and together they made up most of the
+    machine's disk reads. On October 28 the machine stalled twice, for one to
+    three minutes each time, while its disk was saturated, and requests went
+    unanswered while it lasted. The counts are now taken once, right after the
+    nightly price update, and stored. The status page reports the stored
+    figures along with the time they were taken. Tools, watchlists and price
+    history are unchanged.
+  </p>
+  <p class="entry-teaser">
+    The status page was recounting all 74 million stored prices every couple of minutes, reading about 2&nbsp;GB from disk each time, which was most of the server's disk traffic. The counts are now taken once a night after the price update and stored. See full changelog for more.
+  </p>
+</article>
