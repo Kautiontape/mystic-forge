@@ -12,6 +12,7 @@ know where it lives, which keeps it free of a circular import.
 """
 
 import gzip
+import json
 import logging
 import os
 import pathlib
@@ -193,9 +194,9 @@ def built_at(path: str) -> str | None:
     """When this sidecar's build completed, or None if there isn't one.
 
     The identity of a build, for callers that must do something once per
-    build. stats() reports the same value, but it pays three full table scans
-    (~3.2s on a 54M-row sidecar) to get there, and a caller that only needs to
-    compare it against a stored marker should not have to."""
+    build. stats() reports the same value alongside the stored counts; this
+    is the narrower read for a caller that only compares it against a
+    stored marker."""
     if not is_ready(path):
         return None
     db = connect(path)
@@ -416,6 +417,9 @@ def build_from_allprices(path: str, gz_path: str) -> int:
             _set_meta(db, "daily_through", from_day(newest))
         _set_meta(db, "built_at",
                   datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        # Counted here, on the part file, so a sidecar is never published
+        # without the snapshot stats() reports from.
+        _store_stats(db)
         db.commit()
     except BaseException:
         db.close()
@@ -729,9 +733,68 @@ def downsample(path: str, keep_daily_days: int = KEEP_DAILY_DAYS,
         db.close()
 
 
+STATS_KEY = "stats"
+# meta key holding the counts stats() reports, as JSON. Written by
+# _store_stats, never by stats() itself.
+
+
+def _store_stats(db: sqlite3.Connection) -> dict:
+    """Count the sidecar and store the result under STATS_KEY. Uncommitted.
+
+    The one full scan of `points` in the read path, so it is one query: the
+    total, the daily/weekly split and the span all come out of a single pass.
+    Split across statements it read the whole file twice, and on a host that
+    cannot keep the file in page cache every pass is a full read from disk."""
+    span = db.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(agg = 0), 0) AS daily,"
+        " MIN(day) AS lo, MAX(day) AS hi FROM points").fetchone()
+    snap = {
+        "cards": db.execute("SELECT COUNT(*) AS n FROM cards").fetchone()["n"],
+        "points": span["n"],
+        "daily_points": span["daily"],
+        "weekly_points": span["n"] - span["daily"],
+        "earliest": from_day(span["lo"]) if span["lo"] is not None else None,
+        "latest": from_day(span["hi"]) if span["hi"] is not None else None,
+        "stats_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    _set_meta(db, STATS_KEY, json.dumps(snap))
+    return snap
+
+
+def refresh_stats(path: str) -> dict | None:
+    """Recount a ready sidecar and store the snapshot stats() reports.
+
+    Call it after anything that writes `points`: the build does so itself,
+    and run_ingest does after the nightly apply and downsample. Returns the
+    snapshot, or None without touching the disk when the sidecar is not
+    ready -- connect() would otherwise create an empty file at `path`."""
+    if not is_ready(path):
+        return None
+    db = connect(path)
+    try:
+        snap = _store_stats(db)
+        db.commit()
+        return snap
+    finally:
+        db.close()
+
+
 def stats(path: str) -> dict:
-    """Shape and span of the sidecar, for /health. Counts are full scans, so
-    call this on an operator-facing endpoint, not a hot path.
+    """Shape and span of the sidecar, for /health. Never scans.
+
+    The counts and the span come from the snapshot refresh_stats() stored,
+    and `stats_at` says when that was. The data only changes when a build or
+    the nightly ingest writes it, and both refresh the snapshot as their last
+    step, so the counts are current between those runs. Recounting here
+    instead meant a full read of a gigabyte-plus file whenever the
+    healthcheck polled -- on a host whose page cache could not hold it, a
+    disk read heavy enough to stall every other process on the box. A
+    sidecar that has never been refreshed (one built before snapshots
+    existed) reports `ready` with `stats_at: None` and no counts until the
+    next ingest; every deploy forces one, so that window is short.
+
+    `ready`, `daily_through`, `built_at` and `bytes` are read live: they are
+    single-row meta lookups and a stat() of the files.
 
     `bytes` sums the main file with any live -wal/-shm companions. A WAL-mode
     database is a three-file unit, and a concurrent reader -- another stats()
@@ -739,7 +802,7 @@ def stats(path: str) -> dict:
     reach a meaningful fraction of the main file's size; reporting the main
     file alone would understate what the volume actually holds.
 
-    `daily_through` is the stored watermark, reported alongside the computed
+    `daily_through` is the stored watermark, reported alongside the counted
     `latest` rather than instead of it. The two agree under normal operation,
     so publishing both costs nothing and turns any divergence between them
     into a free signal of a partial write.
@@ -754,18 +817,17 @@ def stats(path: str) -> dict:
         return {"ready": False, "reason": reason}
     db = connect(path)
     try:
-        span = db.execute("SELECT COUNT(*) AS n, MIN(day) AS lo, MAX(day) AS hi"
-                          " FROM points").fetchone()
-        daily = db.execute("SELECT COUNT(*) AS n FROM points WHERE agg=0"
-                           ).fetchone()["n"]
+        # A snapshot that will not parse is treated as no snapshot: /health
+        # must answer, and the next refresh overwrites it.
+        try:
+            snap = json.loads(_get_meta(db, STATS_KEY) or "null")
+        except ValueError:
+            snap = None
+        if not isinstance(snap, dict):
+            snap = {"stats_at": None}
         return {
             "ready": True,
-            "cards": db.execute("SELECT COUNT(*) AS n FROM cards").fetchone()["n"],
-            "points": span["n"],
-            "daily_points": daily,
-            "weekly_points": span["n"] - daily,
-            "earliest": from_day(span["lo"]) if span["lo"] is not None else None,
-            "latest": from_day(span["hi"]) if span["hi"] is not None else None,
+            **snap,
             "daily_through": _get_meta(db, "daily_through"),
             "built_at": _get_meta(db, "built_at"),
             "bytes": sum(os.path.getsize(path + suffix)

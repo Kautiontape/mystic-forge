@@ -73,6 +73,7 @@ Sections past RULINGS do more than wrap an API: RULEBOOK, GOLDFISH, and WATCHLIS
 - **It is data, not a rebuildable cache.** Daily resolution for `KEEP_DAILY_DAYS` (120), weekly means forever beyond that. MTGJSON only replays ~90 days, so past that the sidecar holds the only copy of its history. Whatever backs up `mystic_forge.db` must now cover `price_sidecar.sqlite` too.
 - **`PROVIDERS` and `FINISHES` are append-only.** The stored `src` codes are positional, so reordering or removing an entry silently reinterprets every existing row.
 - **A rebuild never clobbers.** The previous file is moved aside to `price_sidecar.sqlite.superseded`.
+- **`/health` never scans it.** `stats()` reads a snapshot stored in the sidecar's `meta` table; the build and the nightly `run_ingest` write it via `refresh_stats()` as their last step. Anything new that writes `points` must refresh it too. Counting on demand read the whole 1.35 GB file from disk every couple of minutes, most of the production host's disk reads; the host stalled twice on a saturated disk on 2026-10-28.
 - **`MYSTIC_FORGE_NO_SIDECAR` is the operator escape hatch.** With it set, readiness stays false and every path falls back to the pre-sidecar AllPrices scan.
 
 ### Consistent per-section pattern

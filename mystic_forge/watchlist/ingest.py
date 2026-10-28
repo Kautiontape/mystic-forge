@@ -437,6 +437,14 @@ def run_ingest(db_path: str, data_dir: str | None = None) -> None:
                 # actually succeeded.
                 log.exception("sidecar downsample failed; the day's prices "
                               "are already applied and projected")
+            # Last, after both writes, so the snapshot /health reports matches
+            # what the night left behind. Guarded for the same reason as
+            # downsample: a failed count must not cost the last_ingest stamp.
+            try:
+                price_sidecar.refresh_stats(side)
+            except Exception:
+                log.exception("sidecar stats refresh failed; /health keeps "
+                              "reporting the previous snapshot")
         else:
             n = ingest_prices_file(db, p)
         log.info("daily: %d rows", n)

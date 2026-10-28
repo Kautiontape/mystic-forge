@@ -759,6 +759,7 @@ def test_stats_distinguishes_daily_and_weekly_points(tmp_path):
     # cutoff falls mid-week-2: week 1 (7 rows) collapses to one weekly mean,
     # week 2 (7 rows) is left daily.
     price_sidecar.downsample(p, keep_daily_days=1, today="2026-01-15")
+    price_sidecar.refresh_stats(p)
     s = price_sidecar.stats(p)
     assert s["daily_points"] == 7
     assert s["weekly_points"] == 1
@@ -810,6 +811,78 @@ def test_stats_on_missing_file_is_not_ready(tmp_path):
     # permanently discards the weekly tier.
     assert price_sidecar.stats(str(tmp_path / "absent.sqlite")) == {
         "ready": False, "reason": "absent"}
+
+
+def test_stats_reports_the_stored_snapshot_not_a_recount(tmp_path):
+    """stats() must never scan points: that recount, run by every /health
+    poll, is what kept a host that could not cache the file reading it from
+    disk around the clock. Writes after the snapshot stay invisible until
+    refresh_stats() runs."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    built = price_sidecar.stats(p)
+    assert built["points"] == 4 and built["stats_at"]
+
+    late = make_prices_gz(tmp_path, "AllPricesToday.json.gz", {
+        "uuid-b": {"paper": {"tcgplayer": {"retail": {
+            "normal": {"2026-08-09": 1.0}}}}}})
+    price_sidecar.apply_daily(p, late)
+    stale = price_sidecar.stats(p)
+    assert stale["points"] == 4
+    assert stale["cards"] == 1
+    assert stale["stats_at"] == built["stats_at"]
+    # Live fields move without a refresh.
+    assert stale["daily_through"] == "2026-08-09"
+
+    snap = price_sidecar.refresh_stats(p)
+    fresh = price_sidecar.stats(p)
+    assert snap["points"] == fresh["points"] == 5
+    assert fresh["cards"] == 2
+    assert fresh["latest"] == fresh["daily_through"] == "2026-08-09"
+
+
+def test_refresh_stats_on_a_missing_sidecar_creates_nothing(tmp_path):
+    """connect() creates an empty file, and an empty file at the sidecar path
+    reads as `corrupt` -- which triggers a rebuild."""
+    p = str(tmp_path / "absent.sqlite")
+    assert price_sidecar.refresh_stats(p) is None
+    assert not os.path.exists(p)
+
+
+def test_stats_without_a_snapshot_is_ready_with_no_counts(tmp_path):
+    """A sidecar built before snapshots existed -- production on the day this
+    ships -- is still ready. It reports no counts rather than scanning to
+    produce them, and stats_at says so."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    db = price_sidecar.connect(p)
+    db.execute("DELETE FROM meta WHERE key=?", (price_sidecar.STATS_KEY,))
+    db.commit()
+    db.close()
+    s = price_sidecar.stats(p)
+    assert s["ready"] is True
+    assert s["stats_at"] is None
+    assert "points" not in s and "cards" not in s
+    assert s["built_at"] and s["daily_through"] == "2026-08-08"
+
+
+@pytest.mark.parametrize("raw", ["{not json", "[1, 2]", "null"])
+def test_stats_treats_an_unreadable_snapshot_as_absent(tmp_path, raw):
+    """/health has to answer; the next refresh overwrites whatever this is."""
+    gz = make_prices_gz(tmp_path, "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    p = str(tmp_path / "side.sqlite")
+    price_sidecar.build_from_allprices(p, gz)
+    db = price_sidecar.connect(p)
+    db.execute("UPDATE meta SET value=? WHERE key=?",
+               (raw, price_sidecar.STATS_KEY))
+    db.commit()
+    db.close()
+    s = price_sidecar.stats(p)
+    assert s["ready"] is True and s["stats_at"] is None
+    assert price_sidecar.refresh_stats(p)["points"] == 4
+    assert price_sidecar.stats(p)["points"] == 4
 
 
 def test_build_logs_skip_counts_for_unknown_provider(tmp_path, caplog):

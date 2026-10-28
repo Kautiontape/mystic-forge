@@ -826,6 +826,51 @@ def test_run_ingest_stamps_last_ingest_when_downsample_fails(
     assert fresh is not None and fresh["price"] == 6.75
 
 
+def test_run_ingest_refreshes_the_sidecar_stats_snapshot(db, db_path, tmp_path,
+                                                         monkeypatch):
+    """/health reports the snapshot, never a recount, so the nightly write
+    has to leave a snapshot that matches what it wrote."""
+    side, _ = _nightly_fixture(tmp_path, monkeypatch, {
+        "uuid-a": {"paper": {"tcgplayer": {"retail": {
+            "normal": {"2026-08-09": 6.75}}}}}})
+    built = price_sidecar.stats(side)["points"]
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+
+    s = price_sidecar.stats(side)
+    assert s["points"] == built + 1
+    assert s["latest"] == s["daily_through"] == "2026-08-09"
+
+
+def test_run_ingest_stamps_last_ingest_when_the_stats_refresh_fails(
+        db, db_path, tmp_path, monkeypatch):
+    """The snapshot is reporting, not data: a failed recount leaves /health
+    on yesterday's counts, which is fine, but must not cost the stamp."""
+    _nightly_fixture(tmp_path, monkeypatch, {
+        "uuid-a": {"paper": {"tcgplayer": {"retail": {
+            "normal": {"2026-08-09": 6.75}}}}}})
+
+    tried = []
+
+    def boom(*a, **k):
+        tried.append(1)
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(price_sidecar, "refresh_stats", boom)
+
+    list_id, _, _ = watchlist_db.create_list(db)
+    watchlist_db.add_card(db, list_id, "Sol Ring")
+    db.commit()
+
+    watchlist_ingest.run_ingest(db_path, str(tmp_path))
+
+    assert tried, "run_ingest never even attempted to refresh the stats"
+    assert db.execute("SELECT value FROM meta WHERE key='last_ingest'"
+                      ).fetchone() is not None
+
+
 # ── One-time reprojection after a build ────────────────────────────────────
 
 MARKER_SQL = "SELECT value FROM meta WHERE key='sidecar_projected_from'"

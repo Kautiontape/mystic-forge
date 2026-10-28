@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import logging
 import os
+import pathlib
 import time
 
 import pytest
@@ -12,6 +13,8 @@ import server
 from mystic_forge.watchlist import db as watchlist_db
 from mystic_forge.watchlist import ingest as watchlist_ingest
 from mystic_forge.watchlist import mtgstocks
+from mystic_forge.watchlist import sidecar as price_sidecar
+from tests.test_price_sidecar import PRICE_OBJ, make_prices_gz
 
 
 def client():
@@ -862,21 +865,21 @@ def test_api_fork_and_recover(db_path):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@pytest.fixture(autouse=True)
-def _no_inherited_sidecar_stats():
-    """/health caches stats() in a module global, and a cache that outlived
-    its test would answer the next one with the wrong sidecar."""
-    server._sidecar_stats_cache = None
-    yield
-    server._sidecar_stats_cache = None
-
-
 def _sidecar_env(db_path, monkeypatch):
     """Point the sidecar helpers at this test's tmp dir and return that path,
     whatever the ambient environment happens to say."""
     monkeypatch.delenv("MYSTIC_FORGE_DATA", raising=False)
     monkeypatch.delenv("MYSTIC_FORGE_NO_SIDECAR", raising=False)
     return watchlist_ingest._sidecar_path(os.path.dirname(db_path))
+
+
+def _built_sidecar(db_path, monkeypatch):
+    """A real one-card sidecar (4 points) beside this test's database."""
+    side = _sidecar_env(db_path, monkeypatch)
+    gz = make_prices_gz(pathlib.Path(os.path.dirname(db_path)),
+                        "AllPrices.json.gz", {"uuid-a": PRICE_OBJ})
+    price_sidecar.build_from_allprices(side, gz)
+    return side
 
 
 def test_health_reports_sidecar_state(db_path, monkeypatch):
@@ -907,7 +910,6 @@ def test_health_names_why_the_sidecar_is_not_ready(db_path, monkeypatch):
     side = _sidecar_env(db_path, monkeypatch)
     with client() as c:
         assert c.get("/health").json()["sidecar"]["reason"] == "absent"
-    server._sidecar_stats_cache = None
     with open(side, "wb") as f:
         f.write(b"this is not a database")
     with client() as c:
@@ -915,9 +917,9 @@ def test_health_names_why_the_sidecar_is_not_ready(db_path, monkeypatch):
 
 
 def test_health_runs_sidecar_stats_off_the_event_loop(db_path, monkeypatch):
-    """stats() is three full table scans -- ~3.2s on a 54M-row sidecar. Called
-    inline it blocks the loop for that long on the one endpoint an uptime
-    monitor polls every 10-30s, stalling every in-flight MCP request with it."""
+    """stats() no longer scans, but it still opens the sidecar. On a host
+    whose disk is stalled that read can block for seconds, and inline it
+    would stall every in-flight MCP request along with the healthcheck."""
     where = {}
 
     def probe(_p):
@@ -934,35 +936,51 @@ def test_health_runs_sidecar_stats_off_the_event_loop(db_path, monkeypatch):
     assert where == {"on_loop": False}
 
 
-def _counting_stats(calls):
-    def stats(_p):
-        calls.append(1)
-        return {"ready": True, "points": len(calls)}
-    return stats
-
-
-def test_health_caches_sidecar_stats_within_the_ttl(db_path, monkeypatch):
-    """Off the loop is not enough on its own: a monitor polling every 10s
-    would otherwise keep a worker thread scanning a gigabyte continuously."""
-    calls = []
-    monkeypatch.setattr(server.price_sidecar, "stats", _counting_stats(calls))
+def test_health_reports_the_snapshot_without_recounting(db_path, monkeypatch):
+    """The regression this guards: /health recounted a 1.35 GB sidecar every
+    time a 60s cache lapsed, and the compose healthcheck polls every 60s, so
+    a host that could not cache the file read it from disk about every two
+    minutes -- enough to stall the whole box. Rows written after the snapshot
+    must not show up until something calls refresh_stats(); bytes, a stat()
+    of the files, must."""
+    side = _built_sidecar(db_path, monkeypatch)
     with client() as c:
-        first = c.get("/health").json()["sidecar"]
-        second = c.get("/health").json()["sidecar"]
-    assert len(calls) == 1
-    assert first == second == {"ready": True, "points": 1}
+        before = c.get("/health").json()["sidecar"]
+    assert before["points"] == 4 and before["stats_at"]
 
-
-def test_health_recomputes_sidecar_stats_once_the_ttl_lapses(db_path,
-                                                             monkeypatch):
-    """Cached, not frozen -- a build landing has to become visible."""
-    monkeypatch.setattr(server, "_SIDECAR_STATS_TTL", 0.0)
-    calls = []
-    monkeypatch.setattr(server.price_sidecar, "stats", _counting_stats(calls))
+    db = price_sidecar.connect(side)
+    db.executemany("INSERT INTO points (card_id, src, day, cents, agg)"
+                   " VALUES (1, 0, ?, 100, 0)", [(d,) for d in range(1, 2001)])
+    db.commit()
+    db.close()
     with client() as c:
-        assert c.get("/health").json()["sidecar"]["points"] == 1
-        assert c.get("/health").json()["sidecar"]["points"] == 2
-    assert len(calls) == 2
+        after = c.get("/health").json()["sidecar"]
+    assert after["points"] == 4
+    assert after["stats_at"] == before["stats_at"]
+    assert after["bytes"] > before["bytes"]
+
+    price_sidecar.refresh_stats(side)
+    with client() as c:
+        assert c.get("/health").json()["sidecar"]["points"] == 2004
+
+
+def test_health_answers_for_a_sidecar_with_no_snapshot(db_path, monkeypatch):
+    """Deploy-day state in production: a sidecar built before snapshots
+    existed, before the forced ingest has refreshed it. Ready, with no
+    counts, and the healthcheck still passes."""
+    side = _built_sidecar(db_path, monkeypatch)
+    db = price_sidecar.connect(side)
+    db.execute("DELETE FROM meta WHERE key=?", (price_sidecar.STATS_KEY,))
+    db.commit()
+    db.close()
+    with client() as c:
+        r = c.get("/health")
+    assert r.status_code == 200
+    body = r.json()["sidecar"]
+    assert body["ready"] is True
+    assert body["stats_at"] is None
+    assert "points" not in body
+    assert body["built_at"] and body["bytes"] > 0
 
 
 def test_health_survives_stats_blowing_up(db_path, monkeypatch):

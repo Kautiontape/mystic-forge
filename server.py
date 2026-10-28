@@ -297,8 +297,8 @@ async def sidecar_build_once():
         data_dir = watchlist_ingest._data_dir()
         side = watchlist_ingest._sidecar_path(data_dir)
         if not price_sidecar.is_ready(side):
-            # Cheap: stats() short-circuits on a not-ready path without
-            # scanning.
+            # Cheap: stats() never scans, and on a not-ready path it only
+            # names the reason.
             reason = price_sidecar.stats(side).get("reason")
             if reason == "disabled":
                 # The escape hatch means "do not use the sidecar", which is
@@ -5837,39 +5837,16 @@ async def og_image(request: Request):
                         media_type="image/png")
 
 
-_SIDECAR_STATS_TTL = 60.0
-# Seconds a /health sidecar block is reused. price_sidecar.stats() is three
-# full table scans -- 3.2s measured on a 54M-row, 1.14 GB sidecar -- so an
-# uptime monitor polling every 10-30s would otherwise keep a worker thread
-# scanning a gigabyte more or less continuously. 60s sits just above the slow
-# end of that polling range, which collapses each cycle to at most one scan
-# while still surfacing a landed build within a minute.
-_sidecar_stats_cache = None                # (monotonic stamp, payload) | None
-_sidecar_stats_lock = threading.Lock()
+def _sidecar_stats() -> dict:
+    """The /health sidecar block. Blocking -- call in a worker thread.
 
-
-def _sidecar_stats_fresh():
-    """The cached sidecar stats if still inside the TTL, else None."""
-    snap = _sidecar_stats_cache
-    if snap is not None and time.monotonic() - snap[0] < _SIDECAR_STATS_TTL:
-        return snap[1]
-    return None
-
-
-def _sidecar_stats_refresh() -> dict:
-    """Recompute the sidecar stats. Blocking -- call in a worker thread."""
-    global _sidecar_stats_cache
-    with _sidecar_stats_lock:
-        hit = _sidecar_stats_fresh()       # another thread may have just filled it
-        if hit is not None:
-            return hit
-        try:
-            side = price_sidecar.stats(watchlist_ingest._sidecar_path())
-        except Exception:
-            logging.getLogger("mystic_forge").exception("sidecar stats failed")
-            side = {"ready": False}
-        _sidecar_stats_cache = (time.monotonic(), side)
-        return side
+    No cache of its own: stats() reads the snapshot the build and the
+    nightly ingest store, so every call is a handful of meta lookups."""
+    try:
+        return price_sidecar.stats(watchlist_ingest._sidecar_path())
+    except Exception:
+        logging.getLogger("mystic_forge").exception("sidecar stats failed")
+        return {"ready": False}
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -5893,13 +5870,11 @@ async def health(request: Request):
         stale = age.days > 1                  # > 36h in whole-day terms
     elif cards:
         stale = True
-    # Never inline: stats() is a multi-second scan on a real sidecar, and this
-    # is the endpoint an uptime monitor hits. `reason` rides along when it is
-    # not ready -- it is what tells a first boot apart from history that has
-    # just been thrown away.
-    side = _sidecar_stats_fresh()
-    if side is None:
-        side = await asyncio.to_thread(_sidecar_stats_refresh)
+    # Off the loop even though stats() no longer scans: it still opens the
+    # sidecar, and on a host whose disk is stalled that read can block for
+    # seconds. `reason` rides along when it is not ready -- it is what tells
+    # a first boot apart from history that has just been thrown away.
+    side = await asyncio.to_thread(_sidecar_stats)
     return JSONResponse({
         "status": "degraded" if stale else "ok",
         "version": VERSION,
